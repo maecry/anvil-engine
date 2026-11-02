@@ -10,10 +10,15 @@ struct FrameData {
     mat4 view;
     mat4 proj;
     mat4 view_proj;
+    mat4 light_view_proj;       // directional shadow map (orthographic, Y flip folded in)
     vec4 camera_pos;
     uint light_count;
     uint sampler_index;
+    uint shadow_index;          // bindless slot of the shadow depth texture
+    uint shadow_sampler;        // bindless slot of the comparison sampler
     float exposure;
+    uint shadow_light;          // index of the shadow-casting light, ~0u = none
+    float shadow_texel_world;   // world size of one shadow texel (normal offset scale)
     float pad;
 };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Frame { FrameData d; };

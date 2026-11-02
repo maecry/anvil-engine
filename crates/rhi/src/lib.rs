@@ -623,7 +623,7 @@ pub struct GraphicsPipelineDesc<'a> {
     pub vertex: ShaderStageDesc<'a>,
     /// Fragment stage.
     pub fragment: ShaderStageDesc<'a>,
-    /// Formats of the color targets (dynamic rendering, no render pass object).
+    /// Formats of the color targets (dynamic rendering, no render pass object); empty = depth-only.
     pub color_formats: &'a [Format],
     /// Depth target and test state, if any.
     pub depth: Option<DepthState>,
@@ -686,7 +686,7 @@ pub struct DepthAttachment {
 /// Parameters for [`CommandEncoder::begin_rendering`].
 #[derive(Clone, Copy, Debug)]
 pub struct RenderingDesc<'a> {
-    /// Color attachments.
+    /// Color attachments (empty for a depth-only pass, which then needs `depth`).
     pub color: &'a [ColorAttachment],
     /// Depth attachment, if any.
     pub depth: Option<DepthAttachment>,

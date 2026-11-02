@@ -1,6 +1,7 @@
 //! M3 vertical slice: a grid of spheres with varying metallic/roughness, a textured cube and a
 //! ground plane, lit by a directional, a point and a spot light, with a fly camera
-//! (WASD + Space/Ctrl, Shift = faster, mouse-look while the right button is held).
+//! (WASD + Space/Ctrl, Shift = faster, mouse-look while the right button is held; `T` toggles
+//! the animated sun).
 //!
 //! Env: `ANVIL_EXIT_AFTER_FRAMES=n` renders n frames and exits (code 1 on validation errors).
 //! `ANVIL_SCREENSHOT=path.png` (with `ANVIL_EXIT_AFTER_FRAMES`) writes the last frame as a PNG.
@@ -40,6 +41,19 @@ fn checker(size: u32, cell: u32) -> Vec<u8> {
     data
 }
 
+/// Sun azimuth (radians) at start; `T` animates it.
+const SUN_START: f32 = 0.35;
+
+/// Directional light pointing down, azimuth `a`.
+fn sun(a: f32) -> Light {
+    Light::Directional {
+        direction: Vec3::new(a.cos() * 0.7, -0.6, a.sin() * 0.6),
+        color: Vec3::new(1.0, 0.96, 0.9),
+        intensity: 2.5,
+        cast_shadows: true,
+    }
+}
+
 struct Gfx {
     instance: VulkanInstance,
     surface: VulkanSurface,
@@ -67,6 +81,8 @@ struct PbrScene {
     camera: FlyCamera,
     keys: Vec<KeyCode>,
     looking: bool,
+    sun_angle: f32,
+    animate_sun: bool,
     last: Instant,
     rendered: u64,
     exit_after: Option<u64>,
@@ -156,25 +172,23 @@ impl PbrScene {
             }
         }
         let lights = vec![
-            Light::Directional {
-                direction: Vec3::new(-0.5, -1.0, -0.4),
-                color: Vec3::new(1.0, 0.96, 0.9),
-                intensity: 3.0,
-            },
+            sun(SUN_START),
+            // Warm point light between the cube and the spheres.
             Light::Point {
-                position: Vec3::new(-3.0, 2.0, 2.0),
-                color: Vec3::new(1.0, 0.5, 0.3),
-                intensity: 20.0,
-                range: 10.0,
+                position: Vec3::new(-2.6, 1.2, 1.8),
+                color: Vec3::new(1.0, 0.45, 0.15),
+                intensity: 25.0,
+                range: 8.0,
             },
+            // Cool spot light on the right-hand spheres.
             Light::Spot {
-                position: Vec3::new(4.0, 4.0, 3.0),
-                direction: Vec3::new(-0.8, -1.0, -1.0),
-                color: Vec3::new(0.4, 0.6, 1.0),
-                intensity: 40.0,
-                range: 15.0,
-                inner_cone: 0.2,
-                outer_cone: 0.4,
+                position: Vec3::new(3.5, 3.5, 2.5),
+                direction: Vec3::new(-0.35, -1.0, -0.9),
+                color: Vec3::new(0.3, 0.5, 1.0),
+                intensity: 90.0,
+                range: 14.0,
+                inner_cone: 0.25,
+                outer_cone: 0.5,
             },
         ];
         Ok(Gfx {
@@ -192,6 +206,9 @@ impl PbrScene {
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32().min(0.1);
         self.last = now;
+        if self.animate_sun {
+            self.sun_angle += dt * 0.5;
+        }
         let down = |k| self.keys.contains(&k);
         let axis = |pos, neg| f32::from(u8::from(down(pos))) - f32::from(u8::from(down(neg)));
         let rot = self.camera.rotation();
@@ -212,6 +229,7 @@ impl PbrScene {
         self.update();
         let last_frame = self.exit_after.is_some_and(|n| self.rendered + 1 >= n);
         let screenshot = self.screenshot.clone().filter(|_| last_frame);
+        let sun_angle = self.sun_angle;
         let scene_camera = Camera {
             position: self.camera.position,
             rotation: self.camera.rotation(),
@@ -233,6 +251,7 @@ impl PbrScene {
             }
             Acquire::Minimized => return Ok(false),
         };
+        g.lights[0] = sun(sun_angle);
         let scene = RenderScene {
             camera: scene_camera,
             meshes: g.instances.clone(),
@@ -354,6 +373,10 @@ impl App for PbrScene {
                 code: KeyCode::Escape,
                 pressed: true,
             } => return Control::Exit,
+            Event::Key {
+                code: KeyCode::T,
+                pressed: true,
+            } => self.animate_sun = !self.animate_sun,
             Event::Key { code, pressed } => {
                 self.keys.retain(|k| k != code);
                 if *pressed {
@@ -413,6 +436,8 @@ fn main() -> anyhow::Result<()> {
             },
             keys: Vec::new(),
             looking: false,
+            sun_angle: SUN_START,
+            animate_sun: false,
             last: Instant::now(),
             rendered: 0,
             exit_after,

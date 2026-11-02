@@ -12,10 +12,15 @@ pub(crate) struct GpuFrame {
     pub view: Mat4,
     pub proj: Mat4,
     pub view_proj: Mat4,
+    pub light_view_proj: Mat4,
     pub camera_pos: [f32; 4],
     pub light_count: u32,
     pub sampler_index: u32,
+    pub shadow_index: u32,
+    pub shadow_sampler: u32,
     pub exposure: f32,
+    pub shadow_light: u32,
+    pub shadow_texel_world: f32,
     pub pad: f32,
 }
 
@@ -46,6 +51,7 @@ impl GpuLight {
                 direction,
                 color,
                 intensity,
+                ..
             } => Self {
                 position_type: [0.0; 4],
                 direction_range: [direction.x, direction.y, direction.z, 0.0],
@@ -120,7 +126,7 @@ mod tests {
 
     #[test]
     fn layouts_match_std430() {
-        assert_eq!(size_of::<GpuFrame>(), 224);
+        assert_eq!(size_of::<GpuFrame>(), 304);
         assert_eq!(size_of::<GpuInstance>(), 144);
         assert_eq!(size_of::<GpuLight>(), 64);
         assert_eq!(size_of::<GpuMaterial>(), 80);

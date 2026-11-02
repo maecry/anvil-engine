@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Status | Accepted (ADR-0011) |
-| Milestone | M3 (forward, PBR; M3a implemented); M4 (graph, post) |
+| Milestone | M3 (forward, PBR; M3a, M3b implemented); M4 (graph, post) |
 | Crates | renderer (M3: mesh, camera and material live inside it as modules) |
 | Traces to | MASTER-000 §4.1, §5.2 rules 4-5, §8.5, §9, §11 |
 | Last updated | 2026-11-02 |
@@ -60,7 +60,7 @@ pub struct RenderScene { pub camera: Camera, pub meshes: Vec<MeshInstance>, pub 
 pub struct Camera { pub position: Vec3, pub rotation: Quat, pub fov_y: f32, pub near: f32, pub exposure: f32 }
 impl Camera { pub fn view(&self) -> Mat4; pub fn projection(&self, aspect: f32) -> Mat4 /* reverse-Z, infinite far, Y flip */ }
 pub struct MeshInstance { pub mesh: MeshId, pub material: MaterialId, pub transform: Mat4 }
-pub enum Light { Directional { direction, color, intensity }, Point { position, color, intensity, range },
+pub enum Light { Directional { direction, color, intensity, cast_shadows }, Point { position, color, intensity, range },
                  Spot { position, direction, color, intensity, range, inner_cone, outer_cone } }
 
 pub struct Vertex { pub pos: [f32; 3], pub normal: [f32; 3], pub uv: [f32; 2], pub tangent: [f32; 4] } // 48 B
@@ -92,14 +92,24 @@ impl Renderer {
 
 ## 12a. Frame structure and GPU data (M3a, ADR-0011 §3-5)
 
-1. Forward opaque pass: HDR `Rgba16Float` color + reverse-Z `D32Sfloat` depth (clear 0, `GreaterOrEqual`, back-face culling, counter-clockwise front faces).
-2. Tonemap pass: fullscreen triangle, ACES fit and exposure, HDR to the swapchain (manual gamma only if the swapchain format is not sRGB).
+1. Shadow pass (M3b): depth-only, 2048x2048 `D32Sfloat`, from the first directional light with `cast_shadows`; always recorded (empty when no caster) so the barrier sequence is constant.
+2. Forward opaque pass: HDR `Rgba16Float` color + reverse-Z `D32Sfloat` depth (clear 0, `GreaterOrEqual`, back-face culling, counter-clockwise front faces).
+3. Tonemap pass: fullscreen triangle, ACES fit and exposure, HDR to the swapchain (manual gamma only if the swapchain format is not sRGB).
 
-Each pass is a free function over an explicit inputs struct (`forward_pass(cmd, &ForwardInputs)`, `tonemap_pass(cmd, &TonemapInputs)`), so M4 can turn them into graph nodes. Barriers are hand-written; HDR/depth start `Undefined` on the first frame and `ShaderRead`/`DepthAttachment` afterwards.
+Each pass is a free function over an explicit inputs struct (`shadow_pass(cmd, &ShadowInputs)`, `forward_pass(cmd, &ForwardInputs)`, `tonemap_pass(cmd, &TonemapInputs)`), so M4 can turn them into graph nodes. Barriers are hand-written; HDR/depth start `Undefined` on the first frame and `ShaderRead`/`DepthAttachment` afterwards.
 
 Per frame the renderer fills one persistently mapped `Upload` ring per frame in flight (4 MiB each, bump allocated, reset when the slot is reused) with frame data (view, proj, view_proj, camera position, light count, sampler index, exposure), the instance array (model + normal matrix + material index), the light array and the dense material array. Shaders read them through buffer device addresses in the push constants (5 addresses = 40 of 128 bytes: frame, instances, lights, materials, vertices); `first_instance` of each indexed draw is the instance index. Meshes are GPU-only vertex (BDA) and index buffers.
 
-M3a shading is deliberately simple: base color texture x factor, Lambert plus Blinn-Phong from the first directional light, hemisphere ambient, normal map, occlusion and emissive. Point and spot lights are uploaded but unused until M3b (PBR over the full light array, directional shadow map). M3c adds IBL.
+### M3b: PBR, lights, shadows
+
+- Shading (`forward.frag`): Cook-Torrance metallic-roughness: GGX NDF, Smith height-correlated visibility, Schlick Fresnel with `F0 = mix(0.04, baseColor, metallic)`, Lambert diffuse scaled by `(1-F)(1-metallic)`. Base color, metallic/roughness (G/B), normal, occlusion and emissive textures are honoured; roughness is clamped to 0.045.
+- Lights: the whole light array is looped (directional, point, spot) with `KHR_lights_punctual` semantics: lux/candela, inverse-square falloff with the smooth range window `clamp(1-(d/range)^4)^2` (range 0 = unlimited), spot cone `smoothstep(cos_outer, cos_inner)`. At most `MAX_LIGHTS` = 64 lights are shaded (extra ones are dropped with a `warn`); `RendererStats.lights` is the number shaded.
+- Ambient: a hemisphere gradient placeholder with a tinted specular term so metals are not black (`// shortcut:` in the shader), replaced by IBL in M3c.
+- Shadows: one 2048 map, only for the first directional light with `cast_shadows`. The orthographic light volume is the bounding sphere of the camera frustum up to 50 m (`SHADOW_DISTANCE`), snapped to whole texels (`shadow.rs::fit_directional`, unit-tested). Lookup uses a comparison sampler (`LessOrEqual`, hardware bilinear PCF) in a 3x3 kernel plus a world normal offset scaled by the texel size and by `1 - N.L`. The shadow pipeline applies a slope-scaled `DepthBias` (constant 2, slope 2.5) and culls **front** faces: only back faces enter the map, so lit surfaces never self-shadow (no acne) without a large bias, and contact shadows stay attached (no peter-panning); the trade-off is light leaking through very thin closed-surface-free casters (a single plane casts nothing), acceptable for M3. Barriers: `Undefined/ShaderRead -> DepthAttachment` before the pass, `DepthAttachment -> ShaderRead` after it.
+- The shadow pass needs a depth-only pipeline and rendering scope: the RHI now accepts zero color formats / attachments (LAYER-003 §18.5).
+- shortcut: a single shadow map without cascades and fixed 2048 resolution; cascades and point/spot shadows are M4. Alpha-tested casters are M4.
+
+M3c adds IBL.
 
 ## 13. Testing strategy
 
@@ -113,8 +123,10 @@ M3a (implemented):
 - [x] `ANVIL_SCREENSHOT` produces a PNG an agent can inspect.
 - [x] No scene crate dependency.
 
-M3b/M3c (pending):
-- [ ] Full PBR metallic-roughness over directional, point and spot lights; 2048 directional shadow map with PCF.
+M3b (implemented):
+- [x] Full PBR metallic-roughness over directional, point and spot lights; 2048 directional shadow map with PCF; zero validation errors/warnings (also with `ANVIL_GPU_AV=1`, apart from the layer's own settings notices).
+
+M3c (pending):
 - [ ] IBL (procedural sky, per-roughness prefiltered equirect textures, irradiance, BRDF LUT).
 - [ ] Renderer builds against a mock backend (the `NullBackend` of earlier drafts is the mock in `rhi` tests).
 

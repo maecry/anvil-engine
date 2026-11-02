@@ -27,6 +27,17 @@ pub(crate) struct ForwardInputs<'a> {
     pub draws: &'a [Draw],
 }
 
+/// Inputs of [`shadow_pass`].
+pub(crate) struct ShadowInputs<'a> {
+    pub pipeline: PipelineHandle,
+    pub texture: TextureHandle,
+    pub size: u32,
+    /// False on the first frame, when the texture is still `Undefined`.
+    pub initialized: bool,
+    pub addresses: [u64; 4],
+    pub draws: &'a [Draw],
+}
+
 /// Inputs of [`tonemap_pass`].
 pub(crate) struct TonemapInputs {
     pub pipeline: PipelineHandle,
@@ -53,6 +64,55 @@ fn full_viewport<C: CommandEncoder>(cmd: &mut C, (w, h): (u32, u32)) {
         width: w,
         height: h,
     });
+}
+
+/// Pushes the four frame-data addresses plus the draw's vertex address, binds the index buffer
+/// and issues the draw; `first_instance` doubles as the instance array index (`gl_InstanceIndex`).
+fn record_draw<C: CommandEncoder>(cmd: &mut C, addresses: &[u64; 4], d: &Draw) {
+    let mut pc = [0u8; 40];
+    for (chunk, a) in pc
+        .chunks_mut(8)
+        .zip(addresses.iter().chain([&d.vertex_address]))
+    {
+        chunk.copy_from_slice(&a.to_le_bytes());
+    }
+    cmd.push_constants(0, &pc);
+    cmd.bind_index_buffer(d.index_buffer, 0, IndexFormat::U32);
+    cmd.draw_indexed(d.index_count, 1, 0, 0, d.instance);
+}
+
+/// Depth-only pass into the directional shadow map; leaves it in `ShaderRead`.
+pub(crate) fn shadow_pass<C: CommandEncoder>(cmd: &mut C, i: &ShadowInputs) {
+    cmd.begin_label("shadow", [0.4, 0.4, 0.4, 1.0]);
+    let from = if i.initialized {
+        TextureState::ShaderRead
+    } else {
+        TextureState::Undefined
+    };
+    cmd.texture_barrier(i.texture, from, TextureState::DepthAttachment);
+    cmd.begin_rendering(&RenderingDesc {
+        color: &[],
+        depth: Some(DepthAttachment {
+            texture: i.texture,
+            load: LoadOp::Clear,
+            store: StoreOp::Store,
+            clear: 1.0,
+        }),
+        width: i.size,
+        height: i.size,
+    });
+    full_viewport(cmd, (i.size, i.size));
+    cmd.bind_pipeline(i.pipeline);
+    for d in i.draws {
+        record_draw(cmd, &i.addresses, d);
+    }
+    cmd.end_rendering();
+    cmd.texture_barrier(
+        i.texture,
+        TextureState::DepthAttachment,
+        TextureState::ShaderRead,
+    );
+    cmd.end_label();
 }
 
 /// Forward opaque pass into the HDR target with reverse-Z depth; leaves HDR in `ShaderRead`.
@@ -84,17 +144,7 @@ pub(crate) fn forward_pass<C: CommandEncoder>(cmd: &mut C, i: &ForwardInputs) {
     full_viewport(cmd, i.extent);
     cmd.bind_pipeline(i.pipeline);
     for d in i.draws {
-        let mut pc = [0u8; 40];
-        for (chunk, a) in pc
-            .chunks_mut(8)
-            .zip(i.addresses.iter().chain([&d.vertex_address]))
-        {
-            chunk.copy_from_slice(&a.to_le_bytes());
-        }
-        cmd.push_constants(0, &pc);
-        cmd.bind_index_buffer(d.index_buffer, 0, IndexFormat::U32);
-        // first_instance doubles as the instance array index (gl_InstanceIndex).
-        cmd.draw_indexed(d.index_count, 1, 0, 0, d.instance);
+        record_draw(cmd, &i.addresses, d);
     }
     cmd.end_rendering();
     cmd.texture_barrier(

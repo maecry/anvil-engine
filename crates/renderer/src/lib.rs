@@ -10,9 +10,10 @@ pub mod mesh;
 mod passes;
 mod renderer;
 mod scene;
+mod shadow;
 
 pub use mesh::{MeshData, Vertex};
 pub use renderer::{
     Material, MaterialDesc, MaterialId, Mesh, MeshId, Renderer, RendererStats, Texture, TextureId,
 };
-pub use scene::{Camera, Light, MeshInstance, RenderScene};
+pub use scene::{Camera, Light, MAX_LIGHTS, MeshInstance, RenderScene};

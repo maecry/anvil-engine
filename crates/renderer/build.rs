@@ -23,6 +23,8 @@ fn main() {
     for (file, kind) in [
         ("forward.vert", shaderc::ShaderKind::Vertex),
         ("forward.frag", shaderc::ShaderKind::Fragment),
+        ("shadow.vert", shaderc::ShaderKind::Vertex),
+        ("shadow.frag", shaderc::ShaderKind::Fragment),
         ("tonemap.vert", shaderc::ShaderKind::Vertex),
         ("tonemap.frag", shaderc::ShaderKind::Fragment),
     ] {

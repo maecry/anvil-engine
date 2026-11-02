@@ -562,6 +562,9 @@ pub enum CompareOp { Never, Less, Equal, LessOrEqual, Greater, GreaterOrEqual, A
 - `Format::Rg16Float` (`R16G16_SFLOAT`, 4 bytes per texel) for the BRDF LUT (M3c).
 - Swapchain images always get `TRANSFER_SRC` usage, and `copy_texture_to_buffer` accepts swapchain textures, for `ANVIL_SCREENSHOT` (ADR-0011 §11). shortcut: surface support for `TRANSFER_SRC` is assumed, not checked against the surface capabilities.
 
+### 18.5 Depth-only rendering (M3b)
+`GraphicsPipelineDesc.color_formats` and `RenderingDesc.color` may be empty when a depth attachment is present (shadow pass); a scope with neither is `InvalidDescriptor`. A depth-only pipeline passes an empty `blend` slice. The fragment stage is still required.
+
 ### 18.4 Tests
 Unit: `depth_state_mapping`, `sampler_info_mapping` (compare), depth/shader barrier pair, `Rg16Float` mapping. GPU (`resources.rs`): `sampled_depth_and_compare_sampler` (sampled depth texture, compare sampler, `DepthAttachment <-> ShaderRead` barriers, zero validation messages).
 

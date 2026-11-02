@@ -711,10 +711,12 @@ impl CommandEncoder for VulkanCommands {
         if self.st.failed() {
             return;
         }
-        if desc.color.is_empty() || desc.color.len() > MAX_COLOR_ATTACHMENTS {
-            return self
-                .st
-                .record(invalid("color attachment count must be 1..=8"));
+        if desc.color.len() > MAX_COLOR_ATTACHMENTS
+            || (desc.color.is_empty() && desc.depth.is_none())
+        {
+            return self.st.record(invalid(
+                "need 1..=8 color attachments, or a depth attachment alone (depth-only pass)",
+            ));
         }
         if desc.width == 0 || desc.height == 0 {
             return self.st.record(invalid("rendering area must be nonzero"));
@@ -1229,8 +1231,9 @@ pub(crate) fn validate_pipeline_desc(
         return Err(invalid("a depth format is not a color target format"));
     }
     let n = desc.color_formats.len();
-    if n == 0 || n > MAX_COLOR_ATTACHMENTS {
-        return Err(invalid("color format count must be 1..=8"));
+    // Zero color formats is a depth-only pipeline (shadow pass).
+    if n > MAX_COLOR_ATTACHMENTS {
+        return Err(invalid("color format count must be 0..=8"));
     }
     if !desc.blend.is_empty() && desc.blend.len() != n {
         return Err(invalid(

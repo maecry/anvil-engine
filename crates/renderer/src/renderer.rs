@@ -5,25 +5,35 @@ use std::time::Instant;
 
 use foundation::Handle;
 use foundation::Pool;
+use foundation::math::Mat4;
 use rhi::{
-    AddressMode, BlendState, BufferDesc, BufferHandle, BufferUsage, CompareOp, CullMode,
+    AddressMode, BlendState, BufferDesc, BufferHandle, BufferUsage, CompareOp, CullMode, DepthBias,
     DepthState, Device, Filter, Format, FrontFace, GraphicsPipelineDesc, Memory, PipelineHandle,
     PrimitiveTopology, RhiError, SamplerDesc, SamplerHandle, ShaderModuleDesc, ShaderModuleHandle,
     ShaderStageDesc, SwapchainImage, TextureDesc, TextureHandle, TextureUsage,
 };
 
 use crate::gpu::{GpuFrame, GpuInstance, GpuLight, GpuMaterial};
-use crate::passes::{Draw, ForwardInputs, TonemapInputs, forward_pass, tonemap_pass};
-use crate::{MeshData, RenderScene};
+use crate::passes::{
+    Draw, ForwardInputs, ShadowInputs, TonemapInputs, forward_pass, shadow_pass, tonemap_pass,
+};
+use crate::shadow::fit_directional;
+use crate::{Light, MAX_LIGHTS, MeshData, RenderScene};
 
 static FORWARD_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forward.vert.spv"));
 static FORWARD_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forward.frag.spv"));
+static SHADOW_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.spv"));
+static SHADOW_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.frag.spv"));
 static TONEMAP_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.vert.spv"));
 static TONEMAP_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.frag.spv"));
 
 /// Size of each per-frame-in-flight upload ring.
 // shortcut: fixed 4 MiB ring, render fails when a scene overflows it; grow or chain rings when scenes get bigger.
 const RING_BYTES: u64 = 4 << 20;
+/// Shadow map resolution (ADR-0011 §7).
+const SHADOW_SIZE: u32 = 2048;
+/// The shadow volume covers the camera frustum up to this distance (meters).
+const SHADOW_DISTANCE: f32 = 50.0;
 const HDR_FORMAT: Format = Format::Rgba16Float;
 const DEPTH_FORMAT: Format = Format::D32Sfloat;
 
@@ -126,7 +136,13 @@ struct Targets {
 /// Forward renderer. All methods taking a device must be given the device it was created with.
 pub struct Renderer {
     forward: PipelineHandle,
+    shadow_pipeline: PipelineHandle,
     tonemap: PipelineHandle,
+    shadow: TextureHandle,
+    shadow_index: u32,
+    shadow_initialized: bool,
+    shadow_sampler: SamplerHandle,
+    shadow_sampler_index: u32,
     targets: Targets,
     encode_srgb: bool,
     linear_repeat: SamplerHandle,
@@ -184,7 +200,7 @@ fn make_pipeline<D: Device>(
     label: &str,
     vert: &[u8],
     frag: &[u8],
-    color: Format,
+    color: &[Format],
     depth: Option<DepthState>,
     cull: CullMode,
 ) -> Result<PipelineHandle, RhiError> {
@@ -206,12 +222,12 @@ fn make_pipeline<D: Device>(
             module: fs,
             entry: "main",
         },
-        color_formats: &[color],
+        color_formats: color,
         depth,
         topology: PrimitiveTopology::TriangleList,
         cull,
         front_face: FrontFace::CounterClockwise,
-        blend: &[BlendState::default()],
+        blend: &[BlendState::default()][..color.len().min(1)],
     });
     // Module destruction is deferred by the device; the pipeline no longer needs them.
     d.destroy_shader_module(vs);
@@ -255,7 +271,7 @@ impl Renderer {
             "renderer.forward",
             FORWARD_VERT,
             FORWARD_FRAG,
-            HDR_FORMAT,
+            &[HDR_FORMAT],
             Some(DepthState {
                 format: DEPTH_FORMAT,
                 compare: CompareOp::GreaterOrEqual, // reverse-Z
@@ -269,10 +285,46 @@ impl Renderer {
             "renderer.tonemap",
             TONEMAP_VERT,
             TONEMAP_FRAG,
-            swapchain_format,
+            &[swapchain_format],
             None,
             CullMode::None,
         )?;
+        // Front-face culling: only back faces enter the map, so lit surfaces never self-shadow
+        // (no acne) at the cost of light leaking through very thin casters.
+        let shadow_pipeline = make_pipeline(
+            device,
+            "renderer.shadow",
+            SHADOW_VERT,
+            SHADOW_FRAG,
+            &[],
+            Some(DepthState {
+                format: DEPTH_FORMAT,
+                compare: CompareOp::LessOrEqual,
+                write: true,
+                bias: Some(DepthBias {
+                    constant: 2.0,
+                    slope: 2.5,
+                    clamp: 0.0,
+                }),
+            }),
+            CullMode::Front,
+        )?;
+        let shadow = device.create_texture(&TextureDesc {
+            label: Some("renderer.shadow"),
+            width: SHADOW_SIZE,
+            height: SHADOW_SIZE,
+            format: DEPTH_FORMAT,
+            usage: TextureUsage::DEPTH_ATTACHMENT | TextureUsage::SAMPLED,
+        })?;
+        let shadow_sampler = device.create_sampler(&SamplerDesc {
+            label: Some("renderer.shadow_cmp"),
+            mag_filter: Filter::Linear,
+            min_filter: Filter::Linear,
+            address_u: AddressMode::ClampToEdge,
+            address_v: AddressMode::ClampToEdge,
+            address_w: AddressMode::ClampToEdge,
+            compare: Some(CompareOp::LessOrEqual),
+        })?;
         let targets = create_targets(device, extent)?;
         let sampler = |label, address| {
             device.create_sampler(&SamplerDesc {
@@ -304,7 +356,13 @@ impl Renderer {
         }
         let mut r = Self {
             forward,
+            shadow_pipeline,
             tonemap,
+            shadow_index: device.texture_index(shadow)?,
+            shadow,
+            shadow_initialized: false,
+            shadow_sampler_index: device.sampler_index(shadow_sampler)?,
+            shadow_sampler,
             targets,
             encode_srgb: !swapchain_format.is_srgb(),
             linear_repeat,
@@ -533,14 +591,55 @@ impl Renderer {
         let view = scene.camera.view();
         let proj = scene.camera.projection(w as f32 / h as f32);
         let cam = scene.camera.position;
+        if scene.lights.len() > MAX_LIGHTS {
+            tracing::warn!(
+                lights = scene.lights.len(),
+                max = MAX_LIGHTS,
+                "too many lights, extra ignored"
+            );
+        }
+        let lights: Vec<GpuLight> = scene
+            .lights
+            .iter()
+            .take(MAX_LIGHTS)
+            .map(GpuLight::new)
+            .collect();
+        let shadow_light = scene.lights.iter().take(MAX_LIGHTS).position(|l| {
+            matches!(
+                l,
+                Light::Directional {
+                    cast_shadows: true,
+                    ..
+                }
+            )
+        });
+        let fit = shadow_light.and_then(|i| match scene.lights[i] {
+            Light::Directional { direction, .. } => Some(fit_directional(
+                &scene.camera,
+                w as f32 / h as f32,
+                direction,
+                SHADOW_DISTANCE,
+                SHADOW_SIZE,
+            )),
+            _ => None,
+        });
         let frame = GpuFrame {
             view,
             proj,
             view_proj: proj * view,
+            light_view_proj: fit.as_ref().map_or(Mat4::IDENTITY, |f| f.view_proj),
             camera_pos: [cam.x, cam.y, cam.z, 1.0],
-            light_count: scene.lights.len() as u32,
+            light_count: lights.len() as u32,
             sampler_index: self.sampler_indices.0,
+            shadow_index: self.shadow_index,
+            shadow_sampler: self.shadow_sampler_index,
             exposure: scene.camera.exposure,
+            shadow_light: if fit.is_some() {
+                shadow_light.map_or(u32::MAX, |i| i as u32)
+            } else {
+                u32::MAX
+            },
+            shadow_texel_world: fit.as_ref().map_or(0.0, |f| f.texel_world),
             pad: 0.0,
         };
 
@@ -571,7 +670,6 @@ impl Renderer {
                 pad: [0; 3],
             });
         }
-        let lights: Vec<GpuLight> = scene.lights.iter().map(GpuLight::new).collect();
         let dense = self
             .materials
             .iter()
@@ -590,6 +688,19 @@ impl Renderer {
             self.ring_push(device, slot, bytemuck::cast_slice(&materials))?,
         ];
 
+        let no_draws: &[Draw] = &[];
+        shadow_pass(
+            cmd,
+            &ShadowInputs {
+                pipeline: self.shadow_pipeline,
+                texture: self.shadow,
+                size: SHADOW_SIZE,
+                initialized: self.shadow_initialized,
+                addresses,
+                draws: if fit.is_some() { &draws } else { no_draws },
+            },
+        );
+        self.shadow_initialized = true;
         forward_pass(
             cmd,
             &ForwardInputs {
@@ -646,6 +757,9 @@ impl Renderer {
         device.destroy_texture(self.targets.depth);
         device.destroy_sampler(self.linear_repeat);
         device.destroy_sampler(self.linear_clamp);
+        device.destroy_texture(self.shadow);
+        device.destroy_sampler(self.shadow_sampler);
+        device.destroy_pipeline(self.shadow_pipeline);
         device.destroy_pipeline(self.forward);
         device.destroy_pipeline(self.tonemap);
         tracing::debug!("renderer destroyed");

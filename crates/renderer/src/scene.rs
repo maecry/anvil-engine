@@ -57,6 +57,8 @@ pub enum Light {
         color: Vec3,
         /// Intensity multiplier (lux).
         intensity: f32,
+        /// Casts the shadow map. Only the first such light in the scene gets shadows.
+        cast_shadows: bool,
     },
     /// Omnidirectional point light with inverse-square falloff.
     Point {
@@ -88,6 +90,9 @@ pub enum Light {
     },
 }
 
+/// Maximum lights shaded per frame; extra lights are ignored (with a warning).
+pub const MAX_LIGHTS: usize = 64;
+
 /// Everything the renderer needs for one frame.
 #[derive(Clone, Debug)]
 pub struct RenderScene {
@@ -95,7 +100,7 @@ pub struct RenderScene {
     pub camera: Camera,
     /// Instances to draw.
     pub meshes: Vec<MeshInstance>,
-    /// Lights; M3a shades with the first directional one.
+    /// Lights, at most [`MAX_LIGHTS`] are shaded.
     pub lights: Vec<Light>,
 }
 
