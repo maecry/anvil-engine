@@ -80,6 +80,11 @@ float spot_shadow(FrameData f, uint slot, Light l, vec3 world_pos, vec3 n, float
     return pcf(f.spot_tex[slot], vec3(ndc.xy * 0.5 + 0.5, ndc.z));
 }
 
+float ssao_factor(vec2 frag_xy) {
+    if (pc.ssao_index == 0xFFFFFFFFu) return 1.0;
+    return texelFetch(textures[nonuniformEXT(pc.ssao_index)], ivec2(frag_xy), 0).r;
+}
+
 uint cluster_index(FrameData f, vec2 frag_xy, float view_z) {
     uvec2 tile = min(uvec2(frag_xy / f.cluster_params.zw * vec2(CLUSTERS_X, CLUSTERS_Y)),
                      uvec2(CLUSTERS_X - 1u, CLUSTERS_Y - 1u));
@@ -160,8 +165,10 @@ void shade(Surface s, vec3 world_pos, vec2 frag_xy, out vec3 diff, out vec3 spec
     vec2 brdf = texture(sampler2D(textures[nonuniformEXT(f.brdf_lut_index)],
                                   samplers[nonuniformEXT(f.ibl_sampler)]),
                         vec2(clamp(n_o_v, 0.5 / 256.0, 1.0 - 0.5 / 256.0), s.roughness)).rg; // U wraps: keep off the edge
-    diff = irradiance * s.base * (1.0 - s.metallic) * s.ao * f.env_intensity;
-    spec = pre * (f0 * brdf.x + brdf.y) * s.ao * f.env_intensity;
+    // Screen-space AO multiplies only the ambient (IBL) term.
+    float ambient_ao = s.ao * ssao_factor(frag_xy);
+    diff = irradiance * s.base * (1.0 - s.metallic) * ambient_ao * f.env_intensity;
+    spec = pre * (f0 * brdf.x + brdf.y) * ambient_ao * f.env_intensity;
 
     for (uint i = 0u; i < f.dir_count; ++i) {
         add_light(f, pc.lights.l[i], i, s, world_pos, v, n_o_v, f0, a2, view_z, diff, spec);
@@ -193,5 +200,6 @@ vec3 debug_view(FrameData f, vec3 color, vec3 world_pos, vec2 frag_xy) {
                                      vec3(0.3, 0.4, 1.0), vec3(1.0, 1.0, 0.25));
         return color * tint[cascade_of(f, z)];
     }
+    if (f.debug_mode == 3u) return vec3(clamp(1.0 - (1.0 - ssao_factor(frag_xy)) * 3.0, 0.0, 1.0)) * 2.0; // occlusion exaggerated 3x; x2 = white after tonemap
     return color;
 }

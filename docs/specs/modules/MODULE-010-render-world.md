@@ -2,10 +2,10 @@
 
 | Field | Value |
 |---|---|
-| Status | Accepted (ADR-0011, ADR-0012) |
+| Status | Accepted (ADR-0011, ADR-0012); M4 complete |
 | Crate | renderer |
 | Layer | LAYER-005 |
-| Milestone | M3; M4b (culling, sorting, clustered lights, alpha, cascades) |
+| Milestone | M3; M4 complete (M4b culling, sorting, clustered lights, alpha, cascades; M4c post-processing inputs) |
 | Traces to | FR-REND-001, FR-REND-002, FR-REND-003, FR-REND-004, FR-REND-025, FR-RES-012, NFR-CONC-003, NFR-ARCH-004, NFR-ARCH-005; MASTER-000 §8.5, §9.1, §11; ADR-0005 |
 | Last updated | 2026-11-02 |
 
@@ -57,7 +57,7 @@ impl RenderWorld {
 }
 ```
 
-As built (M3a, updated for M4a/M4b; the concept above is superseded): `RenderScene { camera: Camera, meshes: Vec<MeshInstance>, lights: Vec<Light>, environment }` is defined in the renderer crate; `Renderer::render(&mut self, device, cmd, &FrameToken, &RenderScene, &SwapchainImage, final_state)` takes it by reference and returns `RenderError`. Renderer options: `set_render_path(RenderPath::{Forward, Deferred})`, `set_debug_view(DebugView)`. `Light::Spot` has `cast_shadows`; `MaterialDesc` has `alpha_mode: AlphaMode::{Opaque, Mask(f32), Blend}` and `double_sided`; `MAX_LIGHTS` is 1024, `MAX_SPOT_SHADOWS` 4. `RendererStats { draws, triangles, lights, ring_bytes_used, graph, culled, shadow_draws, cluster_time }`. There is no `RenderWorld` type yet; see LAYER-005 §8 for the full API.
+As built (M3a, updated for M4a/M4b; the concept above is superseded): `RenderScene { camera: Camera, meshes: Vec<MeshInstance>, lights: Vec<Light>, environment }` is defined in the renderer crate; `Renderer::render(&mut self, device, cmd, &FrameToken, &RenderScene, &SwapchainImage, final_state)` takes it by reference and returns `RenderError`. Renderer options: `set_render_path(RenderPath::{Forward, Deferred})`, `set_debug_view(DebugView)`. `MeshInstance` has `prev_transform` (`MeshInstance::new` for static objects); `set_post(PostSettings { ssao, taa, bloom })`; `DebugView::{None, Clusters, Cascades, Ssao}`. `Light::Spot` has `cast_shadows`; `MaterialDesc` has `alpha_mode: AlphaMode::{Opaque, Mask(f32), Blend}` and `double_sided`; `MAX_LIGHTS` is 1024, `MAX_SPOT_SHADOWS` 4. `RendererStats { draws, triangles, lights, ring_bytes_used, graph, culled, shadow_draws, cluster_time }`. There is no `RenderWorld` type yet; see LAYER-005 §8 for the full API.
 
 ## 6. Data structures
 

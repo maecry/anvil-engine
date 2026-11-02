@@ -13,6 +13,9 @@ pub(crate) struct GpuFrame {
     pub proj: Mat4,
     pub view_proj: Mat4,
     pub inv_view_proj: Mat4,
+    pub unjit_view_proj: Mat4,
+    pub inv_unjit_view_proj: Mat4,
+    pub prev_view_proj: Mat4,
     pub cascade_vp: [Mat4; 4],
     pub spot_vp: [Mat4; 4],
     pub camera_pos: [f32; 4],
@@ -49,6 +52,7 @@ pub(crate) struct GpuFrame {
 pub(crate) struct GpuInstance {
     pub model: Mat4,
     pub normal_matrix: Mat4,
+    pub prev_model: Mat4,
     pub material: u32,
     pub pad: [u32; 3],
 }
@@ -148,8 +152,8 @@ mod tests {
 
     #[test]
     fn layouts_match_std430() {
-        assert_eq!(size_of::<GpuFrame>(), 1008);
-        assert_eq!(size_of::<GpuInstance>(), 144);
+        assert_eq!(size_of::<GpuFrame>(), 1200);
+        assert_eq!(size_of::<GpuInstance>(), 208);
         assert_eq!(size_of::<GpuLight>(), 64);
         assert_eq!(size_of::<GpuMaterial>(), 80);
     }

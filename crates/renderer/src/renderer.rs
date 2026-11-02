@@ -24,6 +24,10 @@ use crate::passes::{
     ShadowInputs, SkyboxInputs, TonemapInputs, forward_pass, gbuffer_pass, lighting_pass, prepass,
     shadow_pass, skybox_pass, tonemap_pass, transparent_pass,
 };
+use crate::post::{
+    BloomInputs, BloomTargets, DOWN_NAMES, TaaInputs, UP_NAMES, bloom_passes, jitter_pixels,
+    jitter_projection, ssao_blur_pass, ssao_pass, taa_pass,
+};
 use crate::shadow::{CASCADES, cascade_splits, fit_directional, fit_spot};
 use crate::{Light, MAX_LIGHTS, MAX_SPOT_SHADOWS, MeshData, RenderScene};
 
@@ -37,6 +41,11 @@ static FORWARD_FRAGS: [&[u8]; 2] = [spv!("forward.frag"), spv!("forward_mask.fra
 static PREPASS_FRAGS: [&[u8]; 2] = [spv!("prepass.frag"), spv!("prepass_mask.frag")];
 static GBUFFER_FRAGS: [&[u8]; 2] = [spv!("gbuffer.frag"), spv!("gbuffer_mask.frag")];
 static LIGHTING_FRAG: &[u8] = spv!("lighting.frag");
+static SSAO_FRAG: &[u8] = spv!("ssao.frag");
+static SSAO_BLUR_FRAG: &[u8] = spv!("ssao_blur.frag");
+static TAA_FRAG: &[u8] = spv!("taa.frag");
+static BLOOM_DOWN_FRAG: &[u8] = spv!("bloom_down.frag");
+static BLOOM_UP_FRAG: &[u8] = spv!("bloom_up.frag");
 static SHADOW_VERT: &[u8] = spv!("shadow.vert");
 static SHADOW_FRAGS: [&[u8]; 2] = [spv!("shadow.frag"), spv!("shadow_mask.frag")];
 pub(crate) static TONEMAP_VERT: &[u8] = spv!("tonemap.vert");
@@ -124,6 +133,38 @@ pub enum DebugView {
     Clusters,
     /// Directional shadow cascades tinted.
     Cascades,
+    /// The screen-space ambient occlusion factor (white when SSAO is off).
+    Ssao,
+}
+
+/// Post-processing switches (ADR-0012 §11); a disabled effect adds no graph passes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PostSettings {
+    /// Half-resolution SSAO multiplying the ambient/IBL term.
+    pub ssao: bool,
+    /// Temporal anti-aliasing (Halton jitter, velocity, YCoCg-clamped history).
+    pub taa: bool,
+    /// Bloom added before tonemapping.
+    pub bloom: bool,
+}
+
+impl Default for PostSettings {
+    fn default() -> Self {
+        Self {
+            ssao: true,
+            taa: true,
+            bloom: true,
+        }
+    }
+}
+
+/// Bloom strength mixed into the HDR image before tonemapping.
+const BLOOM_STRENGTH: f32 = 0.025;
+
+/// The two TAA history textures (ping-pong) at the target size.
+struct History {
+    textures: [TextureHandle; 2],
+    extent: (u32, u32),
 }
 
 /// Handle to a mesh created with [`Renderer::create_mesh`].
@@ -234,6 +275,19 @@ pub struct Renderer {
     cascades: [ShadowMap; CASCADES],
     spots: [ShadowMap; MAX_SPOT_SHADOWS],
     cluster_grid: Option<ClusterGrid>,
+    ssao_pipeline: PipelineHandle,
+    ssao_blur_pipeline: PipelineHandle,
+    taa_pipeline: PipelineHandle,
+    bloom_down_pipeline: PipelineHandle,
+    bloom_up_pipeline: PipelineHandle,
+    post: PostSettings,
+    history: Option<History>,
+    /// History texture written this frame; the other one holds the previous result.
+    taa_write: usize,
+    /// The previous frame resolved TAA into the history at the current extent.
+    taa_valid: bool,
+    prev_view_proj: Mat4,
+    frame_index: u32,
     path: RenderPath,
     debug_view: DebugView,
     shadow_sampler: SamplerHandle,
@@ -415,10 +469,10 @@ impl Renderer {
             "renderer.prepass",
             FORWARD_VERT,
             &PREPASS_FRAGS,
-            &[Format::Rg16Float],
+            &[Format::Rg16Float, Format::Rg16Float], // view normal, velocity
             depth_state(CompareOp::GreaterOrEqual, true, None),
             CullMode::Back,
-            &none,
+            &[BlendState::default(); 2],
         )?;
         let forward = make_variants(
             device,
@@ -468,6 +522,22 @@ impl Renderer {
             None,
             CullMode::None,
         )?;
+        let post_pipe = |label, frag, format| {
+            make_pipeline(
+                device,
+                label,
+                TONEMAP_VERT,
+                frag,
+                &[format],
+                None,
+                CullMode::None,
+            )
+        };
+        let ssao_pipeline = post_pipe("renderer.ssao", SSAO_FRAG, Format::R8Unorm)?;
+        let ssao_blur_pipeline = post_pipe("renderer.ssao_blur", SSAO_BLUR_FRAG, Format::R8Unorm)?;
+        let taa_pipeline = post_pipe("renderer.taa", TAA_FRAG, HDR_FORMAT)?;
+        let bloom_down_pipeline = post_pipe("renderer.bloom_down", BLOOM_DOWN_FRAG, HDR_FORMAT)?;
+        let bloom_up_pipeline = post_pipe("renderer.bloom_up", BLOOM_UP_FRAG, HDR_FORMAT)?;
         let tonemap = make_pipeline(
             device,
             "renderer.tonemap",
@@ -557,6 +627,17 @@ impl Renderer {
             cascades: cascades.try_into().ok().expect("4 cascades"),
             spots: spots.try_into().ok().expect("4 spot maps"),
             cluster_grid: None,
+            ssao_pipeline,
+            ssao_blur_pipeline,
+            taa_pipeline,
+            bloom_down_pipeline,
+            bloom_up_pipeline,
+            post: PostSettings::default(),
+            history: None,
+            taa_write: 0,
+            taa_valid: false,
+            prev_view_proj: Mat4::IDENTITY,
+            frame_index: 0,
             path: RenderPath::default(),
             debug_view: DebugView::default(),
             shadow_sampler_index: device.sampler_index(shadow_sampler)?,
@@ -746,6 +827,16 @@ impl Renderer {
         self.path
     }
 
+    /// Selects the post-processing effects for the next frame.
+    pub fn set_post(&mut self, post: PostSettings) {
+        self.post = post;
+    }
+
+    /// Current post-processing effects.
+    pub fn post(&self) -> PostSettings {
+        self.post
+    }
+
     /// Selects a debug visualisation for the next frame.
     pub fn set_debug_view(&mut self, view: DebugView) {
         self.debug_view = view;
@@ -806,8 +897,49 @@ impl Renderer {
         let (w, h) = (target.extent.0.max(1), target.extent.1.max(1));
         let view = scene.camera.view();
         let aspect = w as f32 / h as f32;
-        let proj = scene.camera.projection(aspect);
+        let proj_unjit = scene.camera.projection(aspect);
+        let view_proj_unjit = proj_unjit * view;
+        // TAA: the main view (prepass, G-buffer/forward, transparent, SSAO) renders with a
+        // sub-pixel jittered projection; shadows, culling and clusters use the plain one.
+        let taa = self.post.taa;
+        let jitter = if taa {
+            jitter_pixels(self.frame_index)
+        } else {
+            (0.0, 0.0)
+        };
+        let proj = jitter_projection(proj_unjit, jitter, (w, h));
         let view_proj = proj * view;
+        let prev_view_proj = if self.frame_index == 0 {
+            view_proj_unjit
+        } else {
+            self.prev_view_proj
+        };
+        if !taa {
+            self.taa_valid = false;
+        } else if self.history.as_ref().is_none_or(|hs| hs.extent != (w, h)) {
+            if let Some(old) = self.history.take() {
+                for t in old.textures {
+                    self.graph.forget(t);
+                    device.destroy_texture(t);
+                }
+            }
+            let mut textures = [TextureHandle::NULL; 2];
+            for (i, t) in textures.iter_mut().enumerate() {
+                *t = device.create_texture(&TextureDesc {
+                    label: Some(["taa.history0", "taa.history1"][i]),
+                    width: w,
+                    height: h,
+                    format: HDR_FORMAT,
+                    usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::SAMPLED,
+                })?;
+                self.graph.track(*t, TextureState::Undefined);
+            }
+            self.history = Some(History {
+                textures,
+                extent: (w, h),
+            });
+            self.taa_valid = false;
+        }
         let cam = scene.camera.position;
         let ibl = self.ibl.indices();
         let tan_y = (scene.camera.fov_y * 0.5).tan();
@@ -966,11 +1098,12 @@ impl Renderer {
             instances.push(GpuInstance {
                 model: inst.transform,
                 normal_matrix: inst.transform.inverse().transpose(),
+                prev_model: inst.prev_transform,
                 material: material_id.index(),
                 pad: [0; 3],
             });
         }
-        let cam_frustum = Frustum::from_view_proj(view_proj);
+        let cam_frustum = Frustum::from_view_proj(view_proj_unjit);
         let (mut opaque, mut blended) = (Vec::new(), Vec::new());
         let mut culled = 0;
         let mut triangles = 0u64;
@@ -1042,6 +1175,9 @@ impl Renderer {
             proj,
             view_proj,
             inv_view_proj: view_proj.inverse(),
+            unjit_view_proj: view_proj_unjit,
+            inv_unjit_view_proj: view_proj_unjit.inverse(),
+            prev_view_proj,
             cascade_vp,
             spot_vp,
             camera_pos: [cam.x, cam.y, cam.z, 1.0],
@@ -1123,6 +1259,7 @@ impl Renderer {
             },
         );
         let normal = b.transient("view_normal", color_tex(Format::Rg16Float));
+        let velocity = b.transient("velocity", color_tex(Format::Rg16Float));
         let rebake = self.ibl.needs_bake(&scene.environment);
         if rebake {
             self.ibl.add_bakes(&mut b, &ids, &scene.environment);
@@ -1159,9 +1296,37 @@ impl Renderer {
             PrepassInputs {
                 depth,
                 normal,
+                velocity,
                 geometry: geometry(self.prepass, &opaque),
             },
         );
+        // Half-resolution SSAO then a depth-aware blur/upsample to full resolution.
+        let ssao = self.post.ssao.then(|| {
+            let half = TransientDesc {
+                width: w.div_ceil(2),
+                height: h.div_ceil(2),
+                ..color_tex(Format::R8Unorm)
+            };
+            let ao_half = b.transient("ssao.half", half);
+            let ao = b.transient("ssao", color_tex(Format::R8Unorm));
+            ssao_pass(
+                &mut b,
+                self.ssao_pipeline,
+                depth,
+                normal,
+                ao_half,
+                addresses,
+            );
+            ssao_blur_pass(
+                &mut b,
+                self.ssao_blur_pipeline,
+                ao_half,
+                depth,
+                ao,
+                addresses,
+            );
+            ao
+        });
         let mut reads: Vec<_> = cascade_ids.into_iter().chain(spot_ids).collect();
         reads.extend([ids.sky, ids.irradiance, ids.lut]);
         reads.extend(ids.prefilter);
@@ -1172,6 +1337,7 @@ impl Renderer {
                     hdr,
                     depth,
                     reads: reads.clone(),
+                    ssao,
                     geometry: geometry(self.forward, &opaque),
                 },
             ),
@@ -1197,6 +1363,7 @@ impl Renderer {
                         gbuffer,
                         depth,
                         reads: reads.clone(),
+                        ssao,
                         addresses,
                     },
                 );
@@ -1219,19 +1386,84 @@ impl Renderer {
                     hdr,
                     depth,
                     reads,
+                    ssao: None,
                     geometry: geometry(self.transparent, &blended),
                 },
             );
         }
+        // TAA resolves the lit HDR image into one of the two imported history textures.
+        let mut color = hdr;
+        if let Some(history) = self.history.as_ref().filter(|_| taa) {
+            let prev = b.import(
+                ["taa.history0", "taa.history1"][1 - self.taa_write],
+                history.textures[1 - self.taa_write],
+                history.extent,
+                None,
+            );
+            let curr = b.import(
+                ["taa.history0", "taa.history1"][self.taa_write],
+                history.textures[self.taa_write],
+                history.extent,
+                None,
+            );
+            taa_pass(
+                &mut b,
+                TaaInputs {
+                    pipeline: self.taa_pipeline,
+                    hdr,
+                    depth,
+                    velocity,
+                    history_prev: prev,
+                    history_curr: curr,
+                    reset: !self.taa_valid,
+                    addresses,
+                },
+            );
+            color = curr;
+        }
+        let bloom = self.post.bloom.then(|| {
+            let size = |level: usize| ((w >> (level + 1)).max(1), (h >> (level + 1)).max(1));
+            let mut tex = |name: &'static str, level: usize| {
+                let (width, height) = size(level);
+                let id = b.transient(
+                    name,
+                    TransientDesc {
+                        width,
+                        height,
+                        ..color_tex(HDR_FORMAT)
+                    },
+                );
+                (id, (width, height))
+            };
+            let targets = BloomTargets {
+                down: std::array::from_fn(|l| tex(DOWN_NAMES[l], l)),
+                up: std::array::from_fn(|l| tex(UP_NAMES[l], l)),
+            };
+            let result = targets.up[0].0;
+            bloom_passes(
+                &mut b,
+                BloomInputs {
+                    down_pipeline: self.bloom_down_pipeline,
+                    up_pipeline: self.bloom_up_pipeline,
+                    source: color,
+                    source_extent: (w, h),
+                    sampler_index: self.sampler_indices.1,
+                    targets,
+                },
+            );
+            result
+        });
         tonemap_pass(
             &mut b,
             TonemapInputs {
                 pipeline: self.tonemap,
-                hdr,
+                hdr: color,
                 sampler_index: self.sampler_indices.1,
                 exposure: scene.camera.exposure,
                 encode_srgb: self.encode_srgb,
                 target: swapchain,
+                bloom,
+                bloom_strength: BLOOM_STRENGTH,
             },
         );
         b.export(swapchain, final_state);
@@ -1242,6 +1474,12 @@ impl Renderer {
         if rebake {
             self.ibl.mark_baked(&scene.environment);
         }
+        self.prev_view_proj = view_proj_unjit;
+        self.frame_index = self.frame_index.wrapping_add(1);
+        if taa {
+            self.taa_write = 1 - self.taa_write;
+        }
+        self.taa_valid = taa;
 
         self.stats = RendererStats {
             draws: (opaque.len() + blended.len()) as u32,
@@ -1281,6 +1519,11 @@ impl Renderer {
             device.destroy_texture(m.texture);
         }
         device.destroy_sampler(self.shadow_sampler);
+        if let Some(h) = self.history {
+            for t in h.textures {
+                device.destroy_texture(t);
+            }
+        }
         for p in self
             .shadow_pipes
             .into_iter()
@@ -1288,7 +1531,15 @@ impl Renderer {
             .chain(self.forward)
             .chain(self.gbuffer)
             .chain(self.transparent)
-            .chain([self.lighting, self.tonemap])
+            .chain([
+                self.lighting,
+                self.tonemap,
+                self.ssao_pipeline,
+                self.ssao_blur_pipeline,
+                self.taa_pipeline,
+                self.bloom_down_pipeline,
+                self.bloom_up_pipeline,
+            ])
         {
             device.destroy_pipeline(p);
         }

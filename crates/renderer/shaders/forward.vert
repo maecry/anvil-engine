@@ -10,6 +10,8 @@ layout(location = 1) out vec3 v_normal;
 layout(location = 2) out vec2 v_uv;
 layout(location = 3) out vec4 v_tangent;
 layout(location = 4) flat out uint v_material;
+layout(location = 5) out vec4 v_clip;       // unjittered clip position
+layout(location = 6) out vec4 v_prev_clip;  // previous frame, unjittered (velocity)
 
 void main() {
     Vertex v = pc.vertices.v[gl_VertexIndex];
@@ -20,5 +22,7 @@ void main() {
     v_uv = vec2(v.uv[0], v.uv[1]);
     v_tangent = vec4(mat3(inst.model) * vec3(v.tangent[0], v.tangent[1], v.tangent[2]), v.tangent[3]);
     v_material = inst.material;
+    v_clip = pc.frame.d.unjit_view_proj * world;
+    v_prev_clip = pc.frame.d.prev_view_proj * (inst.prev_model * vec4(v.pos[0], v.pos[1], v.pos[2], 1.0));
     gl_Position = pc.frame.d.view_proj * world;
 }

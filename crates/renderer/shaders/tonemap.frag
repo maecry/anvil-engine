@@ -6,6 +6,8 @@ layout(push_constant, std430) uniform Push {
     uint sampler_index;
     float exposure;
     uint encode_srgb; // 1 when the target is not an sRGB format
+    uint bloom_index; // bloom texture (half resolution), added before tonemapping
+    float bloom_strength; // 0 = off
 } pc;
 
 layout(set = 0, binding = 0) uniform texture2D textures[];
@@ -22,7 +24,9 @@ vec3 aces(vec3 x) {
 void main() {
     vec3 hdr = texture(sampler2D(textures[nonuniformEXT(pc.hdr_index)],
                                  samplers[nonuniformEXT(pc.sampler_index)]), v_uv).rgb;
-    vec3 c = aces(hdr * pc.exposure);
+    vec3 bloom = texture(sampler2D(textures[nonuniformEXT(pc.bloom_index)],
+                                   samplers[nonuniformEXT(pc.sampler_index)]), v_uv).rgb;
+    vec3 c = aces((hdr + bloom * pc.bloom_strength) * pc.exposure);
     if (pc.encode_srgb == 1u) c = pow(c, vec3(1.0 / 2.2));
     out_color = vec4(c, 1.0);
 }

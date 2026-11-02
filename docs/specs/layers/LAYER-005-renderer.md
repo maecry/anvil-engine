@@ -2,8 +2,8 @@
 
 | Field | Value |
 |---|---|
-| Status | Accepted (ADR-0011) |
-| Milestone | M3 (forward, PBR, shadows, IBL: complete); M4a (render graph port: complete); M4b (prepass, clustered lights, deferred, alpha, cascades: complete); M4c (SSAO, TAA, bloom) |
+| Status | Accepted (ADR-0011, ADR-0012); M4 complete |
+| Milestone | M3 (forward, PBR, shadows, IBL: complete); M4a (render graph port: complete); M4b (prepass, clustered lights, deferred, alpha, cascades: complete); M4c (SSAO, TAA, bloom: complete) |
 | Crates | renderer (M3: mesh, camera and material live inside it as modules) |
 | Traces to | MASTER-000 §4.1, §5.2 rules 4-5, §8.5, §9, §11 |
 | Last updated | 2026-11-02 |
@@ -135,8 +135,17 @@ Frame passes: `bake.*` (only when the environment changed), `shadow.cascade0..3`
 
 Superseded M3 statements: the single 50 m shadow map, `MAX_LIGHTS` = 64, "the whole light array is looped" and the forward pass writing depth.
 
-### Deferred beyond M4b
-SSAO, TAA, bloom (M4c); point-light shadows and GPU culling (M5); HDR environment files and glTF import (asset system, LAYER-009).
+### M4c: SSAO, TAA, bloom (ADR-0012 §11, implemented)
+
+Frame order: shadows, `prepass` (depth, view normal, velocity), `ssao` + `ssao.blur`, forward or G-buffer + `lighting`, `skybox`, `transparent`, `taa` (+ `taa.reset`), `bloom.down0..5` / `bloom.up4..0`, `tonemap`. With everything on, pbr-scene builds 27 passes. Each effect is a pass function (`post.rs`) and `PostSettings` simply omits the passes of a disabled one; the graph's culling and validation keep every combination valid (all 8, on both render paths, are run under sync validation).
+
+- **SSAO**: 16-sample hemisphere kernel (radius 0.8 m, per-pixel rotation from interleaved gradient noise) at half resolution from the prepass depth and the octahedral view-space normal, then `ssao.blur`: a 3x3 depth-aware (bilateral) blur fused with the upsample to full resolution (`R8Unorm`). It multiplies only the ambient/IBL term (`shade()` in `lighting.glsl`, both paths); direct lights are untouched, blended surfaces do not receive it. Key `O`, `ANVIL_SSAO=0|1`, `DebugView::Ssao` (shows the occlusion exaggerated 3x).
+- **TAA**: Halton(2, 3) jitter over 8 frames applied to the projection of the main view only (prepass, G-buffer/forward, transparent; `GpuFrame` carries the jittered and the plain matrices); shadows, culling and clusters do not jitter. `MeshInstance.prev_transform` and the previous view-projection give a velocity target written by the prepass (`Rg16Float`, uv delta); the sky and other pixels with no geometry use camera-only reprojection through the inverse view-projection (homogeneous, valid at infinity). The resolve (`taa.frag`) works in HDR before bloom: 3x3 YCoCg neighborhood clamp of the history, velocity taken from the closest-depth neighbor, history weight 0.9 (blend 0.1), history rejected outside the screen, on the first frame, after a resize and after TAA was off, and on disocclusion (static pixels compare the linear depth stored in the history alpha with the depth the camera motion predicts). It ping-pongs two imported `Rgba16Float` history textures. Key `Y`, `ANVIL_TAA=0|1`. `// shortcut:` bilinear history sampling (no Catmull-Rom), no history depth rejection for moving objects (clamping only), no material mip bias or sharpening (optional in the ADR, skipped).
+- **Bloom**: threshold-free. A 6-level downsample chain (13-tap filter, Karis average on the first level) in separate `Rgba16Float` transients starting at half resolution, and a tent upsample chain (`bloom.up4..0`, each adding the same-size down level) in separate textures; `tonemap.frag` adds the result scaled by 0.025 to the HDR image before the ACES curve. Key `B`, `ANVIL_BLOOM=0|1`.
+- **Examples/tests**: pbr-scene also has `ANVIL_CAMERA_ORBIT=1` (slow orbit, a function of the frame number), a turning checker cube (exercises `prev_transform`), and `ANVIL_TOGGLE_POST=n` (steps through all 8 combinations every n frames). Unit tests: `post.rs` (Halton values, jitter bounds and cycle, projection jitter moves the image by the requested pixels at any depth), `GpuFrame` (1200 bytes) and `GpuInstance` (208 bytes) layout checks.
+
+### Deferred beyond M4
+Point-light shadows, GPU culling and shadows for blended objects (M5); HDR environment files and glTF import (asset system, LAYER-009).
 
 ## 13. Testing strategy
 
@@ -155,6 +164,11 @@ M3b (implemented):
 
 M3c (implemented):
 - [x] IBL (procedural sky, per-roughness prefiltered equirect textures, irradiance, BRDF LUT), skybox, re-bake on change.
+
+M4 (implemented, ADR-0012):
+- [x] M3 passes run as graph nodes with no hand-written barriers (M4a); pixel-identical screenshot.
+- [x] Depth prepass, clustered lights (1024 cap), forward and deferred paths (screenshots differ by at most 47/255 at a few edge pixels, 0.14/255 on average), alpha mask and blend, 4 cascades, 4 spot shadows, CPU frustum culling and sorting (M4b).
+- [x] SSAO, TAA and bloom as graph passes, each switchable at runtime; zero validation errors and warnings in all 8 combinations on both paths, and with `ANVIL_GPU_AV=1` zero errors (M4c).
 
 Open (not blocking M3 exit):
 - [ ] Renderer builds against a mock backend (the `NullBackend` of earlier drafts is the mock in `rhi` tests).

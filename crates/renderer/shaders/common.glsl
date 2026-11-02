@@ -11,7 +11,10 @@ struct FrameData {
     mat4 view;
     mat4 proj;
     mat4 view_proj;
-    mat4 inv_view_proj;
+    mat4 inv_view_proj;         // jittered like view_proj (matches the prepass depth)
+    mat4 unjit_view_proj;       // without TAA jitter (velocity, camera reprojection)
+    mat4 inv_unjit_view_proj;
+    mat4 prev_view_proj;        // previous frame, without jitter
     mat4 cascade_vp[4];         // directional cascades (orthographic, Y flip folded in)
     mat4 spot_vp[4];            // spot shadow maps (perspective, depth 0..1, Y flip folded in)
     vec4 camera_pos;
@@ -24,7 +27,7 @@ struct FrameData {
     uint sampler_index;
     uint shadow_sampler;        // bindless slot of the comparison sampler
     float exposure;
-    uint debug_mode;            // 0 none, 1 cluster light count, 2 cascade tint
+    uint debug_mode;            // 0 none, 1 cluster light count, 2 cascade tint, 3 SSAO
     uint pad0;
     uint pad1;
     uint sky_index;             // equirect environment textures (bindless slots)
@@ -43,7 +46,7 @@ struct FrameData {
 };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Frame { FrameData d; };
 
-struct Instance { mat4 model; mat4 normal_matrix; uint material; uint pad0; uint pad1; uint pad2; };
+struct Instance { mat4 model; mat4 normal_matrix; mat4 prev_model; uint material; uint pad0; uint pad1; uint pad2; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Instances { Instance i[]; };
 
 // position_type.w: 0 directional, 1 point, 2 spot. direction = direction the light travels.
@@ -80,6 +83,7 @@ layout(push_constant, std430) uniform Push {
     Lights lights;
     Materials materials;
     Vertices vertices;
-    uint view_index;            // shadow passes: 0..3 cascade, 4..7 spot
-    uvec4 gbuf;                 // deferred lighting: albedo, normal, emissive, depth slots
+    uint view_index;            // shadow passes: 0..3 cascade, 4..7 spot; TAA: 1 = reset history
+    uint ssao_index;            // bindless slot of the full-resolution AO texture, ~0u = none
+    uvec4 gbuf;                 // per-pass texture slots (deferred lighting, SSAO, TAA)
 } pc;

@@ -2,8 +2,8 @@
 
 | Field | Value |
 |---|---|
-| Status | Accepted (ADR-0012) |
-| Milestone | M4 (M4a: graph and M3 port, implemented; M4b-c use it) |
+| Status | Accepted (ADR-0012); M4 complete |
+| Milestone | M4 (complete: M4a graph and M3 port, M4b prepass/clustered/deferred/alpha/cascades, M4c SSAO/TAA/bloom) |
 | Crates | render-graph |
 | Traces to | MASTER-000 §8.6, §9.3, §10.3, §14 M4 |
 | Last updated | 2026-11-02 |
@@ -108,7 +108,7 @@ Pure unit tests with no GPU on the compile step (`plan.rs`) and the pool (`pool.
 - [x] Invalid graphs rejected with a named pass/resource.
 - [x] The M3 forward pipeline (shadow, IBL bakes, forward + skybox, tonemap) runs as a graph without behaviour change; no hand-written barriers remain in `crates/renderer`.
 - [x] `describe()`, DOT and JSON dumps.
-- [ ] Deferred, post-processing and prepass graphs validation-clean (M4b, M4c).
+- [x] Deferred, prepass and post-processing graphs validation-clean: sync validation, 0 errors and 0 warnings for forward and deferred in all 8 SSAO/TAA/bloom combinations (and a run that cycles them every 3 frames, exercising the TAA reset path); GPU-AV 0 errors. pbr-scene builds 27 passes per frame with everything on (13 in M4b), compile 4 us in release.
 
 ## 15. Open questions (resolved by ADR-0012, 2026-11-02)
 

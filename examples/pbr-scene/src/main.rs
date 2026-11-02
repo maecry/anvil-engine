@@ -4,12 +4,14 @@
 //! Shift = faster, mouse-look while the right button is held).
 //!
 //! Keys: `T` animate sun, `G` forward/deferred, `L` stress lights (256 animated point lights),
-//! `C` cluster light-count heatmap, `V` cascade tint, `Esc` quit.
+//! `O` SSAO, `Y` TAA, `B` bloom, `C` cluster light-count heatmap, `V` cascade tint, `Esc` quit.
 //!
 //! Env: `ANVIL_EXIT_AFTER_FRAMES=n` renders n frames and exits (code 1 on validation errors).
 //! `ANVIL_SCREENSHOT=path.png` (with `ANVIL_EXIT_AFTER_FRAMES`) writes the last frame as a PNG.
 //! `ANVIL_RENDER_PATH=forward|deferred`, `ANVIL_STRESS_LIGHTS=1`,
-//! `ANVIL_DEBUG_VIEW=clusters|cascades` select the initial state headlessly.
+//! `ANVIL_DEBUG_VIEW=clusters|cascades|ssao`, `ANVIL_SSAO=0|1`, `ANVIL_TAA=0|1`,
+//! `ANVIL_BLOOM=0|1` (default 1), `ANVIL_TOGGLE_POST=n` (cycle all combinations every n frames) select the initial state headlessly; `ANVIL_CAMERA_ORBIT=1`
+//! slowly orbits the camera (a function of the frame number, to inspect TAA in motion).
 //! See ADR-0009 §7, ADR-0011 §11 and ADR-0012 §11.
 
 use std::sync::Arc;
@@ -20,8 +22,8 @@ use anyhow::Context;
 use foundation::math::{Mat4, Quat, Vec3};
 use platform::{App, AppError, Control, Event, KeyCode, MouseButton, Window, WindowConfig};
 use renderer::{
-    AlphaMode, Camera, DebugView, Environment, Light, MaterialDesc, MeshInstance, RenderPath,
-    RenderScene, Renderer, mesh,
+    AlphaMode, Camera, DebugView, Environment, Light, MaterialDesc, MeshInstance, PostSettings,
+    RenderPath, RenderScene, Renderer, mesh,
 };
 use rhi::{
     Acquire, Backend, BufferDesc, BufferUsage, CommandEncoder, Device, DeviceDesc,
@@ -143,6 +145,10 @@ struct PbrScene {
     stress: bool,
     path: RenderPath,
     debug: DebugView,
+    post: PostSettings,
+    orbit: bool,
+    /// `ANVIL_TOGGLE_POST=n`: step through all 8 SSAO/TAA/bloom combinations every n frames.
+    toggle_post: Option<u64>,
     last: Instant,
     rendered: u64,
     exit_after: Option<u64>,
@@ -206,30 +212,25 @@ impl PbrScene {
         let quad = r.create_mesh(&device, "quad", &mesh::plane(1.0))?;
 
         let mut instances = vec![
-            MeshInstance {
-                // A 3 x 2 m fence panel standing at the right, slightly turned.
-                mesh: quad,
-                material: fence_mat,
-                transform: Mat4::from_scale_rotation_translation(
+            MeshInstance::new(
+                quad,
+                fence_mat,
+                Mat4::from_scale_rotation_translation(
                     Vec3::new(3.0, 1.0, 2.0),
                     Quat::from_rotation_y(-0.4)
                         * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
                     Vec3::new(3.6, 1.0, 1.4),
                 ),
-            },
-            MeshInstance {
-                mesh: plane,
-                material: ground,
-                transform: Mat4::IDENTITY,
-            },
-            MeshInstance {
-                mesh: cube,
-                material: checker_mat,
-                transform: Mat4::from_rotation_translation(
+            ),
+            MeshInstance::new(plane, ground, Mat4::IDENTITY),
+            MeshInstance::new(
+                cube,
+                checker_mat,
+                Mat4::from_rotation_translation(
                     Quat::from_rotation_y(0.5),
                     Vec3::new(-4.2, 0.5, 0.5),
                 ),
-            },
+            ),
         ];
         // Tinted glass spheres in front of the grid (alpha-blended, sorted back to front).
         for (i, color) in [
@@ -248,15 +249,11 @@ impl PbrScene {
                 alpha_mode: AlphaMode::Blend,
                 ..MaterialDesc::default()
             });
-            instances.push(MeshInstance {
-                mesh: sphere,
+            instances.push(MeshInstance::new(
+                sphere,
                 material,
-                transform: Mat4::from_translation(Vec3::new(
-                    -1.2 + i as f32 * 0.7,
-                    0.5,
-                    3.0 - i as f32 * 0.5,
-                )),
-            });
+                Mat4::from_translation(Vec3::new(-1.2 + i as f32 * 0.7, 0.5, 3.0 - i as f32 * 0.5)),
+            ));
         }
         // Metallic increases along +X, roughness along -Z.
         for row in 0..4 {
@@ -270,15 +267,15 @@ impl PbrScene {
                     roughness,
                     ..MaterialDesc::default()
                 });
-                instances.push(MeshInstance {
-                    mesh: sphere,
+                instances.push(MeshInstance::new(
+                    sphere,
                     material,
-                    transform: Mat4::from_translation(Vec3::new(
+                    Mat4::from_translation(Vec3::new(
                         (col as f32 - 2.0) * 1.4,
                         0.5,
                         -(row as f32) * 1.4,
                     )),
-                });
+                ));
             }
         }
         let lights = vec![
@@ -304,8 +301,9 @@ impl PbrScene {
         ];
         tracing::info!(
             "keys: WASD/Space/Ctrl move, Shift fast, RMB look, T sun animation, G forward/deferred, \
-             L stress lights, C cluster heatmap, V cascade tint, Esc quit; env: ANVIL_RENDER_PATH, \
-             ANVIL_STRESS_LIGHTS, ANVIL_DEBUG_VIEW"
+             L stress lights, O SSAO, Y TAA, B bloom, C cluster heatmap, V cascade tint, Esc quit; \
+             env: ANVIL_RENDER_PATH, ANVIL_STRESS_LIGHTS, ANVIL_DEBUG_VIEW, ANVIL_SSAO, ANVIL_TAA, \
+             ANVIL_BLOOM, ANVIL_CAMERA_ORBIT"
         );
         Ok(Gfx {
             instance,
@@ -336,6 +334,14 @@ impl PbrScene {
             ) + Vec3::Y * axis(KeyCode::Space, KeyCode::Ctrl);
         let speed = MOVE_SPEED * if down(KeyCode::Shift) { 3.0 } else { 1.0 };
         self.camera.position += dir * speed * dt;
+        if self.orbit {
+            let a = self.rendered as f32 * 0.005;
+            self.camera = FlyCamera {
+                position: Vec3::new(9.0 * a.sin(), 2.2, 9.0 * a.cos()),
+                yaw: a,
+                pitch: -0.12,
+            };
+        }
     }
 
     fn render(&mut self, window: &Window) -> anyhow::Result<bool> {
@@ -374,9 +380,25 @@ impl PbrScene {
         if self.stress {
             lights.extend(stress_lights(self.rendered));
         }
+        // The checker cube turns slowly; its previous transform feeds the TAA velocity.
+        let mut meshes = g.instances.clone();
+        meshes[CUBE].transform = cube_transform(self.rendered);
+        meshes[CUBE].prev_transform = cube_transform(self.rendered.saturating_sub(1));
+        if let Some(n) = self
+            .toggle_post
+            .filter(|n| *n > 0 && self.rendered > 0 && self.rendered.is_multiple_of(*n))
+        {
+            let step = (self.rendered / n) as u8 % 8;
+            self.post = PostSettings {
+                ssao: step & 1 != 0,
+                taa: step & 2 != 0,
+                bloom: step & 4 != 0,
+            };
+        }
+        g.renderer.set_post(self.post);
         let scene = RenderScene {
             camera: scene_camera,
-            meshes: g.instances.clone(),
+            meshes,
             lights,
             // The sky's sun follows the shadow-casting directional light.
             environment: Environment {
@@ -517,6 +539,18 @@ impl App for PbrScene {
                 tracing::info!(stress = self.stress, "stress lights");
             }
             Event::Key {
+                code: KeyCode::O,
+                pressed: true,
+            } => self.post.ssao = !self.post.ssao,
+            Event::Key {
+                code: KeyCode::Y,
+                pressed: true,
+            } => self.post.taa = !self.post.taa,
+            Event::Key {
+                code: KeyCode::B,
+                pressed: true,
+            } => self.post.bloom = !self.post.bloom,
+            Event::Key {
                 code: KeyCode::C,
                 pressed: true,
             } => self.debug = toggle(self.debug, DebugView::Clusters),
@@ -559,6 +593,20 @@ impl App for PbrScene {
     }
 }
 
+/// `name=0` disables, anything else (or unset) enables.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).as_deref() != Ok("0")
+}
+
+/// The turning checker cube at frame `frame`; index of its instance in `Gfx::instances`.
+const CUBE: usize = 2;
+fn cube_transform(frame: u64) -> Mat4 {
+    Mat4::from_rotation_translation(
+        Quat::from_rotation_y(0.5 + frame as f32 * 0.015),
+        Vec3::new(-4.2, 0.5, 0.5),
+    )
+}
+
 fn toggle(current: DebugView, view: DebugView) -> DebugView {
     if current == view {
         DebugView::None
@@ -598,9 +646,19 @@ fn main() -> anyhow::Result<()> {
                 Ok("deferred") => RenderPath::Deferred,
                 _ => RenderPath::Forward,
             },
+            post: PostSettings {
+                ssao: env_flag("ANVIL_SSAO"),
+                taa: env_flag("ANVIL_TAA"),
+                bloom: env_flag("ANVIL_BLOOM"),
+            },
+            orbit: std::env::var("ANVIL_CAMERA_ORBIT").as_deref() == Ok("1"),
+            toggle_post: std::env::var("ANVIL_TOGGLE_POST")
+                .ok()
+                .and_then(|v| v.parse().ok()),
             debug: match std::env::var("ANVIL_DEBUG_VIEW").as_deref() {
                 Ok("clusters") => DebugView::Clusters,
                 Ok("cascades") => DebugView::Cascades,
+                Ok("ssao") => DebugView::Ssao,
                 _ => DebugView::None,
             },
             last: Instant::now(),

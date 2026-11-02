@@ -44,6 +44,21 @@ pub struct MeshInstance {
     pub material: MaterialId,
     /// Object-to-world transform.
     pub transform: Mat4,
+    /// Transform in the previous frame (equal to `transform` for static objects); the TAA
+    /// velocity of moving objects comes from the difference.
+    pub prev_transform: Mat4,
+}
+
+impl MeshInstance {
+    /// A static instance: `prev_transform` equals `transform`.
+    pub fn new(mesh: MeshId, material: MaterialId, transform: Mat4) -> Self {
+        Self {
+            mesh,
+            material,
+            transform,
+            prev_transform: transform,
+        }
+    }
 }
 
 /// A punctual light with glTF `KHR_lights_punctual` semantics.

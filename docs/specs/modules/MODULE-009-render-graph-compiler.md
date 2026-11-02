@@ -2,10 +2,10 @@
 
 | Field | Value |
 |---|---|
-| Status | Accepted (ADR-0012); M4a implemented |
+| Status | Accepted (ADR-0012); M4 complete |
 | Crate | render-graph |
 | Layer | LAYER-006 |
-| Milestone | M4 (M4a graph + M3 port; M4b-c features) |
+| Milestone | M4 (complete: M4a-M4c) |
 | Traces to | FR-RG-001..FR-RG-009, FR-RES-011, FR-REND-018, NFR-TEST-001, NFR-PERF-011, NFR-OBS-001; MASTER-000 §8.6, §9.3, §10.3; ADR-0005, ADR-0012; RESEARCH-001, RESEARCH-003 |
 | Last updated | 2026-11-02 |
 
@@ -91,7 +91,7 @@ As LAYER-006 §13. Unit tests: `plan::tests` (ordering and barrier states, culli
 - [x] Invalid graphs are rejected with a named pass/resource.
 - [x] The M3 pipeline runs as a graph without behaviour change (pbr-scene screenshots pixel-identical, 0 validation errors and warnings with sync validation, 0 errors with GPU-AV).
 - [x] `describe()` output renders the graph in a debug dump (`ANVIL_GRAPH_DUMP`).
-- [ ] Deferred and post-processing graphs validation-clean (M4b, M4c).
+- [x] Deferred and post-processing graphs validation-clean (M4b, M4c): all 8 on/off combinations of SSAO, TAA and bloom on forward and deferred, 0 errors / 0 warnings; features that are off simply add no passes, culling keeps the rest valid. TAA ping-pongs two imported history textures (the `taa.reset` pass gives the unused one a defined state on the first frame, after a resize and after TAA was off).
 
 ## 14. Traceability (FR/NFR IDs)
 

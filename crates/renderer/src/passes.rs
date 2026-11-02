@@ -18,6 +18,9 @@ pub(crate) struct Draw {
     pub depth: f32,
 }
 
+/// `ssao_index` push value meaning "no AO texture".
+pub(crate) const NO_SSAO: u32 = u32::MAX;
+
 /// One pipeline per [`Draw::variant`].
 pub(crate) type Pipes = [PipelineHandle; 4];
 
@@ -42,6 +45,7 @@ pub(crate) struct ShadowInputs<'a> {
 pub(crate) struct PrepassInputs<'a> {
     pub depth: TexId,
     pub normal: TexId,
+    pub velocity: TexId,
     pub geometry: GeometryInputs<'a>,
 }
 
@@ -51,6 +55,8 @@ pub(crate) struct ShadedInputs<'a> {
     pub depth: TexId,
     /// Textures the shaders sample through bindless indices (shadow maps, IBL).
     pub reads: Vec<TexId>,
+    /// Full-resolution ambient occlusion multiplying the ambient term (forward pass only).
+    pub ssao: Option<TexId>,
     pub geometry: GeometryInputs<'a>,
 }
 
@@ -68,6 +74,7 @@ pub(crate) struct LightingInputs {
     pub gbuffer: [TexId; 3],
     pub depth: TexId,
     pub reads: Vec<TexId>,
+    pub ssao: Option<TexId>,
     pub addresses: [u64; 4],
 }
 
@@ -98,15 +105,19 @@ pub(crate) struct TonemapInputs {
     pub exposure: f32,
     pub encode_srgb: bool,
     pub target: TexId,
+    /// Bloom texture (half resolution) added to `hdr` before tonemapping.
+    pub bloom: Option<TexId>,
+    pub bloom_strength: f32,
 }
 
 /// Pushes the four frame-data addresses, the vertex address, the view index and the G-buffer
 /// slots (64 bytes, the `Push` block of `common.glsl`).
-fn push_frame<C: CommandEncoder>(
+pub(crate) fn push_frame<C: CommandEncoder>(
     cmd: &mut C,
     addresses: &[u64; 4],
     vertex_address: u64,
     view_index: u32,
+    ssao_index: u32,
     gbuf: [u32; 4],
 ) {
     let mut pc = [0u8; 64];
@@ -117,6 +128,7 @@ fn push_frame<C: CommandEncoder>(
         chunk.copy_from_slice(&a.to_le_bytes());
     }
     pc[40..44].copy_from_slice(&view_index.to_le_bytes());
+    pc[44..48].copy_from_slice(&ssao_index.to_le_bytes());
     for (chunk, g) in pc[48..].chunks_mut(4).zip(gbuf) {
         chunk.copy_from_slice(&g.to_le_bytes());
     }
@@ -125,14 +137,21 @@ fn push_frame<C: CommandEncoder>(
 
 /// Draws a list sorted by variant, switching pipelines only when the variant changes. The
 /// first instance doubles as the instance array index (`gl_InstanceIndex`).
-fn draw_list<C: CommandEncoder>(cmd: &mut C, g: &GeometryInputs, view_index: u32) {
+fn draw_list<C: CommandEncoder>(cmd: &mut C, g: &GeometryInputs, view_index: u32, ssao_index: u32) {
     let mut bound = usize::MAX;
     for d in g.draws {
         if d.variant != bound {
             cmd.bind_pipeline(g.pipes[d.variant]);
             bound = d.variant;
         }
-        push_frame(cmd, &g.addresses, d.vertex_address, view_index, [0; 4]);
+        push_frame(
+            cmd,
+            &g.addresses,
+            d.vertex_address,
+            view_index,
+            ssao_index,
+            [0; 4],
+        );
         cmd.bind_index_buffer(d.index_buffer, 0, IndexFormat::U32);
         cmd.draw_indexed(d.index_count, 1, 0, 0, d.instance);
     }
@@ -155,17 +174,18 @@ pub(crate) fn shadow_pass<'a, D: Device>(b: &mut GraphBuilder<'a, D>, i: ShadowI
         },
     );
     b.pass(pass, move |ctx| {
-        draw_list(ctx.cmd, &i.geometry, i.view_index);
+        draw_list(ctx.cmd, &i.geometry, i.view_index, NO_SSAO);
         Ok(())
     });
 }
 
-/// Depth prepass: opaque and masked geometry, depth (reverse-Z, clear 0) plus view-space
-/// normals.
+/// Depth prepass: opaque and masked geometry, depth (reverse-Z, clear 0), view-space normals
+/// and screen-space velocity.
 pub(crate) fn prepass<'a, D: Device>(b: &mut GraphBuilder<'a, D>, i: PrepassInputs<'a>) {
     let pass = Pass::new("prepass")
         .label_color([0.5, 0.5, 0.8, 1.0])
         .color(i.normal, ColorTarget::clear([0.0; 4]))
+        .color(i.velocity, ColorTarget::clear([0.0; 4]))
         .depth(
             i.depth,
             DepthTarget {
@@ -175,7 +195,7 @@ pub(crate) fn prepass<'a, D: Device>(b: &mut GraphBuilder<'a, D>, i: PrepassInpu
             },
         );
     b.pass(pass, move |ctx| {
-        draw_list(ctx.cmd, &i.geometry, 0);
+        draw_list(ctx.cmd, &i.geometry, 0, NO_SSAO);
         Ok(())
     });
 }
@@ -206,11 +226,12 @@ pub(crate) fn forward_pass<'a, D: Device>(b: &mut GraphBuilder<'a, D>, i: Shaded
         .label_color([0.3, 0.7, 0.3, 1.0])
         .color(i.hdr, ColorTarget::clear([0.02, 0.03, 0.05, 1.0]))
         .depth(i.depth, DEPTH_LOAD);
-    for r in &i.reads {
+    for r in i.reads.iter().chain(&i.ssao) {
         pass = pass.read(*r);
     }
     b.pass(pass, move |ctx| {
-        draw_list(ctx.cmd, &i.geometry, 0);
+        let ssao = i.ssao.map_or(Ok(NO_SSAO), |t| ctx.texture_index(t))?;
+        draw_list(ctx.cmd, &i.geometry, 0, ssao);
         Ok(())
     });
 }
@@ -232,7 +253,7 @@ pub(crate) fn transparent_pass<'a, D: Device>(b: &mut GraphBuilder<'a, D>, i: Sh
         pass = pass.read(*r);
     }
     b.pass(pass, move |ctx| {
-        draw_list(ctx.cmd, &i.geometry, 0);
+        draw_list(ctx.cmd, &i.geometry, 0, NO_SSAO);
         Ok(())
     });
 }
@@ -246,7 +267,7 @@ pub(crate) fn gbuffer_pass<'a, D: Device>(b: &mut GraphBuilder<'a, D>, i: Gbuffe
         pass = pass.color(t, ColorTarget::clear([0.0; 4]));
     }
     b.pass(pass, move |ctx| {
-        draw_list(ctx.cmd, &i.geometry, 0);
+        draw_list(ctx.cmd, &i.geometry, 0, NO_SSAO);
         Ok(())
     });
 }
@@ -260,10 +281,11 @@ pub(crate) fn lighting_pass<D: Device>(b: &mut GraphBuilder<'_, D>, i: LightingI
     for t in i.gbuffer {
         pass = pass.read(t);
     }
-    for r in &i.reads {
+    for r in i.reads.iter().chain(&i.ssao) {
         pass = pass.read(*r);
     }
     b.pass(pass, move |ctx| {
+        let ssao = i.ssao.map_or(Ok(NO_SSAO), |t| ctx.texture_index(t))?;
         let gbuf = [
             ctx.texture_index(i.gbuffer[0])?,
             ctx.texture_index(i.gbuffer[1])?,
@@ -271,7 +293,7 @@ pub(crate) fn lighting_pass<D: Device>(b: &mut GraphBuilder<'_, D>, i: LightingI
             ctx.texture_index(i.depth)?,
         ];
         ctx.cmd.bind_pipeline(i.pipeline);
-        push_frame(ctx.cmd, &i.addresses, 0, 0, gbuf);
+        push_frame(ctx.cmd, &i.addresses, 0, 0, ssao, gbuf);
         ctx.cmd.draw(3, 1, 0, 0);
         Ok(())
     });
@@ -292,26 +314,36 @@ pub(crate) fn skybox_pass<D: Device>(b: &mut GraphBuilder<'_, D>, i: SkyboxInput
         .depth(i.depth, DEPTH_LOAD);
     b.pass(pass, move |ctx| {
         ctx.cmd.bind_pipeline(i.pipeline);
-        push_frame(ctx.cmd, &i.addresses, 0, 0, [0; 4]);
+        push_frame(ctx.cmd, &i.addresses, 0, 0, NO_SSAO, [0; 4]);
         ctx.cmd.draw(3, 1, 0, 0);
         Ok(())
     });
 }
 
-/// Tonemaps the HDR target into `target`.
+/// Tonemaps `hdr` (plus `bloom` scaled by `bloom_strength`) into `target`.
 pub(crate) fn tonemap_pass<D: Device>(b: &mut GraphBuilder<'_, D>, t: TonemapInputs) {
-    let pass = Pass::new("tonemap")
+    let mut pass = Pass::new("tonemap")
         .label_color([0.7, 0.5, 0.2, 1.0])
         .read(t.hdr)
         .color(t.target, ColorTarget::dont_care());
+    if let Some(bloom) = t.bloom {
+        pass = pass.read(bloom);
+    }
     b.pass(pass, move |ctx| {
         let hdr_index = ctx.texture_index(t.hdr)?;
+        // Without bloom the slot is any valid texture and the strength is 0.
+        let (bloom_index, strength) = match t.bloom {
+            Some(bloom) => (ctx.texture_index(bloom)?, t.bloom_strength),
+            None => (hdr_index, 0.0),
+        };
         ctx.cmd.bind_pipeline(t.pipeline);
-        let mut pc = [0u8; 16];
+        let mut pc = [0u8; 24];
         pc[0..4].copy_from_slice(&hdr_index.to_le_bytes());
         pc[4..8].copy_from_slice(&t.sampler_index.to_le_bytes());
         pc[8..12].copy_from_slice(&t.exposure.to_le_bytes());
         pc[12..16].copy_from_slice(&u32::from(t.encode_srgb).to_le_bytes());
+        pc[16..20].copy_from_slice(&bloom_index.to_le_bytes());
+        pc[20..24].copy_from_slice(&strength.to_le_bytes());
         ctx.cmd.push_constants(0, &pc);
         ctx.cmd.draw(3, 1, 0, 0);
         Ok(())
