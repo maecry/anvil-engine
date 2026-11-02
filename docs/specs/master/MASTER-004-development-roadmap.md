@@ -74,3 +74,15 @@ Target: TBD after benchmark hardware/workload is defined.
 
 ## 6. Change control
 Roadmap changes follow MASTER-000 §13.5. Milestone exit requires: exit criteria met, tests for the milestone's deliverables (NFR-TEST-007), specs matching code, and ADRs recorded.
+
+## Status log
+
+### M1 Vulkan Foundation (2026-11-02)
+| Exit criterion | Status | Evidence |
+|---|---|---|
+| Stable app lifecycle | Done | `triangle` start → frames → `Control::Exit` → `on_exit` teardown |
+| Window resizing | Code done; manual resize/minimise check pending | swapchain recreation on `Resized` / `OutOfDate` / `Recreate` |
+| Clean shutdown | Done | reverse-order destroy, `pending_destroys: 0` at exit |
+| No validation errors | Done | `ANVIL_SYNC_VALIDATION=1 ANVIL_EXIT_AFTER_FRAMES=120 cargo run -p triangle`: errors 0, warnings 0 (RADV, RX 9070 XT); FIFO run smooth (manual) |
+
+Open: CI never run (no remote); headless swapchain test; wait_idle shortcuts on swapchain recreate/destroy (M2).
