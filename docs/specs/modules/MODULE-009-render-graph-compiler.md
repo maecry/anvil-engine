@@ -63,7 +63,7 @@ Errors: `GraphError { ReadBeforeWrite, ReadAndWrite, BoundTwice, NoInitialState,
 
 ## 7. Ownership and lifetime
 
-Builder and compiled graph are per frame and borrow frame data for `'a`. `RenderGraph` persists: the state map (import states are updated after `execute`) and the pool. Imported textures are never destroyed by the graph; call `forget` first when the owner destroys one (swapchain images are not forgotten: a few map entries per resize, `// shortcut:`).
+Builder and compiled graph are per frame and borrow frame data for `'a`. `RenderGraph` persists: the state map (import states are updated after `execute`) and the pool. Imported textures are never destroyed by the graph; call `forget` first when the owner destroys one (only imports declared with `initial: None` have their final state remembered; swapchain images use `Some(Undefined)` every frame and never enter the map).
 
 ## 8. Execution flow
 

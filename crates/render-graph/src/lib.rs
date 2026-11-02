@@ -105,7 +105,8 @@ impl<'a, D: Device> GraphBuilder<'a, D> {
 
     /// Imports a persistent texture of `extent`. `initial` overrides the state the graph
     /// remembers (use `Some(Undefined)` for a swapchain image); `None` uses the remembered
-    /// state and fails compilation if there is none (see [`RenderGraph::track`]).
+    /// state and fails compilation if there is none (see [`RenderGraph::track`]). Only imports
+    /// with `None` have their final state remembered.
     pub fn import(
         &mut self,
         name: impl Into<Cow<'static, str>>,
@@ -373,7 +374,13 @@ impl RenderGraph {
             self.pool.entries[e].state = plan.slot_final[s];
         }
         for (i, r) in decls.res.iter().enumerate() {
-            if let plan::ResKind::Imported { texture, .. } = r.kind
+            // An explicit initial state is re-declared every frame (swapchain images), so it is
+            // never remembered; this keeps stale swapchain handles out of the map.
+            if let plan::ResKind::Imported {
+                texture,
+                initial: None,
+                ..
+            } = r.kind
                 && plan.lifetime[i].is_some()
             {
                 self.states.insert(texture, plan.res_final[i]);

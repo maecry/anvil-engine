@@ -568,6 +568,10 @@ pub enum CompareOp { Never, Less, Equal, LessOrEqual, Greater, GreaterOrEqual, A
 ### 18.4 Tests
 Unit: `depth_state_mapping`, `sampler_info_mapping` (compare), depth/shader barrier pair, `Rg16Float` mapping. GPU (`resources.rs`): `sampled_depth_and_compare_sampler` (sampled depth texture, compare sampler, `DepthAttachment <-> ShaderRead` barriers, zero validation messages).
 
+## 19. M4b additions (ADR-0012 §12)
+
+The only RHI-side change of M4b: `rhi-vulkan` enables the Vulkan 1.3 feature `shaderDemoteToHelperInvocation` when creating the device. Fragment-shader `discard` (alpha-tested materials) compiles to `OpDemoteToHelperInvocation` for SPIR-V 1.6, and validation rejects the module without the feature. It is mandatory in Vulkan 1.3, so no capability check was added. No public RHI API changed: `Rg16Float`, multiple color attachments of different formats, depth compare ops and premultiplied blend factors were already expressible.
+
 ## Observability (ADR-0009)
 - `Device::diagnostics() -> DeviceDiagnostics` (plain data: `DeviceInfo`, frame / GPU-completed frame, `LiveObjects`, pending destroys, `SwapchainDiagnostics` per swapchain, `ValidationCounts`). Backends must keep it accurate; integration tests assert `validation.errors == 0`.
 - `RhiError::StaleHandle` carries `kind`, `index`, `generation`; `Backend` carries `op` and the raw code.

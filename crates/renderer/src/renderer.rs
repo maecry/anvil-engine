@@ -1,52 +1,82 @@
 //! The [`Renderer`]: owns pipelines, persistent textures, built-in textures and the per-frame
 //! upload rings, and builds the frame as a render graph (ADR-0011 §3, ADR-0012).
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use foundation::Handle;
 use foundation::Pool;
 use foundation::math::{Mat4, Vec3};
 use render_graph::{GraphBuilder, GraphError, GraphStats, RenderGraph, TransientDesc};
 use rhi::{
-    AddressMode, BlendState, BufferDesc, BufferHandle, BufferUsage, CompareOp, CullMode, DepthBias,
-    DepthState, Device, Filter, Format, FrameToken, FrontFace, GraphicsPipelineDesc, Memory,
-    PipelineHandle, PrimitiveTopology, RhiError, SamplerDesc, SamplerHandle, ShaderModuleDesc,
-    ShaderModuleHandle, ShaderStageDesc, SwapchainImage, TextureDesc, TextureHandle, TextureState,
-    TextureUsage,
+    AddressMode, BlendFactor, BlendState, BufferDesc, BufferHandle, BufferUsage, CompareOp,
+    CullMode, DepthBias, DepthState, Device, Filter, Format, FrameToken, FrontFace,
+    GraphicsPipelineDesc, Memory, PipelineHandle, PrimitiveTopology, RhiError, SamplerDesc,
+    SamplerHandle, ShaderModuleDesc, ShaderModuleHandle, ShaderStageDesc, SwapchainImage,
+    TextureDesc, TextureHandle, TextureState, TextureUsage,
 };
 
+use crate::cluster::{CLUSTER_FAR, ClusterGrid, GRID, LightSphere, spot_bounds};
+use crate::cull::{Frustum, bounding_sphere, transform_sphere};
 use crate::gpu::{GpuFrame, GpuInstance, GpuLight, GpuMaterial};
 use crate::ibl::Ibl;
 use crate::passes::{
-    Draw, ForwardInputs, ShadowInputs, TonemapInputs, forward_pass, shadow_pass, tonemap_pass,
+    Draw, GbufferInputs, GeometryInputs, LightingInputs, Pipes, PrepassInputs, ShadedInputs,
+    ShadowInputs, SkyboxInputs, TonemapInputs, forward_pass, gbuffer_pass, lighting_pass, prepass,
+    shadow_pass, skybox_pass, tonemap_pass, transparent_pass,
 };
-use crate::shadow::fit_directional;
-use crate::{Light, MAX_LIGHTS, MeshData, RenderScene};
+use crate::shadow::{CASCADES, cascade_splits, fit_directional, fit_spot};
+use crate::{Light, MAX_LIGHTS, MAX_SPOT_SHADOWS, MeshData, RenderScene};
 
-static FORWARD_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forward.vert.spv"));
-static FORWARD_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forward.frag.spv"));
-static SHADOW_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.spv"));
-static SHADOW_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.frag.spv"));
-pub(crate) static TONEMAP_VERT: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.vert.spv"));
-static TONEMAP_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.frag.spv"));
+macro_rules! spv {
+    ($name:literal) => {
+        include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")) as &[u8]
+    };
+}
+static FORWARD_VERT: &[u8] = spv!("forward.vert");
+static FORWARD_FRAGS: [&[u8]; 2] = [spv!("forward.frag"), spv!("forward_mask.frag")];
+static PREPASS_FRAGS: [&[u8]; 2] = [spv!("prepass.frag"), spv!("prepass_mask.frag")];
+static GBUFFER_FRAGS: [&[u8]; 2] = [spv!("gbuffer.frag"), spv!("gbuffer_mask.frag")];
+static LIGHTING_FRAG: &[u8] = spv!("lighting.frag");
+static SHADOW_VERT: &[u8] = spv!("shadow.vert");
+static SHADOW_FRAGS: [&[u8]; 2] = [spv!("shadow.frag"), spv!("shadow_mask.frag")];
+pub(crate) static TONEMAP_VERT: &[u8] = spv!("tonemap.vert");
+static TONEMAP_FRAG: &[u8] = spv!("tonemap.frag");
 
 /// Size of each per-frame-in-flight upload ring.
-// shortcut: fixed 4 MiB ring, render fails when a scene overflows it; grow or chain rings when scenes get bigger.
-const RING_BYTES: u64 = 4 << 20;
-/// Shadow map resolution (ADR-0011 §7).
+// shortcut: fixed 8 MiB ring, render fails when a scene overflows it; grow or chain rings when scenes get bigger.
+const RING_BYTES: u64 = 8 << 20;
+/// Resolution of each directional cascade (ADR-0012 §11).
 const SHADOW_SIZE: u32 = 2048;
-/// The shadow volume covers the camera frustum up to this distance (meters).
-const SHADOW_DISTANCE: f32 = 50.0;
+/// Resolution of each spot shadow map; mirrored by `SPOT_SHADOW_SIZE` in `lighting.glsl`.
+const SPOT_SHADOW_SIZE: u32 = 1024;
+/// The cascades cover the camera frustum up to this distance (meters).
+const SHADOW_DISTANCE: f32 = 80.0;
+/// Weight of the logarithmic scheme in the practical cascade split.
+const CASCADE_LAMBDA: f32 = 0.75;
+const CASCADE_NAMES: [&str; CASCADES] = [
+    "shadow.cascade0",
+    "shadow.cascade1",
+    "shadow.cascade2",
+    "shadow.cascade3",
+];
+const SPOT_NAMES: [&str; MAX_SPOT_SHADOWS] = [
+    "shadow.spot0",
+    "shadow.spot1",
+    "shadow.spot2",
+    "shadow.spot3",
+];
 pub(crate) const HDR_FORMAT: Format = Format::Rgba16Float;
 const DEPTH_FORMAT: Format = Format::D32Sfloat;
 
-/// A GPU mesh (vertex buffer read through BDA, index buffer). Handle: [`MeshId`].
+/// A GPU mesh (vertex buffer read through BDA, index buffer) with its object-space bounding
+/// sphere. Handle: [`MeshId`].
 pub struct Mesh {
     vertices: BufferHandle,
     indices: BufferHandle,
     vertex_address: u64,
     index_count: u32,
+    center: Vec3,
+    radius: f32,
 }
 
 /// A GPU texture with its bindless slot. Handle: [`TextureId`].
@@ -55,8 +85,46 @@ pub struct Texture {
     index: u32,
 }
 
-/// A material record (GPU layout). Handle: [`MaterialId`].
-pub struct Material(GpuMaterial);
+/// A material record (GPU layout plus the alpha mode that selects pipelines). Handle: [`MaterialId`].
+pub struct Material {
+    gpu: GpuMaterial,
+    alpha_mode: AlphaMode,
+    double_sided: bool,
+}
+
+/// How a material's alpha is used.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AlphaMode {
+    /// Alpha ignored.
+    Opaque,
+    /// Fragments with alpha below the cutoff are discarded (prepass, G-buffer, forward, shadows).
+    Mask(f32),
+    /// Alpha blended in the forward transparent pass, sorted back to front, no depth write.
+    /// Blended objects receive shadows but do not cast them.
+    Blend,
+}
+
+/// Which shading path lights the opaque geometry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RenderPath {
+    /// G-buffer-free: the forward pass lights every fragment (default).
+    #[default]
+    Forward,
+    /// G-buffer fill followed by a fullscreen lighting pass.
+    Deferred,
+}
+
+/// Debug visualisations of the lighting data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DebugView {
+    /// Normal image.
+    #[default]
+    None,
+    /// Lights per cluster as a heatmap.
+    Clusters,
+    /// Directional shadow cascades tinted.
+    Cascades,
+}
 
 /// Handle to a mesh created with [`Renderer::create_mesh`].
 pub type MeshId = Handle<Mesh>;
@@ -95,6 +163,10 @@ pub struct MaterialDesc<'a> {
     pub emissive: [f32; 3],
     /// Emissive texture (sRGB).
     pub emissive_texture: Option<TextureId>,
+    /// Alpha handling.
+    pub alpha_mode: AlphaMode,
+    /// Render both faces (back faces get a flipped normal).
+    pub double_sided: bool,
 }
 
 impl Default for MaterialDesc<'_> {
@@ -112,6 +184,8 @@ impl Default for MaterialDesc<'_> {
             occlusion_strength: 1.0,
             emissive: [0.0; 3],
             emissive_texture: None,
+            alpha_mode: AlphaMode::Opaque,
+            double_sided: false,
         }
     }
 }
@@ -129,6 +203,12 @@ pub struct RendererStats {
     pub ring_bytes_used: u64,
     /// Render graph counters, including compile time.
     pub graph: GraphStats,
+    /// Instances rejected by the camera frustum test.
+    pub culled: u32,
+    /// Draws recorded into all shadow maps.
+    pub shadow_draws: u32,
+    /// CPU time of the cluster light assignment.
+    pub cluster_time: Duration,
 }
 
 /// Why [`Renderer::render`] failed.
@@ -144,11 +224,18 @@ pub enum RenderError {
 
 /// Forward renderer. All methods taking a device must be given the device it was created with.
 pub struct Renderer {
-    forward: PipelineHandle,
-    shadow_pipeline: PipelineHandle,
+    forward: Pipes,
+    prepass: Pipes,
+    gbuffer: Pipes,
+    transparent: Pipes,
+    lighting: PipelineHandle,
+    shadow_pipes: Pipes,
     tonemap: PipelineHandle,
-    shadow: TextureHandle,
-    shadow_index: u32,
+    cascades: [ShadowMap; CASCADES],
+    spots: [ShadowMap; MAX_SPOT_SHADOWS],
+    cluster_grid: Option<ClusterGrid>,
+    path: RenderPath,
+    debug_view: DebugView,
     shadow_sampler: SamplerHandle,
     shadow_sampler_index: u32,
     ibl: Ibl,
@@ -170,6 +257,12 @@ pub struct Renderer {
     last_log: Instant,
 }
 
+/// A persistent depth texture rendered by a shadow pass and sampled by the shaders.
+struct ShadowMap {
+    texture: TextureHandle,
+    index: u32,
+}
+
 fn spirv_words(bytes: &[u8]) -> Vec<u32> {
     bytes
         .as_chunks::<4>()
@@ -187,6 +280,21 @@ pub(crate) fn make_pipeline<D: Device>(
     color: &[Format],
     depth: Option<DepthState>,
     cull: CullMode,
+) -> Result<PipelineHandle, RhiError> {
+    let blend = vec![BlendState::default(); color.len()];
+    make_pipeline_blend(d, label, vert, frag, color, depth, cull, &blend)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn make_pipeline_blend<D: Device>(
+    d: &D,
+    label: &str,
+    vert: &[u8],
+    frag: &[u8],
+    color: &[Format],
+    depth: Option<DepthState>,
+    cull: CullMode,
+    blend: &[BlendState],
 ) -> Result<PipelineHandle, RhiError> {
     let mk = |bytes: &[u8], l: String| -> Result<ShaderModuleHandle, RhiError> {
         d.create_shader_module(&ShaderModuleDesc {
@@ -211,12 +319,53 @@ pub(crate) fn make_pipeline<D: Device>(
         topology: PrimitiveTopology::TriangleList,
         cull,
         front_face: FrontFace::CounterClockwise,
-        blend: &[BlendState::default()][..color.len().min(1)],
+        blend,
     });
     // Module destruction is deferred by the device; the pipeline no longer needs them.
     d.destroy_shader_module(vs);
     d.destroy_shader_module(fs);
     pipeline
+}
+
+/// The four pipeline variants of one stage: `mask * 2 + double_sided`. `frags` are the opaque and
+/// the alpha-tested fragment shader; double-sided variants disable culling.
+#[allow(clippy::too_many_arguments)]
+fn make_variants<D: Device>(
+    d: &D,
+    label: &str,
+    vert: &[u8],
+    frags: &[&[u8]; 2],
+    color: &[Format],
+    depth: Option<DepthState>,
+    cull: CullMode,
+    blend: &[BlendState],
+) -> Result<Pipes, RhiError> {
+    let mut out = [PipelineHandle::NULL; 4];
+    for (v, p) in out.iter_mut().enumerate() {
+        let (mask, double) = (v / 2, v % 2 == 1);
+        let name = format!(
+            "{label}{}{}",
+            ["", ".mask"][mask],
+            [".1s", ".2s"][usize::from(double)]
+        );
+        let c = if double { CullMode::None } else { cull };
+        *p = make_pipeline_blend(d, &name, vert, frags[mask], color, depth, c, blend)?;
+    }
+    Ok(out)
+}
+
+fn shadow_map<D: Device>(d: &D, label: &str, size: u32) -> Result<ShadowMap, RhiError> {
+    let texture = d.create_texture(&TextureDesc {
+        label: Some(label),
+        width: size,
+        height: size,
+        format: DEPTH_FORMAT,
+        usage: TextureUsage::DEPTH_ATTACHMENT | TextureUsage::SAMPLED,
+    })?;
+    Ok(ShadowMap {
+        texture,
+        index: d.texture_index(texture)?,
+    })
 }
 
 fn gpu_only_buffer<D: Device>(
@@ -250,19 +399,74 @@ impl Renderer {
         swapchain_format: Format,
         extent: (u32, u32),
     ) -> Result<Self, RhiError> {
-        let forward = make_pipeline(
+        let none = [BlendState::default()];
+        let depth_state = |compare, write, bias| {
+            Some(DepthState {
+                format: DEPTH_FORMAT,
+                compare,
+                write,
+                bias,
+            })
+        };
+        // Reverse-Z: far = 0. The prepass writes depth; later passes test `GreaterOrEqual`
+        // against it without writing, which needs the one invariant vertex shader.
+        let prepass = make_variants(
+            device,
+            "renderer.prepass",
+            FORWARD_VERT,
+            &PREPASS_FRAGS,
+            &[Format::Rg16Float],
+            depth_state(CompareOp::GreaterOrEqual, true, None),
+            CullMode::Back,
+            &none,
+        )?;
+        let forward = make_variants(
             device,
             "renderer.forward",
             FORWARD_VERT,
-            FORWARD_FRAG,
+            &FORWARD_FRAGS,
             &[HDR_FORMAT],
-            Some(DepthState {
-                format: DEPTH_FORMAT,
-                compare: CompareOp::GreaterOrEqual, // reverse-Z
-                write: true,
-                bias: None,
-            }),
+            depth_state(CompareOp::GreaterOrEqual, false, None),
             CullMode::Back,
+            &none,
+        )?;
+        let gbuffer = make_variants(
+            device,
+            "renderer.gbuffer",
+            FORWARD_VERT,
+            &GBUFFER_FRAGS,
+            &[Format::Rgba8Srgb, Format::Rgba16Float, Format::Rgba16Float],
+            depth_state(CompareOp::GreaterOrEqual, false, None),
+            CullMode::Back,
+            &[BlendState::default(); 3],
+        )?;
+        // Premultiplied alpha: the shader scales the diffuse term by alpha, not the specular.
+        let premultiplied = [BlendState {
+            enabled: true,
+            src_color: BlendFactor::One,
+            dst_color: BlendFactor::OneMinusSrcAlpha,
+            src_alpha: BlendFactor::One,
+            dst_alpha: BlendFactor::OneMinusSrcAlpha,
+            ..BlendState::default()
+        }];
+        let transparent = make_variants(
+            device,
+            "renderer.transparent",
+            FORWARD_VERT,
+            &[FORWARD_FRAGS[0]; 2],
+            &[HDR_FORMAT],
+            depth_state(CompareOp::GreaterOrEqual, false, None),
+            CullMode::Back,
+            &premultiplied,
+        )?;
+        let lighting = make_pipeline(
+            device,
+            "renderer.lighting",
+            TONEMAP_VERT,
+            LIGHTING_FRAG,
+            &[HDR_FORMAT],
+            None,
+            CullMode::None,
         )?;
         let tonemap = make_pipeline(
             device,
@@ -275,31 +479,32 @@ impl Renderer {
         )?;
         // Front-face culling: only back faces enter the map, so lit surfaces never self-shadow
         // (no acne) at the cost of light leaking through very thin casters.
-        let shadow_pipeline = make_pipeline(
+        let shadow_pipes = make_variants(
             device,
             "renderer.shadow",
             SHADOW_VERT,
-            SHADOW_FRAG,
+            &SHADOW_FRAGS,
             &[],
-            Some(DepthState {
-                format: DEPTH_FORMAT,
-                compare: CompareOp::LessOrEqual,
-                write: true,
-                bias: Some(DepthBias {
+            depth_state(
+                CompareOp::LessOrEqual,
+                true,
+                Some(DepthBias {
                     constant: 2.0,
                     slope: 2.5,
                     clamp: 0.0,
                 }),
-            }),
+            ),
             CullMode::Front,
+            &[],
         )?;
-        let shadow = device.create_texture(&TextureDesc {
-            label: Some("renderer.shadow"),
-            width: SHADOW_SIZE,
-            height: SHADOW_SIZE,
-            format: DEPTH_FORMAT,
-            usage: TextureUsage::DEPTH_ATTACHMENT | TextureUsage::SAMPLED,
-        })?;
+        let mut cascades = Vec::new();
+        for name in CASCADE_NAMES {
+            cascades.push(shadow_map(device, name, SHADOW_SIZE)?);
+        }
+        let mut spots = Vec::new();
+        for name in SPOT_NAMES {
+            spots.push(shadow_map(device, name, SPOT_SHADOW_SIZE)?);
+        }
         let shadow_sampler = device.create_sampler(&SamplerDesc {
             label: Some("renderer.shadow_cmp"),
             mag_filter: Filter::Linear,
@@ -310,7 +515,9 @@ impl Renderer {
             compare: Some(CompareOp::LessOrEqual),
         })?;
         let mut graph = RenderGraph::new(device.diagnostics().frames_in_flight);
-        graph.track(shadow, TextureState::Undefined);
+        for m in cascades.iter().chain(&spots) {
+            graph.track(m.texture, TextureState::Undefined);
+        }
         let sampler = |label, address| {
             device.create_sampler(&SamplerDesc {
                 label: Some(label),
@@ -341,10 +548,17 @@ impl Renderer {
         }
         let mut r = Self {
             forward,
-            shadow_pipeline,
+            prepass,
+            gbuffer,
+            transparent,
+            lighting,
+            shadow_pipes,
             tonemap,
-            shadow_index: device.texture_index(shadow)?,
-            shadow,
+            cascades: cascades.try_into().ok().expect("4 cascades"),
+            spots: spots.try_into().ok().expect("4 spot maps"),
+            cluster_grid: None,
+            path: RenderPath::default(),
+            debug_view: DebugView::default(),
             shadow_sampler_index: device.sampler_index(shadow_sampler)?,
             shadow_sampler,
             ibl: Ibl::new(device, &mut graph)?,
@@ -411,11 +625,14 @@ impl Renderer {
             BufferUsage::INDEX,
             bytemuck::cast_slice(&data.indices),
         )?;
+        let (center, radius) = bounding_sphere(data.vertices.iter().map(|v| Vec3::from(v.pos)));
         let id = self.meshes.insert(Mesh {
             vertices,
             indices,
             vertex_address: device.buffer_address(vertices)?,
             index_count: data.indices.len() as u32,
+            center,
+            radius,
         });
         tracing::debug!(
             label,
@@ -497,9 +714,17 @@ impl Renderer {
             normal_tex: tex(desc.normal_texture, self.flat_normal),
             occlusion_tex: tex(desc.occlusion_texture, self.white_linear),
             emissive_tex: tex(desc.emissive_texture, self.white_srgb),
-            pad: [0; 3],
+            alpha_cutoff: match desc.alpha_mode {
+                AlphaMode::Mask(c) => c,
+                _ => 0.0,
+            },
+            pad: [0; 2],
         };
-        let id = self.materials.insert(Material(m));
+        let id = self.materials.insert(Material {
+            gpu: m,
+            alpha_mode: desc.alpha_mode,
+            double_sided: desc.double_sided,
+        });
         tracing::debug!(label = desc.label, ?id, "material created");
         id
     }
@@ -509,6 +734,26 @@ impl Renderer {
         if self.materials.remove(id).is_some() {
             tracing::debug!(?id, "material destroyed");
         }
+    }
+
+    /// Selects forward or deferred shading for the next frame.
+    pub fn set_render_path(&mut self, path: RenderPath) {
+        self.path = path;
+    }
+
+    /// Current shading path.
+    pub fn render_path(&self) -> RenderPath {
+        self.path
+    }
+
+    /// Selects a debug visualisation for the next frame.
+    pub fn set_debug_view(&mut self, view: DebugView) {
+        self.debug_view = view;
+    }
+
+    /// Current debug visualisation.
+    pub fn debug_view(&self) -> DebugView {
+        self.debug_view
     }
 
     /// Counters of the last rendered frame.
@@ -539,8 +784,9 @@ impl Renderer {
     }
 
     /// Builds and records the frame as a render graph: environment bakes (when the environment
-    /// changed), shadow, forward + skybox into a transient HDR target, then tonemap into
-    /// `target`. `frame` is the token `cmd` was begun with. `target` ends in `final_state`
+    /// changed), four shadow cascades and up to four spot shadows, the depth prepass, then
+    /// either forward lighting or G-buffer + lighting, the skybox, blended geometry and tonemap
+    /// into `target`. `frame` is the token `cmd` was begun with. `target` ends in `final_state`
     /// (`Present`, or `TransferSrc` to read it back); it is imported as `Undefined`.
     ///
     /// # Errors
@@ -559,10 +805,11 @@ impl Renderer {
 
         let (w, h) = (target.extent.0.max(1), target.extent.1.max(1));
         let view = scene.camera.view();
-        let proj = scene.camera.projection(w as f32 / h as f32);
+        let aspect = w as f32 / h as f32;
+        let proj = scene.camera.projection(aspect);
+        let view_proj = proj * view;
         let cam = scene.camera.position;
         let ibl = self.ibl.indices();
-        let aspect = w as f32 / h as f32;
         let tan_y = (scene.camera.fov_y * 0.5).tan();
         let rot = scene.camera.rotation;
         let (right, up, forward) = (rot * Vec3::X, rot * Vec3::Y, rot * Vec3::NEG_Z);
@@ -573,88 +820,205 @@ impl Renderer {
                 "too many lights, extra ignored"
             );
         }
-        let lights: Vec<GpuLight> = scene
-            .lights
-            .iter()
-            .take(MAX_LIGHTS)
-            .map(GpuLight::new)
-            .collect();
-        let shadow_light = scene.lights.iter().take(MAX_LIGHTS).position(|l| {
-            matches!(
-                l,
-                Light::Directional {
-                    cast_shadows: true,
-                    ..
-                }
-            )
-        });
-        let fit = shadow_light.and_then(|i| match scene.lights[i] {
-            Light::Directional { direction, .. } => Some(fit_directional(
-                &scene.camera,
-                w as f32 / h as f32,
-                direction,
-                SHADOW_DISTANCE,
-                SHADOW_SIZE,
-            )),
-            _ => None,
-        });
-        let frame_data = GpuFrame {
-            view,
-            proj,
-            view_proj: proj * view,
-            light_view_proj: fit.as_ref().map_or(Mat4::IDENTITY, |f| f.view_proj),
-            camera_pos: [cam.x, cam.y, cam.z, 1.0],
-            light_count: lights.len() as u32,
-            sampler_index: self.sampler_indices.0,
-            shadow_index: self.shadow_index,
-            shadow_sampler: self.shadow_sampler_index,
-            exposure: scene.camera.exposure,
-            shadow_light: if fit.is_some() {
-                shadow_light.map_or(u32::MAX, |i| i as u32)
-            } else {
-                u32::MAX
-            },
-            shadow_texel_world: fit.as_ref().map_or(0.0, |f| f.texel_world),
-            pad: 0.0,
-            sky_index: ibl.sky,
-            irradiance_index: ibl.irradiance,
-            brdf_lut_index: ibl.lut,
-            ibl_sampler: ibl.sampler,
-            prefilter: ibl.prefilter,
-            env_intensity: scene.environment.intensity,
-            pad0: 0,
-            cam_right: [right.x, right.y, right.z, tan_y * aspect],
-            cam_up: [up.x, up.y, up.z, tan_y],
-            cam_forward: [forward.x, forward.y, forward.z, 0.0],
-        };
 
+        // Lights: directional first (looped by every fragment), then local lights (clustered).
+        let lights_in = &scene.lights[..scene.lights.len().min(MAX_LIGHTS)];
+        let mut lights: Vec<GpuLight> = Vec::with_capacity(lights_in.len());
+        let mut cascade_dir = None;
+        for l in lights_in {
+            if let Light::Directional {
+                direction,
+                cast_shadows,
+                ..
+            } = *l
+            {
+                let mut g = GpuLight::new(l);
+                if cast_shadows && cascade_dir.is_none() {
+                    cascade_dir = Some(direction);
+                    g.spot[2] = 0.0; // cascaded shadows
+                }
+                lights.push(g);
+            }
+        }
+        let dir_count = lights.len();
+        let mut spot_vp = [Mat4::IDENTITY; MAX_SPOT_SHADOWS];
+        let mut spot_used = 0;
+        let mut spheres = Vec::new();
+        for l in lights_in {
+            let (center, radius) = match *l {
+                Light::Directional { .. } => continue,
+                Light::Point {
+                    position, range, ..
+                } => (position, range),
+                Light::Spot {
+                    position,
+                    direction,
+                    range,
+                    outer_cone,
+                    ..
+                } => {
+                    if range > 0.0 {
+                        spot_bounds(position, direction.normalize(), range, outer_cone)
+                    } else {
+                        (position, 0.0)
+                    }
+                }
+            };
+            let mut g = GpuLight::new(l);
+            if let Light::Spot {
+                position,
+                direction,
+                range,
+                outer_cone,
+                cast_shadows: true,
+                ..
+            } = *l
+                && spot_used < MAX_SPOT_SHADOWS
+            {
+                spot_vp[spot_used] = fit_spot(position, direction, outer_cone, range);
+                g.spot[2] = spot_used as f32;
+                spot_used += 1;
+            }
+            spheres.push(LightSphere {
+                center: view.transform_point3(center),
+                // A light without range reaches everywhere.
+                radius: if radius > 0.0 { radius } else { f32::INFINITY },
+                index: (dir_count + spheres.len()) as u32,
+            });
+            lights.push(g);
+        }
+
+        // Cascades (stable-fit spheres, texel snapped) of the shadow-casting directional light.
+        let splits = cascade_splits(scene.camera.near, SHADOW_DISTANCE, CASCADE_LAMBDA);
+        let mut cascade_vp = [Mat4::IDENTITY; CASCADES];
+        let mut cascade_texel = [0.0f32; 4];
+        if let Some(dir) = cascade_dir {
+            let mut start = scene.camera.near;
+            for c in 0..CASCADES {
+                let fit =
+                    fit_directional(&scene.camera, aspect, dir, start, splits[c], SHADOW_SIZE);
+                cascade_vp[c] = fit.view_proj;
+                cascade_texel[c] = fit.texel_world;
+                start = splits[c];
+            }
+        }
+
+        // Clustered assignment.
+        let t_cluster = Instant::now();
+        let tan = (tan_y * aspect, tan_y);
+        if !self
+            .cluster_grid
+            .as_ref()
+            .is_some_and(|g| g.matches(scene.camera.near, tan))
+        {
+            self.cluster_grid = Some(ClusterGrid::new(scene.camera.near, tan));
+        }
+        let assignment = self
+            .cluster_grid
+            .as_ref()
+            .map(|g| g.assign(&spheres))
+            .expect("grid built above");
+        let cluster_time = t_cluster.elapsed();
+
+        // Visible instances per view: camera (opaque sorted front to back, grouped by pipeline
+        // variant; blended sorted back to front) and each shadow map.
+        struct Item {
+            draw: Draw,
+            center: Vec3,
+            radius: f32,
+            blend: bool,
+        }
         let mut instances = Vec::with_capacity(scene.meshes.len());
-        let mut draws = Vec::with_capacity(scene.meshes.len());
-        let mut triangles = 0u64;
+        let mut items = Vec::with_capacity(scene.meshes.len());
         for inst in &scene.meshes {
             let Some(mesh) = self.meshes.get(inst.mesh) else {
                 tracing::warn!(mesh = ?inst.mesh, "scene references a destroyed mesh, skipped");
                 continue;
             };
-            let material = if self.materials.get(inst.material).is_some() {
+            let material_id = if self.materials.get(inst.material).is_some() {
                 inst.material
             } else {
                 self.default_material
             };
-            draws.push(Draw {
-                vertex_address: mesh.vertex_address,
-                index_buffer: mesh.indices,
-                index_count: mesh.index_count,
-                instance: instances.len() as u32,
+            let Some(material) = self.materials.get(material_id) else {
+                continue;
+            };
+            let (center, radius) = transform_sphere(&inst.transform, mesh.center, mesh.radius);
+            let double = usize::from(material.double_sided);
+            let (variant, blend) = match material.alpha_mode {
+                AlphaMode::Opaque => (double, false),
+                AlphaMode::Mask(_) => (2 + double, false),
+                AlphaMode::Blend => (double, true),
+            };
+            items.push(Item {
+                draw: Draw {
+                    vertex_address: mesh.vertex_address,
+                    index_buffer: mesh.indices,
+                    index_count: mesh.index_count,
+                    instance: instances.len() as u32,
+                    variant,
+                    depth: -view.transform_point3(center).z,
+                },
+                center,
+                radius,
+                blend,
             });
-            triangles += u64::from(mesh.index_count / 3);
             instances.push(GpuInstance {
                 model: inst.transform,
                 normal_matrix: inst.transform.inverse().transpose(),
-                material: material.index(),
+                material: material_id.index(),
                 pad: [0; 3],
             });
         }
+        let cam_frustum = Frustum::from_view_proj(view_proj);
+        let (mut opaque, mut blended) = (Vec::new(), Vec::new());
+        let mut culled = 0;
+        let mut triangles = 0u64;
+        for it in &items {
+            if !cam_frustum.intersects_sphere(it.center, it.radius) {
+                culled += 1;
+                continue;
+            }
+            triangles += u64::from(it.draw.index_count / 3);
+            if it.blend { &mut blended } else { &mut opaque }.push(it.draw);
+        }
+        opaque.sort_by(|a, b| a.variant.cmp(&b.variant).then(a.depth.total_cmp(&b.depth)));
+        blended.sort_by(|a, b| b.depth.total_cmp(&a.depth));
+        // Shadow casters: everything but blended objects, grouped by variant.
+        let shadow_draws = |vp: Mat4| -> Vec<Draw> {
+            let f = Frustum::from_view_proj(vp);
+            let mut v: Vec<Draw> = items
+                .iter()
+                .filter(|it| !it.blend && f.intersects_sphere(it.center, it.radius))
+                .map(|it| it.draw)
+                .collect();
+            v.sort_by_key(|d| d.variant);
+            v
+        };
+        let cascade_draws: Vec<Vec<Draw>> = (0..CASCADES)
+            .map(|c| {
+                if cascade_dir.is_some() {
+                    shadow_draws(cascade_vp[c])
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        let spot_draws: Vec<Vec<Draw>> = (0..MAX_SPOT_SHADOWS)
+            .map(|i| {
+                if i < spot_used {
+                    shadow_draws(spot_vp[i])
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        let shadow_draw_count = cascade_draws
+            .iter()
+            .chain(&spot_draws)
+            .map(Vec::len)
+            .sum::<usize>();
+
         let dense = self
             .materials
             .iter()
@@ -663,19 +1027,79 @@ impl Renderer {
             .unwrap_or(1) as usize;
         let mut materials = vec![bytemuck::Zeroable::zeroed(); dense];
         for (h, m) in self.materials.iter() {
-            materials[h.index() as usize] = m.0;
+            materials[h.index() as usize] = m.gpu;
         }
 
+        let instances_addr = self.ring_push(device, slot, bytemuck::cast_slice(&instances))?;
+        let lights_addr = self.ring_push(device, slot, bytemuck::cast_slice(&lights))?;
+        let materials_addr = self.ring_push(device, slot, bytemuck::cast_slice(&materials))?;
+        let ranges_addr = self.ring_push(device, slot, bytemuck::cast_slice(&assignment.ranges))?;
+        let indices_addr =
+            self.ring_push(device, slot, bytemuck::cast_slice(&assignment.indices))?;
+        let split = |a: u64| [a as u32, (a >> 32) as u32];
+        let frame_data = GpuFrame {
+            view,
+            proj,
+            view_proj,
+            inv_view_proj: view_proj.inverse(),
+            cascade_vp,
+            spot_vp,
+            camera_pos: [cam.x, cam.y, cam.z, 1.0],
+            cascade_splits: splits,
+            cascade_texel,
+            cascade_tex: std::array::from_fn(|i| self.cascades[i].index),
+            spot_tex: std::array::from_fn(|i| self.spots[i].index),
+            light_count: lights.len() as u32,
+            dir_count: dir_count as u32,
+            sampler_index: self.sampler_indices.0,
+            shadow_sampler: self.shadow_sampler_index,
+            exposure: scene.camera.exposure,
+            debug_mode: self.debug_view as u32,
+            pad0: 0,
+            pad1: 0,
+            sky_index: ibl.sky,
+            irradiance_index: ibl.irradiance,
+            brdf_lut_index: ibl.lut,
+            ibl_sampler: ibl.sampler,
+            prefilter: ibl.prefilter,
+            env_intensity: scene.environment.intensity,
+            pad2: 0,
+            cam_right: [right.x, right.y, right.z, tan_y * aspect],
+            cam_up: [up.x, up.y, up.z, tan_y],
+            cam_forward: [forward.x, forward.y, forward.z, 0.0],
+            cluster_ranges: split(ranges_addr),
+            cluster_indices: split(indices_addr),
+            cluster_params: [
+                scene.camera.near,
+                GRID.2 as f32 / (CLUSTER_FAR / scene.camera.near).ln(),
+                w as f32,
+                h as f32,
+            ],
+        };
         let addresses = [
             self.ring_push(device, slot, bytemuck::bytes_of(&frame_data))?,
-            self.ring_push(device, slot, bytemuck::cast_slice(&instances))?,
-            self.ring_push(device, slot, bytemuck::cast_slice(&lights))?,
-            self.ring_push(device, slot, bytemuck::cast_slice(&materials))?,
+            instances_addr,
+            lights_addr,
+            materials_addr,
         ];
 
-        let no_draws: &[Draw] = &[];
         let mut b = GraphBuilder::<D>::new();
-        let shadow = b.import("shadow", self.shadow, (SHADOW_SIZE, SHADOW_SIZE), None);
+        let cascade_ids: [_; CASCADES] = std::array::from_fn(|i| {
+            b.import(
+                CASCADE_NAMES[i],
+                self.cascades[i].texture,
+                (SHADOW_SIZE, SHADOW_SIZE),
+                None,
+            )
+        });
+        let spot_ids: [_; MAX_SPOT_SHADOWS] = std::array::from_fn(|i| {
+            b.import(
+                SPOT_NAMES[i],
+                self.spots[i].texture,
+                (SPOT_SHADOW_SIZE, SPOT_SHADOW_SIZE),
+                None,
+            )
+        });
         let ids = self.ibl.import(&mut b);
         let swapchain = b.import(
             "swapchain",
@@ -683,51 +1107,122 @@ impl Renderer {
             target.extent,
             Some(TextureState::Undefined),
         );
-        let hdr = b.transient(
-            "hdr",
-            TransientDesc {
-                width: w,
-                height: h,
-                format: HDR_FORMAT,
-                usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::SAMPLED,
-            },
-        );
+        let color_tex = |format| TransientDesc {
+            width: w,
+            height: h,
+            format,
+            usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::SAMPLED,
+        };
+        let hdr = b.transient("hdr", color_tex(HDR_FORMAT));
         let depth = b.transient(
             "depth",
             TransientDesc {
-                width: w,
-                height: h,
                 format: DEPTH_FORMAT,
-                usage: TextureUsage::DEPTH_ATTACHMENT,
+                usage: TextureUsage::DEPTH_ATTACHMENT | TextureUsage::SAMPLED,
+                ..color_tex(DEPTH_FORMAT)
             },
         );
+        let normal = b.transient("view_normal", color_tex(Format::Rg16Float));
         let rebake = self.ibl.needs_bake(&scene.environment);
         if rebake {
             self.ibl.add_bakes(&mut b, &ids, &scene.environment);
         }
-        shadow_pass(
+        let geometry = |pipes, draws| GeometryInputs {
+            pipes,
+            addresses,
+            draws,
+        };
+        for c in 0..CASCADES {
+            shadow_pass(
+                &mut b,
+                ShadowInputs {
+                    name: CASCADE_NAMES[c],
+                    texture: cascade_ids[c],
+                    view_index: c as u32,
+                    geometry: geometry(self.shadow_pipes, &cascade_draws[c]),
+                },
+            );
+        }
+        for i in 0..MAX_SPOT_SHADOWS {
+            shadow_pass(
+                &mut b,
+                ShadowInputs {
+                    name: SPOT_NAMES[i],
+                    texture: spot_ids[i],
+                    view_index: 4 + i as u32,
+                    geometry: geometry(self.shadow_pipes, &spot_draws[i]),
+                },
+            );
+        }
+        prepass(
             &mut b,
-            ShadowInputs {
-                pipeline: self.shadow_pipeline,
-                texture: shadow,
-                addresses,
-                draws: if fit.is_some() { &draws } else { no_draws },
+            PrepassInputs {
+                depth,
+                normal,
+                geometry: geometry(self.prepass, &opaque),
             },
         );
-        let mut reads = vec![shadow, ids.sky, ids.irradiance, ids.lut];
+        let mut reads: Vec<_> = cascade_ids.into_iter().chain(spot_ids).collect();
+        reads.extend([ids.sky, ids.irradiance, ids.lut]);
         reads.extend(ids.prefilter);
-        forward_pass(
+        match self.path {
+            RenderPath::Forward => forward_pass(
+                &mut b,
+                ShadedInputs {
+                    hdr,
+                    depth,
+                    reads: reads.clone(),
+                    geometry: geometry(self.forward, &opaque),
+                },
+            ),
+            RenderPath::Deferred => {
+                let gbuffer = [
+                    b.transient("gbuffer.albedo", color_tex(Format::Rgba8Srgb)),
+                    b.transient("gbuffer.normal", color_tex(Format::Rgba16Float)),
+                    b.transient("gbuffer.emissive", color_tex(Format::Rgba16Float)),
+                ];
+                gbuffer_pass(
+                    &mut b,
+                    GbufferInputs {
+                        targets: gbuffer,
+                        depth,
+                        geometry: geometry(self.gbuffer, &opaque),
+                    },
+                );
+                lighting_pass(
+                    &mut b,
+                    LightingInputs {
+                        pipeline: self.lighting,
+                        hdr,
+                        gbuffer,
+                        depth,
+                        reads: reads.clone(),
+                        addresses,
+                    },
+                );
+            }
+        }
+        skybox_pass(
             &mut b,
-            ForwardInputs {
-                pipeline: self.forward,
+            SkyboxInputs {
+                pipeline: self.ibl.skybox,
                 hdr,
                 depth,
-                reads,
+                sky: ids.sky,
                 addresses,
-                draws: &draws,
-                skybox: self.ibl.skybox,
             },
         );
+        if !blended.is_empty() {
+            transparent_pass(
+                &mut b,
+                ShadedInputs {
+                    hdr,
+                    depth,
+                    reads,
+                    geometry: geometry(self.transparent, &blended),
+                },
+            );
+        }
         tonemap_pass(
             &mut b,
             TonemapInputs {
@@ -749,11 +1244,14 @@ impl Renderer {
         }
 
         self.stats = RendererStats {
-            draws: draws.len() as u32,
+            draws: (opaque.len() + blended.len()) as u32,
             triangles,
             lights: lights.len() as u32,
             ring_bytes_used: self.ring_used,
             graph: graph_stats,
+            culled,
+            shadow_draws: shadow_draw_count as u32,
+            cluster_time,
         };
         if self.last_log.elapsed().as_secs() >= 1 {
             self.last_log = Instant::now();
@@ -779,11 +1277,21 @@ impl Renderer {
         device.destroy_sampler(self.linear_repeat);
         device.destroy_sampler(self.linear_clamp);
         self.ibl.destroy(device);
-        device.destroy_texture(self.shadow);
+        for m in self.cascades.iter().chain(&self.spots) {
+            device.destroy_texture(m.texture);
+        }
         device.destroy_sampler(self.shadow_sampler);
-        device.destroy_pipeline(self.shadow_pipeline);
-        device.destroy_pipeline(self.forward);
-        device.destroy_pipeline(self.tonemap);
+        for p in self
+            .shadow_pipes
+            .into_iter()
+            .chain(self.prepass)
+            .chain(self.forward)
+            .chain(self.gbuffer)
+            .chain(self.transparent)
+            .chain([self.lighting, self.tonemap])
+        {
+            device.destroy_pipeline(p);
+        }
         tracing::debug!("renderer destroyed");
     }
 }

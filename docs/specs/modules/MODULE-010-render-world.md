@@ -2,10 +2,10 @@
 
 | Field | Value |
 |---|---|
-| Status | Accepted (ADR-0011) |
+| Status | Accepted (ADR-0011, ADR-0012) |
 | Crate | renderer |
 | Layer | LAYER-005 |
-| Milestone | M3 |
+| Milestone | M3; M4b (culling, sorting, clustered lights, alpha, cascades) |
 | Traces to | FR-REND-001, FR-REND-002, FR-REND-003, FR-REND-004, FR-REND-025, FR-RES-012, NFR-CONC-003, NFR-ARCH-004, NFR-ARCH-005; MASTER-000 §8.5, §9.1, §11; ADR-0005 |
 | Last updated | 2026-11-02 |
 
@@ -19,7 +19,7 @@ The renderer-owned copy of the scene: it receives immutable extracted data each 
 
 - Accept `RenderScene` (camera, mesh instances, lights; plain data, `Send`) (formerly `ExtractedFrame`).
 - `RenderWorld::update(&mut self, frame: &ExtractedFrame)`: add/update/remove render-side instances keyed by renderer-neutral ids (`MeshId`, `MaterialId`).
-- Visibility: frustum culling first (M3), later occlusion/LOD (M5).
+- Visibility: CPU frustum culling of bounding spheres per view (camera, each cascade, each spot) in M4b, later occlusion/LOD (M5). Light visibility: clustered assignment (LAYER-005 M4b).
 - Sorting and batching into draw lists (by pipeline/material/depth).
 - Per-frame uniform data (camera, lights) prepared as plain bytes for upload.
 - Hand draw lists and data to pass implementations (forward in M3; the render graph from M4).
@@ -57,7 +57,7 @@ impl RenderWorld {
 }
 ```
 
-As built in M3a (the concept above is superseded): `RenderScene { camera: Camera, meshes: Vec<MeshInstance>, lights: Vec<Light> }` is defined in the renderer crate; `Renderer::render(&mut self, device, cmd, slot, &RenderScene, &SwapchainImage)` takes it by reference. There is no `RenderWorld` type yet; see LAYER-005 §8 for the full API.
+As built (M3a, updated for M4a/M4b; the concept above is superseded): `RenderScene { camera: Camera, meshes: Vec<MeshInstance>, lights: Vec<Light>, environment }` is defined in the renderer crate; `Renderer::render(&mut self, device, cmd, &FrameToken, &RenderScene, &SwapchainImage, final_state)` takes it by reference and returns `RenderError`. Renderer options: `set_render_path(RenderPath::{Forward, Deferred})`, `set_debug_view(DebugView)`. `Light::Spot` has `cast_shadows`; `MaterialDesc` has `alpha_mode: AlphaMode::{Opaque, Mask(f32), Blend}` and `double_sided`; `MAX_LIGHTS` is 1024, `MAX_SPOT_SHADOWS` 4. `RendererStats { draws, triangles, lights, ring_bytes_used, graph, culled, shadow_draws, cluster_time }`. There is no `RenderWorld` type yet; see LAYER-005 §8 for the full API.
 
 ## 6. Data structures
 
@@ -95,7 +95,7 @@ Unit tests against `NullBackend` or no backend at all: add/update/remove semanti
 - [x] `renderer` has no `ash` or scene dependency (`cargo tree -p renderer`).
 - [x] Extracted data is immutable during rendering (type-level: `&RenderScene`).
 - [x] Unit tests: mesh winding/tangents/counts, camera reverse-Z and Y flip, GPU layout sizes.
-- [ ] Culling and sorting unit tests, deterministic draw lists (deferred to M4, with visibility).
+- [x] Culling unit tests (`cull.rs`: perspective reverse-Z, orthographic, bounds) and sorting by variant then depth (M4b). Deterministic draw lists for the same scene follow from the stable sorts; no separate golden test.
 - [ ] Builds against a mock backend (pending).
 
 ## 14. Traceability (FR/NFR IDs)

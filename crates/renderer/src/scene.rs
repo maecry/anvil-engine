@@ -87,6 +87,9 @@ pub enum Light {
         inner_cone: f32,
         /// Half-angle (radians) where the intensity reaches zero.
         outer_cone: f32,
+        /// Casts a 1024x1024 perspective shadow map. Only the first
+        /// [`MAX_SPOT_SHADOWS`] such lights get one.
+        cast_shadows: bool,
     },
 }
 
@@ -122,7 +125,10 @@ impl Default for Environment {
 }
 
 /// Maximum lights shaded per frame; extra lights are ignored (with a warning).
-pub const MAX_LIGHTS: usize = 64;
+pub const MAX_LIGHTS: usize = 1024;
+
+/// Spot lights that get a shadow map per frame.
+pub const MAX_SPOT_SHADOWS: usize = 4;
 
 /// Everything the renderer needs for one frame.
 #[derive(Clone, Debug)]

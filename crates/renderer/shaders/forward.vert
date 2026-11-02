@@ -1,6 +1,10 @@
 #version 460
 #include "common.glsl"
 
+// Shared by the prepass, forward, G-buffer and transparent passes: one compiled vertex
+// transform, declared invariant, so depth matches bit for bit across passes.
+invariant gl_Position;
+
 layout(location = 0) out vec3 v_world_pos;
 layout(location = 1) out vec3 v_normal;
 layout(location = 2) out vec2 v_uv;

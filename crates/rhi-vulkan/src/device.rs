@@ -604,7 +604,10 @@ pub(crate) fn create_device_with(
         .descriptor_binding_partially_bound(true);
     let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
         .dynamic_rendering(true)
-        .synchronization2(true);
+        .synchronization2(true)
+        // `discard` in fragment shaders (alpha test) compiles to OpDemoteToHelperInvocation;
+        // the feature is mandatory in Vulkan 1.3.
+        .shader_demote_to_helper_invocation(true);
     let ci = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_ci)
         .enabled_extension_names(&ext_names)

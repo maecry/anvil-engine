@@ -12,26 +12,35 @@ pub(crate) struct GpuFrame {
     pub view: Mat4,
     pub proj: Mat4,
     pub view_proj: Mat4,
-    pub light_view_proj: Mat4,
+    pub inv_view_proj: Mat4,
+    pub cascade_vp: [Mat4; 4],
+    pub spot_vp: [Mat4; 4],
     pub camera_pos: [f32; 4],
+    pub cascade_splits: [f32; 4],
+    pub cascade_texel: [f32; 4],
+    pub cascade_tex: [u32; 4],
+    pub spot_tex: [u32; 4],
     pub light_count: u32,
+    pub dir_count: u32,
     pub sampler_index: u32,
-    pub shadow_index: u32,
     pub shadow_sampler: u32,
     pub exposure: f32,
-    pub shadow_light: u32,
-    pub shadow_texel_world: f32,
-    pub pad: f32,
+    pub debug_mode: u32,
+    pub pad0: u32,
+    pub pad1: u32,
     pub sky_index: u32,
     pub irradiance_index: u32,
     pub brdf_lut_index: u32,
     pub ibl_sampler: u32,
     pub prefilter: [u32; 6],
     pub env_intensity: f32,
-    pub pad0: u32,
+    pub pad2: u32,
     pub cam_right: [f32; 4],
     pub cam_up: [f32; 4],
     pub cam_forward: [f32; 4],
+    pub cluster_ranges: [u32; 2],
+    pub cluster_indices: [u32; 2],
+    pub cluster_params: [f32; 4],
 }
 
 /// Per-instance data.
@@ -71,7 +80,8 @@ impl GpuLight {
                     color.z * intensity,
                     0.0,
                 ],
-                spot: [0.0; 4],
+                // Cascaded shadows are flagged by the renderer on the shadow caster.
+                spot: [0.0, 0.0, -1.0, 0.0],
             },
             Light::Point {
                 position,
@@ -87,7 +97,7 @@ impl GpuLight {
                     color.z * intensity,
                     0.0,
                 ],
-                spot: [0.0; 4],
+                spot: [0.0, 0.0, -1.0, 0.0],
             },
             Light::Spot {
                 position,
@@ -97,6 +107,7 @@ impl GpuLight {
                 range,
                 inner_cone,
                 outer_cone,
+                ..
             } => Self {
                 position_type: [position.x, position.y, position.z, 2.0],
                 direction_range: [direction.x, direction.y, direction.z, range],
@@ -106,7 +117,7 @@ impl GpuLight {
                     color.z * intensity,
                     0.0,
                 ],
-                spot: [inner_cone.cos(), outer_cone.cos(), 0.0, 0.0],
+                spot: [inner_cone.cos(), outer_cone.cos(), -1.0, outer_cone.tan()],
             },
         }
     }
@@ -127,7 +138,8 @@ pub(crate) struct GpuMaterial {
     pub normal_tex: u32,
     pub occlusion_tex: u32,
     pub emissive_tex: u32,
-    pub pad: [u32; 3],
+    pub alpha_cutoff: f32,
+    pub pad: [u32; 2],
 }
 
 #[cfg(test)]
@@ -136,7 +148,7 @@ mod tests {
 
     #[test]
     fn layouts_match_std430() {
-        assert_eq!(size_of::<GpuFrame>(), 400);
+        assert_eq!(size_of::<GpuFrame>(), 1008);
         assert_eq!(size_of::<GpuInstance>(), 144);
         assert_eq!(size_of::<GpuLight>(), 64);
         assert_eq!(size_of::<GpuMaterial>(), 80);

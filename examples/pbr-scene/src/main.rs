@@ -1,11 +1,16 @@
-//! M3 vertical slice: a grid of spheres with varying metallic/roughness, a textured cube and a
-//! ground plane, lit by a directional, a point and a spot light, with a fly camera
-//! (WASD + Space/Ctrl, Shift = faster, mouse-look while the right button is held; `T` toggles
-//! the animated sun).
+//! M3/M4b showcase: a grid of spheres with varying metallic/roughness, a textured cube, an
+//! alpha-tested fence, transparent glass spheres and a ground plane, lit by a cascaded-shadow sun,
+//! a point light and a shadow-casting spot light, with a fly camera (WASD + Space/Ctrl,
+//! Shift = faster, mouse-look while the right button is held).
+//!
+//! Keys: `T` animate sun, `G` forward/deferred, `L` stress lights (256 animated point lights),
+//! `C` cluster light-count heatmap, `V` cascade tint, `Esc` quit.
 //!
 //! Env: `ANVIL_EXIT_AFTER_FRAMES=n` renders n frames and exits (code 1 on validation errors).
 //! `ANVIL_SCREENSHOT=path.png` (with `ANVIL_EXIT_AFTER_FRAMES`) writes the last frame as a PNG.
-//! See ADR-0009 §7 and ADR-0011 §11.
+//! `ANVIL_RENDER_PATH=forward|deferred`, `ANVIL_STRESS_LIGHTS=1`,
+//! `ANVIL_DEBUG_VIEW=clusters|cascades` select the initial state headlessly.
+//! See ADR-0009 §7, ADR-0011 §11 and ADR-0012 §11.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +20,8 @@ use anyhow::Context;
 use foundation::math::{Mat4, Quat, Vec3};
 use platform::{App, AppError, Control, Event, KeyCode, MouseButton, Window, WindowConfig};
 use renderer::{
-    Camera, Environment, Light, MaterialDesc, MeshInstance, RenderScene, Renderer, mesh,
+    AlphaMode, Camera, DebugView, Environment, Light, MaterialDesc, MeshInstance, RenderPath,
+    RenderScene, Renderer, mesh,
 };
 use rhi::{
     Acquire, Backend, BufferDesc, BufferUsage, CommandEncoder, Device, DeviceDesc,
@@ -41,6 +47,51 @@ fn checker(size: u32, cell: u32) -> Vec<u8> {
         }
     }
     data
+}
+
+/// Procedural fence: opaque vertical slats separated by fully transparent gaps (alpha-tested).
+fn fence(size: u32) -> Vec<u8> {
+    let mut data = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let slat = x % 16 < 11 && y > size / 16 + (x % 16) / 2 % 3;
+            let grain = 90 + (x * 7 + y * 3) % 40;
+            data.extend_from_slice(&[
+                grain as u8 + 60,
+                grain as u8 + 20,
+                40,
+                if slat { 255 } else { 0 },
+            ]);
+        }
+    }
+    data
+}
+
+/// 256 small colored point lights drifting over the ground, a function of the frame number so
+/// runs are reproducible.
+fn stress_lights(frame: u64) -> Vec<Light> {
+    let t = frame as f32 / 60.0;
+    (0..256)
+        .map(|i| {
+            let (gx, gz) = ((i % 16) as f32, (i / 16) as f32);
+            let phase = i as f32 * 0.7;
+            let hue = i as f32 / 256.0 * std::f32::consts::TAU;
+            Light::Point {
+                position: Vec3::new(
+                    (gx - 7.5) * 1.5 + (t * 0.6 + phase).sin() * 0.8,
+                    0.25 + 0.15 * (t + phase).sin().abs(),
+                    (gz - 11.0) * 1.2 + (t * 0.5 + phase).cos() * 0.8,
+                ),
+                color: Vec3::new(
+                    0.5 + 0.5 * hue.cos(),
+                    0.5 + 0.5 * (hue + 2.1).cos(),
+                    0.5 + 0.5 * (hue + 4.2).cos(),
+                ),
+                intensity: 2.0,
+                range: 2.5,
+            }
+        })
+        .collect()
 }
 
 /// Sun azimuth (radians) at start; `T` animates it.
@@ -89,6 +140,9 @@ struct PbrScene {
     looking: bool,
     sun_angle: f32,
     animate_sun: bool,
+    stress: bool,
+    path: RenderPath,
+    debug: DebugView,
     last: Instant,
     rendered: u64,
     exit_after: Option<u64>,
@@ -139,7 +193,30 @@ impl PbrScene {
             ..MaterialDesc::default()
         });
 
+        let fence_tex = r.create_texture(&device, "fence", &fence(64), 64, 64, true)?;
+        let fence_mat = r.create_material(&MaterialDesc {
+            label: "fence",
+            base_color_texture: Some(fence_tex),
+            metallic: 0.0,
+            roughness: 0.8,
+            alpha_mode: AlphaMode::Mask(0.5),
+            double_sided: true,
+            ..MaterialDesc::default()
+        });
+        let quad = r.create_mesh(&device, "quad", &mesh::plane(1.0))?;
+
         let mut instances = vec![
+            MeshInstance {
+                // A 3 x 2 m fence panel standing at the right, slightly turned.
+                mesh: quad,
+                material: fence_mat,
+                transform: Mat4::from_scale_rotation_translation(
+                    Vec3::new(3.0, 1.0, 2.0),
+                    Quat::from_rotation_y(-0.4)
+                        * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+                    Vec3::new(3.6, 1.0, 1.4),
+                ),
+            },
             MeshInstance {
                 mesh: plane,
                 material: ground,
@@ -154,6 +231,33 @@ impl PbrScene {
                 ),
             },
         ];
+        // Tinted glass spheres in front of the grid (alpha-blended, sorted back to front).
+        for (i, color) in [
+            [0.2, 0.6, 1.0, 0.35],
+            [1.0, 0.3, 0.3, 0.35],
+            [0.3, 1.0, 0.4, 0.35],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let material = r.create_material(&MaterialDesc {
+                label: "glass",
+                base_color: color,
+                metallic: 0.0,
+                roughness: 0.05,
+                alpha_mode: AlphaMode::Blend,
+                ..MaterialDesc::default()
+            });
+            instances.push(MeshInstance {
+                mesh: sphere,
+                material,
+                transform: Mat4::from_translation(Vec3::new(
+                    -1.2 + i as f32 * 0.7,
+                    0.5,
+                    3.0 - i as f32 * 0.5,
+                )),
+            });
+        }
         // Metallic increases along +X, roughness along -Z.
         for row in 0..4 {
             for col in 0..5 {
@@ -195,8 +299,14 @@ impl PbrScene {
                 range: 14.0,
                 inner_cone: 0.25,
                 outer_cone: 0.5,
+                cast_shadows: true,
             },
         ];
+        tracing::info!(
+            "keys: WASD/Space/Ctrl move, Shift fast, RMB look, T sun animation, G forward/deferred, \
+             L stress lights, C cluster heatmap, V cascade tint, Esc quit; env: ANVIL_RENDER_PATH, \
+             ANVIL_STRESS_LIGHTS, ANVIL_DEBUG_VIEW"
+        );
         Ok(Gfx {
             instance,
             surface,
@@ -258,10 +368,16 @@ impl PbrScene {
             Acquire::Minimized => return Ok(false),
         };
         g.lights[0] = sun(sun_angle);
+        g.renderer.set_render_path(self.path);
+        g.renderer.set_debug_view(self.debug);
+        let mut lights = g.lights.clone();
+        if self.stress {
+            lights.extend(stress_lights(self.rendered));
+        }
         let scene = RenderScene {
             camera: scene_camera,
             meshes: g.instances.clone(),
-            lights: g.lights.clone(),
+            lights,
             // The sky's sun follows the shadow-casting directional light.
             environment: Environment {
                 sun_direction: sun_direction(sun_angle),
@@ -383,6 +499,31 @@ impl App for PbrScene {
                 code: KeyCode::T,
                 pressed: true,
             } => self.animate_sun = !self.animate_sun,
+            Event::Key {
+                code: KeyCode::G,
+                pressed: true,
+            } => {
+                self.path = match self.path {
+                    RenderPath::Forward => RenderPath::Deferred,
+                    RenderPath::Deferred => RenderPath::Forward,
+                };
+                tracing::info!(path = ?self.path, "render path");
+            }
+            Event::Key {
+                code: KeyCode::L,
+                pressed: true,
+            } => {
+                self.stress = !self.stress;
+                tracing::info!(stress = self.stress, "stress lights");
+            }
+            Event::Key {
+                code: KeyCode::C,
+                pressed: true,
+            } => self.debug = toggle(self.debug, DebugView::Clusters),
+            Event::Key {
+                code: KeyCode::V,
+                pressed: true,
+            } => self.debug = toggle(self.debug, DebugView::Cascades),
             Event::Key { code, pressed } => {
                 self.keys.retain(|k| k != code);
                 if *pressed {
@@ -418,6 +559,14 @@ impl App for PbrScene {
     }
 }
 
+fn toggle(current: DebugView, view: DebugView) -> DebugView {
+    if current == view {
+        DebugView::None
+    } else {
+        view
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     foundation::init_logging()?;
     let failed = Arc::new(AtomicBool::new(false));
@@ -444,6 +593,16 @@ fn main() -> anyhow::Result<()> {
             looking: false,
             sun_angle: SUN_START,
             animate_sun: false,
+            stress: std::env::var("ANVIL_STRESS_LIGHTS").as_deref() == Ok("1"),
+            path: match std::env::var("ANVIL_RENDER_PATH").as_deref() {
+                Ok("deferred") => RenderPath::Deferred,
+                _ => RenderPath::Forward,
+            },
+            debug: match std::env::var("ANVIL_DEBUG_VIEW").as_deref() {
+                Ok("clusters") => DebugView::Clusters,
+                Ok("cascades") => DebugView::Cascades,
+                _ => DebugView::None,
+            },
             last: Instant::now(),
             rendered: 0,
             exit_after,
