@@ -19,3 +19,5 @@ undocumented_unsafe_blocks = "warn"
 tracing = "0.1.44"
 thiserror = "2.0.21"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "std"] }
+winit = "0.30.13"
+raw-window-handle = "0.6.2"

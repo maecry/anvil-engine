@@ -10,3 +10,5 @@ workspace = true
 
 [dependencies]
 foundation = { path = "../foundation" }
+thiserror.workspace = true
+raw-window-handle.workspace = true
