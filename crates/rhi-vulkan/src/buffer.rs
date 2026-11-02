@@ -234,8 +234,12 @@ pub(crate) fn create_buffer(s: &DeviceShared, desc: &BufferDesc) -> Result<Buffe
     // SAFETY: the buffer has SHADER_DEVICE_ADDRESS usage and bound memory (bufferDeviceAddress
     // is an enabled feature).
     let address = unsafe { s.raw.get_buffer_device_address(&info) };
-    let mapped = mapped_of(&allocation);
-    debug_assert_eq!(mapped.is_some(), desc.memory != Memory::GpuOnly);
+    // UMA/software devices (lavapipe) map GpuOnly memory too; ignore that so write/read_buffer
+    // behave the same on every device.
+    let mapped = (desc.memory != Memory::GpuOnly)
+        .then(|| mapped_of(&allocation))
+        .flatten();
+    debug_assert!(desc.memory == Memory::GpuOnly || mapped.is_some());
     let coherent = is_coherent(&allocation);
     let h = write(&s.pools.buffers).insert(VkBuffer {
         raw,
