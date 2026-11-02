@@ -1,0 +1,19 @@
+[package]
+name = "render-graph"
+description = "Frame render graph: declared passes, barrier planning and transient textures (ADR-0012)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+foundation = { path = "../foundation" }
+rhi = { path = "../rhi" }
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+foundation = { path = "../foundation", features = ["log-init"] }
+rhi-vulkan = { path = "../rhi-vulkan" }

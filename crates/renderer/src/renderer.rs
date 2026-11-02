@@ -1,16 +1,18 @@
-//! The [`Renderer`]: owns pipelines, render targets, built-in textures and the per-frame upload
-//! rings, and records the fixed pass sequence (ADR-0011 §3).
+//! The [`Renderer`]: owns pipelines, persistent textures, built-in textures and the per-frame
+//! upload rings, and builds the frame as a render graph (ADR-0011 §3, ADR-0012).
 
 use std::time::Instant;
 
 use foundation::Handle;
 use foundation::Pool;
 use foundation::math::{Mat4, Vec3};
+use render_graph::{GraphBuilder, GraphError, GraphStats, RenderGraph, TransientDesc};
 use rhi::{
     AddressMode, BlendState, BufferDesc, BufferHandle, BufferUsage, CompareOp, CullMode, DepthBias,
-    DepthState, Device, Filter, Format, FrontFace, GraphicsPipelineDesc, Memory, PipelineHandle,
-    PrimitiveTopology, RhiError, SamplerDesc, SamplerHandle, ShaderModuleDesc, ShaderModuleHandle,
-    ShaderStageDesc, SwapchainImage, TextureDesc, TextureHandle, TextureUsage,
+    DepthState, Device, Filter, Format, FrameToken, FrontFace, GraphicsPipelineDesc, Memory,
+    PipelineHandle, PrimitiveTopology, RhiError, SamplerDesc, SamplerHandle, ShaderModuleDesc,
+    ShaderModuleHandle, ShaderStageDesc, SwapchainImage, TextureDesc, TextureHandle, TextureState,
+    TextureUsage,
 };
 
 use crate::gpu::{GpuFrame, GpuInstance, GpuLight, GpuMaterial};
@@ -125,14 +127,19 @@ pub struct RendererStats {
     pub lights: u32,
     /// Bytes of the frame's upload ring in use.
     pub ring_bytes_used: u64,
+    /// Render graph counters, including compile time.
+    pub graph: GraphStats,
 }
 
-struct Targets {
-    hdr: TextureHandle,
-    hdr_index: u32,
-    depth: TextureHandle,
-    extent: (u32, u32),
-    initialized: bool,
+/// Why [`Renderer::render`] failed.
+#[derive(Debug, thiserror::Error)]
+pub enum RenderError {
+    /// Device or upload failure.
+    #[error(transparent)]
+    Rhi(#[from] RhiError),
+    /// The frame graph did not compile or run.
+    #[error(transparent)]
+    Graph(#[from] GraphError),
 }
 
 /// Forward renderer. All methods taking a device must be given the device it was created with.
@@ -142,11 +149,10 @@ pub struct Renderer {
     tonemap: PipelineHandle,
     shadow: TextureHandle,
     shadow_index: u32,
-    shadow_initialized: bool,
     shadow_sampler: SamplerHandle,
     shadow_sampler_index: u32,
     ibl: Ibl,
-    targets: Targets,
+    graph: RenderGraph,
     encode_srgb: bool,
     linear_repeat: SamplerHandle,
     linear_clamp: SamplerHandle,
@@ -171,31 +177,6 @@ fn spirv_words(bytes: &[u8]) -> Vec<u32> {
         .iter()
         .map(|c| u32::from_le_bytes(*c))
         .collect()
-}
-
-fn create_targets<D: Device>(d: &D, extent: (u32, u32)) -> Result<Targets, RhiError> {
-    let (width, height) = (extent.0.max(1), extent.1.max(1));
-    let hdr = d.create_texture(&TextureDesc {
-        label: Some("renderer.hdr"),
-        width,
-        height,
-        format: HDR_FORMAT,
-        usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::SAMPLED,
-    })?;
-    let depth = d.create_texture(&TextureDesc {
-        label: Some("renderer.depth"),
-        width,
-        height,
-        format: DEPTH_FORMAT,
-        usage: TextureUsage::DEPTH_ATTACHMENT,
-    })?;
-    Ok(Targets {
-        hdr,
-        hdr_index: d.texture_index(hdr)?,
-        depth,
-        extent: (width, height),
-        initialized: false,
-    })
 }
 
 pub(crate) fn make_pipeline<D: Device>(
@@ -328,7 +309,8 @@ impl Renderer {
             address_w: AddressMode::ClampToEdge,
             compare: Some(CompareOp::LessOrEqual),
         })?;
-        let targets = create_targets(device, extent)?;
+        let mut graph = RenderGraph::new(device.diagnostics().frames_in_flight);
+        graph.track(shadow, TextureState::Undefined);
         let sampler = |label, address| {
             device.create_sampler(&SamplerDesc {
                 label: Some(label),
@@ -363,11 +345,10 @@ impl Renderer {
             tonemap,
             shadow_index: device.texture_index(shadow)?,
             shadow,
-            shadow_initialized: false,
             shadow_sampler_index: device.sampler_index(shadow_sampler)?,
             shadow_sampler,
-            ibl: Ibl::new(device)?,
-            targets,
+            ibl: Ibl::new(device, &mut graph)?,
+            graph,
             encode_srgb: !swapchain_format.is_srgb(),
             linear_repeat,
             linear_clamp,
@@ -401,22 +382,6 @@ impl Renderer {
         });
         tracing::debug!(?extent, ?swapchain_format, frames, "renderer created");
         Ok(r)
-    }
-
-    /// Recreates the size-dependent targets. Called automatically by [`Renderer::render`] when
-    /// the swapchain image size differs.
-    ///
-    /// # Errors
-    /// Any [`RhiError`] from texture creation.
-    pub fn resize<D: Device>(&mut self, device: &D, extent: (u32, u32)) -> Result<(), RhiError> {
-        if extent == self.targets.extent {
-            return Ok(());
-        }
-        device.destroy_texture(self.targets.hdr);
-        device.destroy_texture(self.targets.depth);
-        self.targets = create_targets(device, extent)?;
-        tracing::debug!(?extent, "renderer targets resized");
-        Ok(())
     }
 
     /// Uploads a mesh into GPU-only buffers.
@@ -573,29 +538,29 @@ impl Renderer {
         Ok(base + offset)
     }
 
-    /// Records the frame: forward opaque into HDR, then tonemap into `target`. `slot` is
-    /// [`rhi::FrameToken::slot`]. `target` is left in [`rhi::TextureState::ColorAttachment`];
-    /// the caller transitions it to `Present` (or `TransferSrc` for a screenshot).
+    /// Builds and records the frame as a render graph: environment bakes (when the environment
+    /// changed), shadow, forward + skybox into a transient HDR target, then tonemap into
+    /// `target`. `frame` is the token `cmd` was begun with. `target` ends in `final_state`
+    /// (`Present`, or `TransferSrc` to read it back); it is imported as `Undefined`.
     ///
     /// # Errors
-    /// [`RhiError`] from target recreation or ring uploads (including ring overflow).
+    /// [`RenderError`] from ring uploads (including ring overflow), or the graph.
     pub fn render<D: Device>(
         &mut self,
         device: &D,
         cmd: &mut D::Commands,
-        slot: u32,
+        frame: &FrameToken,
         scene: &RenderScene,
         target: &SwapchainImage,
-    ) -> Result<(), RhiError> {
-        self.resize(device, target.extent)?;
-        let slot = slot as usize;
+        final_state: TextureState,
+    ) -> Result<(), RenderError> {
+        let slot = frame.slot as usize;
         self.ring_used = 0;
 
-        let (w, h) = self.targets.extent;
+        let (w, h) = (target.extent.0.max(1), target.extent.1.max(1));
         let view = scene.camera.view();
         let proj = scene.camera.projection(w as f32 / h as f32);
         let cam = scene.camera.position;
-        self.ibl.bake(cmd, &scene.environment);
         let ibl = self.ibl.indices();
         let aspect = w as f32 / h as f32;
         let tan_y = (scene.camera.fov_y * 0.5).tan();
@@ -633,7 +598,7 @@ impl Renderer {
             )),
             _ => None,
         });
-        let frame = GpuFrame {
+        let frame_data = GpuFrame {
             view,
             proj,
             view_proj: proj * view,
@@ -702,57 +667,93 @@ impl Renderer {
         }
 
         let addresses = [
-            self.ring_push(device, slot, bytemuck::bytes_of(&frame))?,
+            self.ring_push(device, slot, bytemuck::bytes_of(&frame_data))?,
             self.ring_push(device, slot, bytemuck::cast_slice(&instances))?,
             self.ring_push(device, slot, bytemuck::cast_slice(&lights))?,
             self.ring_push(device, slot, bytemuck::cast_slice(&materials))?,
         ];
 
         let no_draws: &[Draw] = &[];
+        let mut b = GraphBuilder::<D>::new();
+        let shadow = b.import("shadow", self.shadow, (SHADOW_SIZE, SHADOW_SIZE), None);
+        let ids = self.ibl.import(&mut b);
+        let swapchain = b.import(
+            "swapchain",
+            target.texture,
+            target.extent,
+            Some(TextureState::Undefined),
+        );
+        let hdr = b.transient(
+            "hdr",
+            TransientDesc {
+                width: w,
+                height: h,
+                format: HDR_FORMAT,
+                usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::SAMPLED,
+            },
+        );
+        let depth = b.transient(
+            "depth",
+            TransientDesc {
+                width: w,
+                height: h,
+                format: DEPTH_FORMAT,
+                usage: TextureUsage::DEPTH_ATTACHMENT,
+            },
+        );
+        let rebake = self.ibl.needs_bake(&scene.environment);
+        if rebake {
+            self.ibl.add_bakes(&mut b, &ids, &scene.environment);
+        }
         shadow_pass(
-            cmd,
-            &ShadowInputs {
+            &mut b,
+            ShadowInputs {
                 pipeline: self.shadow_pipeline,
-                texture: self.shadow,
-                size: SHADOW_SIZE,
-                initialized: self.shadow_initialized,
+                texture: shadow,
                 addresses,
                 draws: if fit.is_some() { &draws } else { no_draws },
             },
         );
-        self.shadow_initialized = true;
+        let mut reads = vec![shadow, ids.sky, ids.irradiance, ids.lut];
+        reads.extend(ids.prefilter);
         forward_pass(
-            cmd,
-            &ForwardInputs {
+            &mut b,
+            ForwardInputs {
                 pipeline: self.forward,
-                hdr: self.targets.hdr,
-                depth: self.targets.depth,
-                extent: self.targets.extent,
-                targets_initialized: self.targets.initialized,
+                hdr,
+                depth,
+                reads,
                 addresses,
                 draws: &draws,
                 skybox: self.ibl.skybox,
             },
         );
-        self.targets.initialized = true;
         tonemap_pass(
-            cmd,
-            &TonemapInputs {
+            &mut b,
+            TonemapInputs {
                 pipeline: self.tonemap,
-                hdr_index: self.targets.hdr_index,
+                hdr,
                 sampler_index: self.sampler_indices.1,
                 exposure: scene.camera.exposure,
                 encode_srgb: self.encode_srgb,
-                target: target.texture,
-                extent: target.extent,
+                target: swapchain,
             },
         );
+        b.export(swapchain, final_state);
+        let compiled = self.graph.compile(b)?;
+        let compile_time = compiled.stats().compile_time;
+        let mut graph_stats = self.graph.execute(compiled, device, cmd, frame)?;
+        graph_stats.compile_time = compile_time;
+        if rebake {
+            self.ibl.mark_baked(&scene.environment);
+        }
 
         self.stats = RendererStats {
             draws: draws.len() as u32,
             triangles,
             lights: lights.len() as u32,
             ring_bytes_used: self.ring_used,
+            graph: graph_stats,
         };
         if self.last_log.elapsed().as_secs() >= 1 {
             self.last_log = Instant::now();
@@ -774,8 +775,7 @@ impl Renderer {
         for (b, _) in self.rings {
             device.destroy_buffer(b);
         }
-        device.destroy_texture(self.targets.hdr);
-        device.destroy_texture(self.targets.depth);
+        self.graph.destroy(device);
         device.destroy_sampler(self.linear_repeat);
         device.destroy_sampler(self.linear_clamp);
         self.ibl.destroy(device);

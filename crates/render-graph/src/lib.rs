@@ -1,0 +1,393 @@
+//! Frame render graph over the Anvil RHI (ADR-0012, `docs/specs/layers/LAYER-006-render-graph.md`).
+//!
+//! Every frame the app declares passes with their texture reads and attachments on a
+//! [`GraphBuilder`], compiles it with [`RenderGraph::compile`] (validate, cull, order, plan
+//! barriers and transient slots) and records it with [`RenderGraph::execute`]. The graph emits
+//! all barriers, `begin_rendering`/`end_rendering`, viewport and scissor; pass bodies only bind
+//! and draw. The persistent [`RenderGraph`] remembers the state of imported textures and pools
+//! transient textures across frames. Knows nothing about meshes or materials.
+
+mod describe;
+mod plan;
+mod pool;
+
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use rhi::{
+    ColorAttachment, CommandEncoder, DepthAttachment, Device, FrameToken, Rect2D, RenderingDesc,
+    RhiError, TextureDesc, TextureHandle, TextureState, Viewport,
+};
+
+pub use describe::{BarrierDesc, GraphDescription, PassDesc, ResourceDesc};
+pub use plan::{ColorTarget, DepthTarget, GraphError, Pass, TexId, TransientDesc};
+
+use plan::{Decls, Plan, pass_extent};
+use pool::TransientPool;
+
+/// Counters of one frame's graph (ADR-0012 §5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GraphStats {
+    /// Declared passes.
+    pub passes: u32,
+    /// Declared passes dropped because no root depends on them.
+    pub culled: u32,
+    /// Planned barriers.
+    pub barriers: u32,
+    /// Declared transient textures that a live pass uses.
+    pub transients: u32,
+    /// Physical textures needed after lifetime-based sharing.
+    pub slots: u32,
+    /// CPU time of [`RenderGraph::compile`].
+    pub compile_time: Duration,
+    /// Device textures created by [`RenderGraph::execute`] (set there).
+    pub textures_created: u32,
+    /// Pool entries alive after [`RenderGraph::execute`] (set there).
+    pub pool_size: u32,
+}
+
+/// Body of a pass: binds and draws. Errors are attributed to the pass.
+type Body<'a, D> = Box<dyn FnOnce(&mut PassContext<'_, D>) -> Result<(), RhiError> + 'a>;
+
+/// What a pass body can use: the encoder (inside the pass's rendering scope for raster
+/// passes), the device, and the physical textures behind graph ids.
+pub struct PassContext<'c, D: Device> {
+    /// Command encoder.
+    pub cmd: &'c mut D::Commands,
+    /// The device the graph runs on.
+    pub device: &'c D,
+    textures: &'c [TextureHandle],
+}
+
+impl<D: Device> PassContext<'_, D> {
+    /// The texture behind `id`. Only valid for textures the pass declared.
+    pub fn texture(&self, id: TexId) -> TextureHandle {
+        self.textures[id.0 as usize]
+    }
+
+    /// Bindless slot of the texture behind `id`.
+    ///
+    /// # Errors
+    /// [`RhiError`] from the device (e.g. a texture without `SAMPLED` usage).
+    pub fn texture_index(&self, id: TexId) -> Result<u32, RhiError> {
+        self.device.texture_index(self.texture(id))
+    }
+}
+
+/// One frame's declarations: textures, passes with bodies, exports. Bodies are boxed once per
+/// pass (the bounded `dyn` exception of ADR-0012 §7) and may borrow frame data for `'a`.
+pub struct GraphBuilder<'a, D: Device> {
+    decls: Decls,
+    bodies: Vec<Body<'a, D>>,
+}
+
+impl<'a, D: Device> Default for GraphBuilder<'a, D> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a, D: Device> GraphBuilder<'a, D> {
+    /// An empty frame.
+    pub fn new() -> Self {
+        Self {
+            decls: Decls::default(),
+            bodies: Vec::new(),
+        }
+    }
+
+    /// Declares a transient texture, allocated from the pool when a live pass uses it.
+    pub fn transient(&mut self, name: impl Into<Cow<'static, str>>, desc: TransientDesc) -> TexId {
+        self.decls.transient(name.into(), desc)
+    }
+
+    /// Imports a persistent texture of `extent`. `initial` overrides the state the graph
+    /// remembers (use `Some(Undefined)` for a swapchain image); `None` uses the remembered
+    /// state and fails compilation if there is none (see [`RenderGraph::track`]).
+    pub fn import(
+        &mut self,
+        name: impl Into<Cow<'static, str>>,
+        texture: TextureHandle,
+        extent: (u32, u32),
+        initial: Option<TextureState>,
+    ) -> TexId {
+        self.decls.import(name.into(), texture, extent, initial)
+    }
+
+    /// `tex` must end the frame in `state` (e.g. `Present`). Exports are roots.
+    pub fn export(&mut self, tex: TexId, state: TextureState) {
+        self.decls.exports.push((tex, state));
+    }
+
+    /// Adds a pass. Passes run in declaration order; one that reaches no root is culled and
+    /// its body dropped unrun.
+    pub fn pass(
+        &mut self,
+        pass: Pass,
+        body: impl FnOnce(&mut PassContext<'_, D>) -> Result<(), RhiError> + 'a,
+    ) {
+        self.decls.passes.push(pass);
+        self.bodies.push(Box::new(body));
+    }
+}
+
+/// A validated, planned frame ready for [`RenderGraph::execute`].
+pub struct CompiledGraph<'a, D: Device> {
+    decls: Decls,
+    plan: Plan,
+    bodies: Vec<Option<Body<'a, D>>>,
+    stats: GraphStats,
+}
+
+impl<D: Device> CompiledGraph<'_, D> {
+    /// Compile-time counters.
+    pub fn stats(&self) -> GraphStats {
+        self.stats
+    }
+
+    /// The frame structure as plain data.
+    pub fn describe(&self) -> GraphDescription {
+        describe::describe(&self.decls, &self.plan)
+    }
+}
+
+/// Persistent part of the graph: remembered states of imported textures and the transient pool.
+pub struct RenderGraph {
+    states: HashMap<TextureHandle, TextureState>,
+    pool: TransientPool,
+}
+
+/// Writes the first compiled graph to `ANVIL_GRAPH_DUMP` (`.json`, otherwise DOT).
+fn dump_once(desc: &GraphDescription) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    let Ok(path) = std::env::var("ANVIL_GRAPH_DUMP") else {
+        return;
+    };
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let text = if path.ends_with(".json") {
+        desc.to_json()
+    } else {
+        desc.to_dot()
+    };
+    match std::fs::write(&path, text) {
+        Ok(()) => tracing::info!(path, "render graph dumped"),
+        Err(e) => tracing::warn!(path, error = %e, "render graph dump failed"),
+    }
+}
+
+impl RenderGraph {
+    /// `frames_in_flight` is the device's setting; it decides when a pooled texture has retired.
+    pub fn new(frames_in_flight: u32) -> Self {
+        Self {
+            states: HashMap::new(),
+            pool: TransientPool::new(frames_in_flight),
+        }
+    }
+
+    /// Starts remembering `texture` (e.g. a just-created IBL map) in `state`.
+    pub fn track(&mut self, texture: TextureHandle, state: TextureState) {
+        self.states.insert(texture, state);
+    }
+
+    /// Stops remembering `texture`; call before destroying an imported texture.
+    pub fn forget(&mut self, texture: TextureHandle) {
+        self.states.remove(&texture);
+    }
+
+    /// Validates, culls, orders and plans the frame.
+    ///
+    /// # Errors
+    /// A [`GraphError`] naming the offending pass and texture.
+    pub fn compile<'a, D: Device>(
+        &self,
+        builder: GraphBuilder<'a, D>,
+    ) -> Result<CompiledGraph<'a, D>, GraphError> {
+        let t0 = Instant::now();
+        let GraphBuilder { decls, bodies } = builder;
+        let plan = plan::plan(&decls, &self.states)?;
+        let culled = plan.live.iter().filter(|l| !**l).count() as u32;
+        let stats = GraphStats {
+            passes: decls.passes.len() as u32,
+            culled,
+            barriers: plan.barriers.len() as u32,
+            transients: plan.slot_of.iter().filter(|s| s.is_some()).count() as u32,
+            slots: plan.slots.len() as u32,
+            compile_time: t0.elapsed(),
+            ..GraphStats::default()
+        };
+        tracing::debug!(
+            passes = stats.passes,
+            culled,
+            barriers = stats.barriers,
+            transients = stats.transients,
+            slots = stats.slots,
+            compile_us = stats.compile_time.as_micros() as u64,
+            "render graph compiled"
+        );
+        let compiled = CompiledGraph {
+            decls,
+            plan,
+            bodies: bodies.into_iter().map(Some).collect(),
+            stats,
+        };
+        if tracing::enabled!(tracing::Level::TRACE)
+            || std::env::var_os("ANVIL_GRAPH_DUMP").is_some()
+        {
+            let desc = compiled.describe();
+            tracing::trace!(graph = ?desc, "render graph");
+            dump_once(&desc);
+        }
+        Ok(compiled)
+    }
+
+    /// Records the compiled frame into `cmd`: per live pass its barriers, label, rendering
+    /// scope and body; then the export barriers. `frame` is the token the commands were
+    /// begun with. Returns the counters including pool activity.
+    ///
+    /// # Errors
+    /// [`GraphError::Rhi`] from texture creation or a pass body.
+    pub fn execute<D: Device>(
+        &mut self,
+        compiled: CompiledGraph<'_, D>,
+        device: &D,
+        cmd: &mut D::Commands,
+        frame: &FrameToken,
+    ) -> Result<GraphStats, GraphError> {
+        let CompiledGraph {
+            decls,
+            plan,
+            mut bodies,
+            mut stats,
+        } = compiled;
+        let rhi_err = |pass: &str, source| GraphError::Rhi {
+            pass: pass.to_owned(),
+            source,
+        };
+        let mut slot_entry = Vec::with_capacity(plan.slots.len());
+        for s in &plan.slots {
+            let name = &decls.res[s.first_owner.0 as usize].name;
+            let (entry, created) = self
+                .pool
+                .acquire(s.desc, frame.frame, || {
+                    device.create_texture(&TextureDesc {
+                        label: Some(name),
+                        width: s.desc.width,
+                        height: s.desc.height,
+                        format: s.desc.format,
+                        usage: s.desc.usage,
+                    })
+                })
+                .map_err(|e| rhi_err(name, e))?;
+            stats.textures_created += u32::from(created);
+            slot_entry.push(entry);
+        }
+        let textures: Vec<TextureHandle> = decls
+            .res
+            .iter()
+            .enumerate()
+            .map(|(i, r)| match (&r.kind, plan.slot_of[i]) {
+                (plan::ResKind::Imported { texture, .. }, _) => *texture,
+                (_, Some(s)) => self.pool.entries[slot_entry[s]].texture,
+                _ => TextureHandle::NULL,
+            })
+            .collect();
+
+        let mut next_barrier = 0;
+        let mut emit = |cmd: &mut D::Commands, pool: &TransientPool, upto: usize| {
+            while let Some(b) = plan.barriers.get(next_barrier).filter(|b| b.before <= upto) {
+                let mut from = b.from;
+                // A pooled texture's first barrier starts from the state its last frame left.
+                if from == TextureState::Undefined
+                    && let Some(s) = plan.slot_of[b.tex.0 as usize]
+                    && plan.slots[s].first_owner == b.tex
+                {
+                    from = pool.entries[slot_entry[s]].state;
+                }
+                cmd.texture_barrier(textures[b.tex.0 as usize], from, b.to);
+                next_barrier += 1;
+            }
+        };
+        for (k, &pi) in plan.order.iter().enumerate() {
+            emit(cmd, &self.pool, k);
+            let pass = &decls.passes[pi];
+            tracing::trace!(pass = %pass.name, position = k, "graph pass");
+            cmd.begin_label(&pass.name, pass.label_color);
+            let extent = pass_extent(&decls, pass);
+            if let Some((width, height)) = extent {
+                let colors: Vec<ColorAttachment> = pass
+                    .colors
+                    .iter()
+                    .map(|(t, c)| ColorAttachment {
+                        texture: textures[t.0 as usize],
+                        load: c.load,
+                        store: c.store,
+                        clear: c.clear,
+                    })
+                    .collect();
+                cmd.begin_rendering(&RenderingDesc {
+                    color: &colors,
+                    depth: pass.depth.map(|(t, d)| DepthAttachment {
+                        texture: textures[t.0 as usize],
+                        load: d.load,
+                        store: d.store,
+                        clear: d.clear,
+                    }),
+                    width,
+                    height,
+                });
+                cmd.set_viewport(Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: width as f32,
+                    height: height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                });
+                cmd.set_scissor(Rect2D {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                });
+            }
+            if let Some(body) = bodies[pi].take() {
+                body(&mut PassContext {
+                    cmd,
+                    device,
+                    textures: &textures,
+                })
+                .map_err(|e| rhi_err(&pass.name, e))?;
+            }
+            if extent.is_some() {
+                cmd.end_rendering();
+            }
+            cmd.end_label();
+        }
+        emit(cmd, &self.pool, usize::MAX);
+
+        for (s, &e) in slot_entry.iter().enumerate() {
+            self.pool.entries[e].state = plan.slot_final[s];
+        }
+        for (i, r) in decls.res.iter().enumerate() {
+            if let plan::ResKind::Imported { texture, .. } = r.kind
+                && plan.lifetime[i].is_some()
+            {
+                self.states.insert(texture, plan.res_final[i]);
+            }
+        }
+        self.pool.evict(frame.frame, |t| device.destroy_texture(t));
+        stats.pool_size = self.pool.entries.len() as u32;
+        Ok(stats)
+    }
+
+    /// Destroys the pooled textures. Imported textures belong to the caller.
+    pub fn destroy<D: Device>(self, device: &D) {
+        for e in self.pool.entries {
+            device.destroy_texture(e.texture);
+        }
+    }
+}

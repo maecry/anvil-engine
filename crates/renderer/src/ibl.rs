@@ -4,11 +4,10 @@
 //! passes recorded into the frame's command buffer, and only re-run when the [`Environment`]
 //! changes.
 
-use std::time::Instant;
-
+use render_graph::{GraphBuilder, RenderGraph, TexId};
 use rhi::{
-    AddressMode, CommandEncoder, CompareOp, CullMode, DepthState, Device, Filter, Format,
-    PipelineHandle, RhiError, SamplerDesc, SamplerHandle, TextureDesc, TextureHandle, TextureUsage,
+    AddressMode, CompareOp, CullMode, DepthState, Device, Filter, Format, PipelineHandle, RhiError,
+    SamplerDesc, SamplerHandle, TextureDesc, TextureHandle, TextureState, TextureUsage,
 };
 
 use crate::Environment;
@@ -35,6 +34,23 @@ const PREFILTER_SIZES: [(u32, u32); PREFILTER_LEVELS] = [
     (32, 16),
 ];
 const LUT_SIZE: (u32, u32) = (256, 256);
+
+const PREFILTER_NAMES: [&str; PREFILTER_LEVELS] = [
+    "ibl.prefilter0",
+    "ibl.prefilter1",
+    "ibl.prefilter2",
+    "ibl.prefilter3",
+    "ibl.prefilter4",
+    "ibl.prefilter5",
+];
+
+/// The IBL textures imported into one frame's graph.
+pub(crate) struct IblIds {
+    pub sky: TexId,
+    pub irradiance: TexId,
+    pub lut: TexId,
+    pub prefilter: [TexId; PREFILTER_LEVELS],
+}
 
 struct EnvTex {
     handle: TextureHandle,
@@ -83,9 +99,8 @@ pub(crate) struct Ibl {
     prefilter_pipeline: PipelineHandle,
     lut_pipeline: PipelineHandle,
     pub skybox: PipelineHandle,
+    /// Environment of the last bake; `None` until the first bake.
     baked: Option<Environment>,
-    /// All textures are `ShaderRead` after the first bake.
-    initialized: bool,
 }
 
 fn vec4(v: foundation::math::Vec3) -> [u8; 16] {
@@ -97,7 +112,7 @@ fn vec4(v: foundation::math::Vec3) -> [u8; 16] {
 }
 
 impl Ibl {
-    pub fn new<D: Device>(device: &D) -> Result<Self, RhiError> {
+    pub fn new<D: Device>(device: &D, graph: &mut RenderGraph) -> Result<Self, RhiError> {
         let pipe = |label, frag, format| {
             make_pipeline(
                 device,
@@ -149,6 +164,9 @@ impl Ibl {
             address_w: AddressMode::ClampToEdge,
             compare: None,
         })?;
+        for t in [&sky, &irradiance, &lut].into_iter().chain(&prefilter) {
+            graph.track(t.handle, TextureState::Undefined);
+        }
         Ok(Self {
             sampler_index: device.sampler_index(sampler)?,
             sampler,
@@ -162,7 +180,6 @@ impl Ibl {
             lut_pipeline,
             skybox,
             baked: None,
-            initialized: false,
         })
     }
 
@@ -180,30 +197,46 @@ impl Ibl {
         }
     }
 
-    /// Records the bakes if `env` differs from the last baked one (everything, including the
-    /// BRDF LUT, on the first call). Each bake leaves its texture in `ShaderRead`.
+    /// Imports every IBL texture into the frame's graph (their states persist in the graph).
+    pub fn import<D: Device>(&self, b: &mut GraphBuilder<'_, D>) -> IblIds {
+        let mut imp = |name, t: &EnvTex| b.import(name, t.handle, t.extent, None);
+        IblIds {
+            sky: imp("ibl.sky", &self.sky),
+            irradiance: imp("ibl.irradiance", &self.irradiance),
+            lut: imp("ibl.brdf_lut", &self.lut),
+            prefilter: std::array::from_fn(|i| imp(PREFILTER_NAMES[i], &self.prefilter[i])),
+        }
+    }
+
+    /// True when `env` differs from the last baked one (or nothing was baked yet).
+    pub fn needs_bake(&self, env: &Environment) -> bool {
+        self.baked != Some(*env)
+    }
+
+    /// Adds the bake passes for `env` (everything, including the BRDF LUT, on the first call).
+    /// Call [`Ibl::mark_baked`] once the graph has been recorded.
     // shortcut: the BRDF LUT is baked on the first render, not in Renderer::new, because the RHI
     // can only record into a frame's encoder; move it if a one-shot upload encoder appears.
-    pub fn bake<C: CommandEncoder>(&mut self, cmd: &mut C, env: &Environment) {
-        if self.initialized && self.baked == Some(*env) {
-            return;
-        }
-        let t0 = Instant::now();
-        let init = self.initialized;
-        let one = |cmd: &mut C, pipeline, t: &EnvTex, push: &[u8]| {
+    pub fn add_bakes<D: Device>(
+        &self,
+        b: &mut GraphBuilder<'_, D>,
+        ids: &IblIds,
+        env: &Environment,
+    ) {
+        let one = |b: &mut GraphBuilder<'_, D>, name, pipeline, target, read, push: &[u8]| {
             bake_pass(
-                cmd,
-                &BakeInputs {
+                b,
+                BakeInputs {
+                    name,
                     pipeline,
-                    target: t.handle,
-                    extent: t.extent,
-                    initialized: init,
-                    push,
+                    target,
+                    read,
+                    push: push.to_vec(),
                 },
             );
         };
-        if !init {
-            one(cmd, self.lut_pipeline, &self.lut, &[]);
+        if self.baked.is_none() {
+            one(b, "bake.brdf_lut", self.lut_pipeline, ids.lut, None, &[]);
         }
         let mut push = Vec::with_capacity(80);
         for v in [
@@ -215,25 +248,42 @@ impl Ibl {
         ] {
             push.extend_from_slice(&vec4(v));
         }
-        one(cmd, self.sky_pipeline, &self.sky, &push);
+        one(b, "bake.sky", self.sky_pipeline, ids.sky, None, &push);
         let mut src = [0u8; 16];
         src[0..4].copy_from_slice(&self.sky.index.to_le_bytes());
         src[4..8].copy_from_slice(&self.sampler_index.to_le_bytes());
-        one(cmd, self.irradiance_pipeline, &self.irradiance, &src[..8]);
-        for (i, t) in self.prefilter.iter().enumerate() {
+        let name = "bake.irradiance";
+        one(
+            b,
+            name,
+            self.irradiance_pipeline,
+            ids.irradiance,
+            Some(ids.sky),
+            &src[..8],
+        );
+        for (i, &target) in ids.prefilter.iter().enumerate() {
             let roughness = i as f32 / (PREFILTER_LEVELS - 1) as f32;
             src[8..12].copy_from_slice(&roughness.to_le_bytes());
-            one(cmd, self.prefilter_pipeline, t, &src);
+            one(
+                b,
+                "bake.prefilter",
+                self.prefilter_pipeline,
+                target,
+                Some(ids.sky),
+                &src,
+            );
         }
-        self.initialized = true;
-        self.baked = Some(*env);
-        let record_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        // Re-bakes happen every frame while the sun animates; keep them out of info.
-        if init {
-            tracing::debug!(record_ms, "environment re-baked (command recording time)");
+    }
+
+    /// Records that the bakes added for `env` were executed.
+    pub fn mark_baked(&mut self, env: &Environment) {
+        if self.baked.is_none() {
+            tracing::info!("environment baked");
         } else {
-            tracing::info!(record_ms, "environment baked (command recording time)");
+            // Re-bakes happen every frame while the sun animates; keep them out of info.
+            tracing::debug!("environment re-baked");
         }
+        self.baked = Some(*env);
     }
 
     pub fn destroy<D: Device>(self, device: &D) {

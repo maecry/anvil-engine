@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Status | Accepted (ADR-0011) |
-| Milestone | M3 (forward, PBR, shadows, IBL: complete); M4 (graph, post); M4 (graph, post) |
+| Milestone | M3 (forward, PBR, shadows, IBL: complete); M4a (render graph port: complete); M4b-c (post, deferred, ...) |
 | Crates | renderer (M3: mesh, camera and material live inside it as modules) |
 | Traces to | MASTER-000 §4.1, §5.2 rules 4-5, §8.5, §9, §11 |
 | Last updated | 2026-11-02 |
@@ -26,7 +26,7 @@ Turn extracted scene data into GPU work: render world, visibility, mesh submissi
 
 | Crate | Introduced | Notes |
 |---|---|---|
-| renderer | M3 | depends on foundation (`foundation::math` = glam) and rhi; render-graph from M4 (M3 uses direct pass functions) |
+| renderer | M3 | depends on foundation (`foundation::math` = glam) and rhi; render-graph from M4a (passes are graph nodes) |
 
 M3 decision (ADR-0011): mesh, camera, material and the extraction types are modules of the single `renderer` crate (`mesh`, `scene`, `gpu`, `passes`, `renderer`), not separate crates. Split them when a second consumer appears.
 
@@ -86,18 +86,18 @@ impl Renderer {
 
 ## 9-12. Ownership, threading, errors, diagnostics
 
-- Ownership: renderer owns GPU resources (pipelines, HDR and depth targets, samplers, built-in 1x1 textures, per-frame rings, meshes, textures) through RHI handles and destroys them via the RHI; the app and scene hold only renderer-neutral ids (`MeshId`, `TextureId`, `MaterialId`, generational `foundation::Handle`s). No Vulkan objects are exposed (FR-RES-012).
+- Ownership: renderer owns GPU resources (pipelines, the shadow map and IBL textures, samplers, built-in 1x1 textures, per-frame rings, meshes, textures) through RHI handles and destroys them via the RHI; the app and scene hold only renderer-neutral ids (`MeshId`, `TextureId`, `MaterialId`, generational `foundation::Handle`s). No Vulkan objects are exposed (FR-RES-012).
 - Threading: extraction on the main thread; visibility/sorting parallelisable on workers (task, M5); recording single-threaded until M5. Prefer immutable extracted data (MASTER-000 §11).
-- Errors: M3 returns `RhiError` directly (`DeviceLost` passes through unchanged); a `RenderError` wrapper is deferred until the renderer has errors of its own.
-- Diagnostics: debug labels per pass (`forward`, `tonemap`), `tracing` `debug` on every mesh/texture/material create and destroy with its label, and `RendererStats { draws, triangles, lights, ring_bytes_used }` returned by `stats()` and logged once per second at `debug` (ADR-0011 §11). `ANVIL_SCREENSHOT` is implemented by the example, not the renderer.
+- Errors: construction and resource calls return `RhiError` (`DeviceLost` passes through unchanged); `Renderer::render` returns `RenderError { Rhi, Graph }` (M4a).
+- Diagnostics: debug labels per pass (`shadow`, `bake.*`, `forward`, `tonemap`, from the graph), `tracing` `debug` on every mesh/texture/material create and destroy with its label, and `RendererStats { draws, triangles, lights, ring_bytes_used, graph }` (`graph` = `render_graph::GraphStats` incl. compile time) returned by `stats()` and logged once per second at `debug` (ADR-0011 §11). `ANVIL_SCREENSHOT` is implemented by the example, not the renderer.
 
 ## 12a. Frame structure and GPU data (M3a, ADR-0011 §3-5)
 
-1. Shadow pass (M3b): depth-only, 2048x2048 `D32Sfloat`, from the first directional light with `cast_shadows`; always recorded (empty when no caster) so the barrier sequence is constant.
+1. Shadow pass (M3b): depth-only, 2048x2048 `D32Sfloat`, from the first directional light with `cast_shadows`; always added to the graph (empty when no caster).
 2. Forward opaque pass: HDR `Rgba16Float` color + reverse-Z `D32Sfloat` depth (clear 0, `GreaterOrEqual`, back-face culling, counter-clockwise front faces).
 3. Tonemap pass: fullscreen triangle, ACES fit and exposure, HDR to the swapchain (manual gamma only if the swapchain format is not sRGB).
 
-Each pass is a free function over an explicit inputs struct (`shadow_pass(cmd, &ShadowInputs)`, `forward_pass(cmd, &ForwardInputs)`, `tonemap_pass(cmd, &TonemapInputs)`), so M4 can turn them into graph nodes. Barriers are hand-written; HDR/depth start `Undefined` on the first frame and `ShaderRead`/`DepthAttachment` afterwards.
+M4a (ADR-0012): each pass is a function that adds a graph node from an inputs struct (`shadow_pass(&mut GraphBuilder, ShadowInputs)`, `forward_pass`, `tonemap_pass`, `bake_pass`); the closure only binds and draws, and the render graph owns barriers, `begin_rendering`, viewport and scissor. There are no hand-written barriers in the crate. The HDR target and depth are graph transients (pooled, recreated automatically on resize; `Renderer::resize` is gone); the shadow map and IBL textures are imported persistents whose states the graph remembers. The swapchain image is imported `Undefined` and exported in the state the caller passes to `Renderer::render(device, cmd, &FrameToken, scene, &SwapchainImage, final_state)`: `Present`, or `TransferSrc` when the app reads it back (the app then transitions it to `Present` itself after the copy). The steady-state frame is `shadow`, `forward`, `tonemap`; `bake.*` passes are added only on frames where the environment changed (all of them, including the BRDF LUT, on the first frame).
 
 Per frame the renderer fills one persistently mapped `Upload` ring per frame in flight (4 MiB each, bump allocated, reset when the slot is reused) with frame data (view, proj, view_proj, camera position, light count, sampler index, exposure), the instance array (model + normal matrix + material index), the light array and the dense material array. Shaders read them through buffer device addresses in the push constants (5 addresses = 40 of 128 bytes: frame, instances, lights, materials, vertices); `first_instance` of each indexed draw is the instance index. Meshes are GPU-only vertex (BDA) and index buffers.
 
@@ -113,7 +113,7 @@ Per frame the renderer fills one persistently mapped `Upload` ring per frame in 
 ### M3c: environment and IBL
 
 - `Environment` is an analytic sky (zenith/horizon/ground gradient plus sun glow and disk). `sun_direction` is the direction the light travels and should equal the shadow-casting directional light. The environment is baked only when it differs (`==`) from the last baked one; the first render bakes everything.
-- Bakes are fullscreen-triangle fragment passes (`bake_pass`, no compute), recorded into the frame's command buffer before the shadow pass: sky 512x256 `Rgba16Float` equirect; diffuse irradiance 64x32 (cosine convolution on a 48x16 hemisphere grid, stored as E/pi); six GGX-prefiltered equirects for roughness 0, 0.2 ... 1 (256x128, 128x64, 64x32, 64x32, 32x16, 32x16; 192 importance samples each, no mips or cubemaps); split-sum BRDF LUT 256x256 `Rg16Float` (256 samples). Every bake leaves its texture in `ShaderRead` (`Undefined` the first time, `ShaderRead` afterwards). Sample counts are small enough that recording is ~0.3 ms and the GPU work is far below 100 ms.
+- Bakes are fullscreen-triangle fragment passes (`bake_pass`, no compute), graph passes (`bake.brdf_lut`, `bake.sky`, `bake.irradiance`, `bake.prefilter` x6) added only when the environment changed, ordered before the shadow pass: sky 512x256 `Rgba16Float` equirect; diffuse irradiance 64x32 (cosine convolution on a 48x16 hemisphere grid, stored as E/pi); six GGX-prefiltered equirects for roughness 0, 0.2 ... 1 (256x128, 128x64, 64x32, 64x32, 32x16, 32x16; 192 importance samples each, no mips or cubemaps); split-sum BRDF LUT 256x256 `Rg16Float` (256 samples). The forward pass reads every IBL texture, so the graph leaves each in `ShaderRead` (`Undefined` the first time). Sample counts are small enough that recording is ~0.3 ms and the GPU work is far below 100 ms.
 - Equirect mapping: u = atan2(z, x)/2pi + 0.5 wraps (sampler `Repeat` in U, `ClampToEdge` in V), v = acos(y)/pi; sampling uses `textureLod(.., 0)` so the atan discontinuity cannot select a wrong mip, and screenshots at the seam direction show none.
 - Forward shading: diffuse = irradiance x albedo x (1-metallic); specular = lerp of the two nearest prefiltered levels (`level = roughness x 5`) x (F0 x LUT.x + LUT.y); both multiplied by occlusion and `Environment.intensity`. The hemisphere ambient placeholder is gone.
 - Skybox: drawn after the opaques in the forward rendering scope with a fullscreen triangle at reverse-Z depth 0, compare `GreaterOrEqual`, depth write off; the ray comes from camera right/up/forward and the half-fov tangents in the frame data.

@@ -278,24 +278,19 @@ impl PbrScene {
             None => None,
         };
         let mut cmd = g.device.begin_commands(&frame)?;
+        // The graph leaves the image in `TransferSrc` for a readback, otherwise in `Present`.
+        let final_state = if readback.is_some() {
+            TextureState::TransferSrc
+        } else {
+            TextureState::Present
+        };
         g.renderer
-            .render(&g.device, &mut cmd, frame.slot, &scene, &image)?;
+            .render(&g.device, &mut cmd, &frame, &scene, &image, final_state)?;
         if let Some(rb) = readback {
-            cmd.texture_barrier(
-                image.texture,
-                TextureState::ColorAttachment,
-                TextureState::TransferSrc,
-            );
             cmd.copy_texture_to_buffer(image.texture, rb, 0);
             cmd.texture_barrier(
                 image.texture,
                 TextureState::TransferSrc,
-                TextureState::Present,
-            );
-        } else {
-            cmd.texture_barrier(
-                image.texture,
-                TextureState::ColorAttachment,
                 TextureState::Present,
             );
         }

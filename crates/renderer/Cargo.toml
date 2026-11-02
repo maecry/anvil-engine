@@ -11,6 +11,8 @@ workspace = true
 [dependencies]
 foundation = { path = "../foundation" }
 rhi = { path = "../rhi" }
+render-graph = { path = "../render-graph" }
+thiserror.workspace = true
 tracing.workspace = true
 bytemuck.workspace = true
 
