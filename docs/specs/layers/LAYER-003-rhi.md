@@ -222,7 +222,7 @@ pub enum RhiError {
     #[error("no suitable GPU: {reason}")]                NoSuitableDevice { reason: String },
     #[error("unsupported: {what}")]                      Unsupported { what: String },
     #[error("surface lost")]                             SurfaceLost,          // fatal in M1: the app shuts down cleanly
-    #[error("stale or invalid handle ({kind})")]         StaleHandle { kind: &'static str },
+    #[error("stale or invalid {kind} handle (index {index}, generation {generation})")] StaleHandle { kind: &'static str, index: u32, generation: u32 },
     #[error("invalid descriptor: {0}")]                  InvalidDescriptor(String),
     #[error("backend failure in {op}: code {code}")]     Backend { op: &'static str, code: i32 },
 }
@@ -272,3 +272,8 @@ pub enum RhiError {
 ## 16. Related modules
 
 None dedicated; see MODULE-005 and MODULE-006 (LAYER-007) for the M2 resource API, and MODULE-004-command-manager (LAYER-004) for the encoder implementation.
+
+## Observability (ADR-0009)
+- `Device::diagnostics() -> DeviceDiagnostics` (plain data: `DeviceInfo`, frame / GPU-completed frame, `LiveObjects`, pending destroys, `SwapchainDiagnostics` per swapchain, `ValidationCounts`). Backends must keep it accurate; integration tests assert `validation.errors == 0`.
+- `RhiError::StaleHandle` carries `kind`, `index`, `generation`; `Backend` carries `op` and the raw code.
+- Backends trace every create/destroy at `debug` (handle + label), per-frame ops at `trace` inside a `frame` span, state changes at `info`.

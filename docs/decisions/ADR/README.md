@@ -12,3 +12,4 @@ Template: [0000-template.md](0000-template.md). Rules: Master Spec §13.3.
 | [0006](0006-generational-resource-handles.md) | Generational resource handles | Accepted | 2026-11-02 |
 | [0007](0007-gpu-memory-allocator.md) | GPU memory allocator | Accepted | 2026-11-02 |
 | [0008](0008-crate-naming.md) | Crate names without the `anvil-` prefix | Accepted | 2026-11-02 |
+| [0009](0009-ai-observability.md) | AI-first observability: structured logs, diagnostics API, fail-fast validation | Accepted | 2026-11-02 |
