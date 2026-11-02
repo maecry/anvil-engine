@@ -137,3 +137,15 @@ Unit tests: insert/get/remove; stale handle after remove; stale after slot reuse
 ## 16. Related modules
 
 None for M1. Pool/handle internals are small enough to live in this spec; a module spec is written only if they grow.
+
+## Observability (ADR-0009)
+
+`init_logging()` is configured by environment variables only; all are optional and read once at init.
+
+| Variable | Values | Effect |
+|---|---|---|
+| `ANVIL_LOG` | `tracing` filter directives, e.g. `info,vulkan::validation=trace` | Overrides the default filter (debug builds: engine crates at `debug`, else `info`). Unparsable: `CoreError::InvalidLogFilter`. |
+| `ANVIL_LOG_FORMAT` | `pretty` (default), `json` | `json` emits one JSON object per line with timestamp, level, target, fields, current span and span list. Other value: `CoreError::InvalidLogFormat`. |
+| `ANVIL_LOG_FILE` | file path | Create/truncate the file and log there instead of stderr, without ANSI colors. Failure: `CoreError::LogFile { path, reason }`. |
+
+Output always includes the target, so agents can grep on e.g. `vulkan::validation`. After a successful install, one `info!` records the effective `filter`, `format` and `destination`.
