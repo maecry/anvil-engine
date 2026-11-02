@@ -15,3 +15,4 @@ Template: [0000-template.md](0000-template.md). Rules: Master Spec §13.3.
 | [0009](0009-ai-observability.md) | AI-first observability: structured logs, diagnostics API, fail-fast validation | Accepted | 2026-11-02 |
 | [0010](0010-m2-binding-and-resources.md) | Bindless binding (descriptor indexing + BDA) and M2 resource decisions | Accepted | 2026-11-02 |
 | [0011](0011-m3-renderer-architecture.md) | M3 core renderer: math conventions, renderer/app boundary, fixed passes, IBL, RHI additions | Accepted | 2026-11-02 |
+| [0012](0012-m4-render-graph.md) | M4 render graph (state model, compile, transients, passes, diagnostics) and advanced-rendering techniques | Accepted | 2026-11-02 |
