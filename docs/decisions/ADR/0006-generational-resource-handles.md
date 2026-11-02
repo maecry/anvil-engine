@@ -31,7 +31,7 @@ Option 3.
 ## Disadvantages
 - Lookup cost per access (index + generation check).
 - Manual `destroy` calls: leaks are possible without RAII; needs leak diagnostics at shutdown.
-- Generation wraps after 2^32 reuses of a slot (acceptable; document behavior).
+- A slot whose generation reaches `u32::MAX` is retired and never reused (no wrap-around, so stale handles can never alias). Generation 0 is never issued, so `Handle::NULL` is always invalid (LAYER-001).
 
 ## Consequences
 - Pools need synchronization if resources are created from several threads (decided with the threading spec, §11).

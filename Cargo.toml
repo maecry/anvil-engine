@@ -14,3 +14,8 @@ missing_docs = "warn"
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "warn"
+
+[workspace.dependencies]
+tracing = "0.1.44"
+thiserror = "2.0.21"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "std"] }
