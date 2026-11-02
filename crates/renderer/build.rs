@@ -24,7 +24,7 @@ fn make_options<'a>() -> shaderc::CompileOptions<'a> {
 fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let compiler = shaderc::Compiler::new().expect("shaderc compiler");
-    use shaderc::ShaderKind::{Fragment, Vertex};
+    use shaderc::ShaderKind::{Compute, Fragment, Vertex};
     // (source file, output stem, kind, defines): `MASK` variants add the alpha test.
     let mask = Some("MASK");
     for (file, out_name, kind, define) in [
@@ -52,6 +52,9 @@ fn main() {
         ("skybox.frag", "skybox.frag", Fragment, None),
         ("tonemap.vert", "tonemap.vert", Vertex, None),
         ("tonemap.frag", "tonemap.frag", Fragment, None),
+        ("cull_camera.comp", "cull_camera.comp", Compute, None),
+        ("cull_shadow.comp", "cull_shadow.comp", Compute, None),
+        ("hiz.comp", "hiz.comp", Compute, None),
     ] {
         let path = format!("shaders/{file}");
         println!("cargo:rerun-if-changed={path}");
@@ -66,7 +69,7 @@ fn main() {
         fs::write(out.join(format!("{out_name}.spv")), spv.as_binary_u8()).expect("write spv");
     }
     println!("cargo:rerun-if-changed=shaders/common.glsl");
-    for f in ["ibl", "bindings", "surface", "lighting"] {
+    for f in ["ibl", "bindings", "surface", "lighting", "types", "cull"] {
         println!("cargo:rerun-if-changed=shaders/{f}.glsl");
     }
     println!("cargo:rerun-if-changed=build.rs");

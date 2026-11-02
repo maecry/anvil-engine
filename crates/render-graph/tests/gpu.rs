@@ -32,6 +32,9 @@ fn passes_barriers_and_pool_reuse_are_validation_clean() {
             height: 32,
             format: Format::Rgba8Unorm,
             usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::SAMPLED,
+            mip_levels: 1,
+            array_layers: 1,
+            cube: false,
         })
         .unwrap();
     graph.track(history, TextureState::Undefined);

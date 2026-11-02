@@ -35,8 +35,9 @@ impl Camera {
     }
 }
 
-/// One drawn instance of a mesh.
-#[derive(Clone, Copy, Debug)]
+/// One drawn instance of a mesh. Equality (all fields bitwise-equal floats) is how the renderer
+/// finds the instances that changed since the previous frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MeshInstance {
     /// Mesh to draw.
     pub mesh: MeshId,

@@ -70,6 +70,9 @@ fn env_tex<D: Device>(
         height: extent.1,
         format,
         usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::SAMPLED,
+        mip_levels: 1,
+        array_layers: 1,
+        cube: false,
     })?;
     Ok(EnvTex {
         handle,

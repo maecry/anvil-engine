@@ -18,6 +18,8 @@ fn main() {
         ("flat.vert", shaderc::ShaderKind::Vertex),
         ("flat.frag", shaderc::ShaderKind::Fragment),
         ("empty.frag", shaderc::ShaderKind::Fragment),
+        ("fill.comp", shaderc::ShaderKind::Compute),
+        ("storage.comp", shaderc::ShaderKind::Compute),
     ] {
         let path = format!("tests/shaders/{file}");
         println!("cargo:rerun-if-changed={path}");

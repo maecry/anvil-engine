@@ -7,23 +7,35 @@ use foundation::Handle;
 use foundation::Pool;
 use foundation::math::{Mat4, Vec3};
 use rayon::prelude::*;
-use render_graph::{GpuTimings, GraphBuilder, GraphError, GraphStats, RenderGraph, TransientDesc};
-use rhi::{
-    AddressMode, BlendFactor, BlendState, BufferDesc, BufferHandle, BufferUsage, CompareOp,
-    CullMode, DepthBias, DepthState, Device, Filter, Format, FrameToken, FrontFace,
-    GraphicsPipelineDesc, Memory, PipelineHandle, PrimitiveTopology, RhiError, SamplerDesc,
-    SamplerHandle, ShaderModuleDesc, ShaderModuleHandle, ShaderStageDesc, SwapchainImage,
-    TextureDesc, TextureHandle, TextureState, TextureUsage,
+use render_graph::{
+    BufId, GpuTimings, GraphBuilder, GraphError, GraphStats, Pass, RenderGraph, TexId,
+    TransientBufferDesc, TransientDesc,
 };
+use rhi::{
+    AddressMode, BlendFactor, BlendState, BufferDesc, BufferHandle, BufferState, BufferUsage,
+    CommandEncoder, CompareOp, ComputePipelineDesc, CullMode, DepthBias, DepthState, Device,
+    Filter, Format, FrameToken, FrontFace, GraphicsPipelineDesc, Memory, PipelineHandle,
+    PrimitiveTopology, RhiError, SamplerDesc, SamplerHandle, ShaderModuleDesc, ShaderModuleHandle,
+    ShaderStageDesc, SwapchainImage, TextureDesc, TextureHandle, TextureState, TextureUsage,
+};
+
+use crate::arena::{Arena, ArenaSlot};
 
 use crate::cluster::{CLUSTER_FAR, ClusterGrid, GRID, LightSphere, spot_bounds};
 use crate::cull::{Frustum, bounding_sphere};
-use crate::gpu::{GpuFrame, GpuLight, GpuMaterial};
+use crate::gpu::{
+    COUNTS_BYTES, CULL_VIEWS, GpuCullParams, GpuFrame, GpuInstance, GpuLight, GpuMaterial, GpuMesh,
+};
+use crate::gpu_cull::{
+    CullBuffers, CullLayout, CullPipelines, CullStats, Pyramid, camera_cull_pass, hiz_passes,
+    reset_pass, shadow_cull_pass, stats_pass,
+};
 use crate::ibl::Ibl;
+use crate::mesh::{MAX_LODS, generate_lods};
 use crate::passes::{
-    Draw, GbufferInputs, GeometryInputs, LightingInputs, Pipes, PrepassInputs, ShadedInputs,
-    ShadowInputs, SkyboxInputs, TonemapInputs, forward_pass, gbuffer_pass, lighting_pass, prepass,
-    shadow_pass, skybox_pass, tonemap_pass, transparent_pass,
+    ArenaRef, Draw, DrawSource, GbufferInputs, GeometryInputs, GpuDraws, LightingInputs, Pipes,
+    PrepassInputs, ShadedInputs, ShadowInputs, SkyboxInputs, TonemapInputs, forward_pass,
+    gbuffer_pass, lighting_pass, prepass, shadow_pass, skybox_pass, tonemap_pass, transparent_pass,
 };
 use crate::post::{
     BloomInputs, BloomTargets, DOWN_NAMES, TaaInputs, UP_NAMES, bloom_passes, jitter_pixels,
@@ -52,10 +64,31 @@ static SHADOW_VERT: &[u8] = spv!("shadow.vert");
 static SHADOW_FRAGS: [&[u8]; 2] = [spv!("shadow.frag"), spv!("shadow_mask.frag")];
 pub(crate) static TONEMAP_VERT: &[u8] = spv!("tonemap.vert");
 static TONEMAP_FRAG: &[u8] = spv!("tonemap.frag");
+static CULL_CAMERA_COMP: &[u8] = spv!("cull_camera.comp");
+static CULL_SHADOW_COMP: &[u8] = spv!("cull_shadow.comp");
+static HIZ_COMP: &[u8] = spv!("hiz.comp");
 
-/// Size of each per-frame-in-flight upload ring.
-// shortcut: fixed 16 MiB ring (208 B per instance: about 75 000 instances), render fails when a scene overflows it; GPU-driven rendering (M5b) replaces the per-frame instance upload.
+/// Size of each per-frame-in-flight upload ring: frame data, lights, materials, cluster lists,
+/// culling parameters and the changed instances of the frame.
+// shortcut: fixed 16 MiB ring, render fails when a frame's uploads overflow it (frame data is small; changed instances above 70 000 per frame go through `Device::upload_buffer` instead).
 const RING_BYTES: u64 = 16 << 20;
+/// Mesh records the GPU mesh table holds. shortcut: fixed size (320 KiB), `create_mesh` fails
+/// beyond it; grow like the arena when a scene needs more meshes.
+const MESH_TABLE_CAPACITY: u32 = 4096;
+/// Instance buffer capacity at creation; it doubles when the scene outgrows it.
+const INITIAL_INSTANCES: u32 = 4096;
+/// A changed-instance run is merged with the next one when at most this many unchanged
+/// instances separate them (one copy instead of two).
+const RUN_GAP: u32 = 4;
+/// Culling views of the camera passes (see `cull.glsl`): phase 1, phase 2, or both.
+const PHASE1_VIEWS: &[usize] = &[0];
+const PHASE2_VIEWS: &[usize] = &[1];
+const CAMERA_VIEWS: &[usize] = &[0, 1];
+/// Culling view of each shadow map: 4 cascades, then 4 spot lights.
+const SHADOW_VIEWS: [&[usize]; CULL_VIEWS - 2] = [&[2], &[3], &[4], &[5], &[6], &[7], &[8], &[9]];
+/// Default LOD error threshold: a level is used while its projected geometric error stays under
+/// this many pixels. `ANVIL_LOD=0` disables LODs, `ANVIL_LOD=<px>` overrides.
+const DEFAULT_LOD_PIXELS: f32 = 0.5;
 /// Resolution of each directional cascade (ADR-0012 §11).
 const SHADOW_SIZE: u32 = 2048;
 /// Resolution of each spot shadow map; mirrored by `SPOT_SHADOW_SIZE` in `lighting.glsl`.
@@ -79,13 +112,11 @@ const SPOT_NAMES: [&str; MAX_SPOT_SHADOWS] = [
 pub(crate) const HDR_FORMAT: Format = Format::Rgba16Float;
 const DEPTH_FORMAT: Format = Format::D32Sfloat;
 
-/// A GPU mesh (vertex buffer read through BDA, index buffer) with its object-space bounding
-/// sphere. Handle: [`MeshId`].
+/// A mesh in the shared arena (vertices and indices of all its levels of detail) with its
+/// object-space bounding sphere and GPU record. Handle: [`MeshId`].
 pub struct Mesh {
-    vertices: BufferHandle,
-    indices: BufferHandle,
-    vertex_address: u64,
-    index_count: u32,
+    slot: ArenaSlot,
+    record: GpuMesh,
     center: Vec3,
     radius: f32,
 }
@@ -137,6 +168,24 @@ pub enum DebugView {
     Cascades,
     /// The screen-space ambient occlusion factor (white when SSAO is off).
     Ssao,
+    /// Level of detail of each instance tinted: 0 green, 1 yellow, 2 orange, 3 red (GPU culling).
+    Lod = 4,
+    /// Instances that occlusion culling phase 2 drew this frame tinted magenta (GPU culling).
+    Occlusion,
+}
+
+impl DebugView {
+    /// Parses the `ANVIL_DEBUG_VIEW` names: `clusters`, `cascades`, `ssao`, `lod`, `occlusion`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "clusters" => Self::Clusters,
+            "cascades" => Self::Cascades,
+            "ssao" => Self::Ssao,
+            "lod" => Self::Lod,
+            "occlusion" => Self::Occlusion,
+            _ => return None,
+        })
+    }
 }
 
 /// Post-processing switches (ADR-0012 §11); a disabled effect adds no graph passes.
@@ -283,9 +332,10 @@ impl Drop for StageGuard<'_> {
 /// Per-frame counters (ADR-0011 §11), logged once per second at `debug`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RendererStats {
-    /// Draw calls issued.
+    /// Draws of the camera view: with GPU culling the indirect commands of both phases (read
+    /// back, `frames_in_flight` old) plus the blended draws; otherwise the CPU draws.
     pub draws: u32,
-    /// Triangles submitted.
+    /// Triangles of the camera view after LOD selection (same delay and composition as `draws`).
     pub triangles: u64,
     /// Lights uploaded.
     pub lights: u32,
@@ -293,10 +343,19 @@ pub struct RendererStats {
     pub ring_bytes_used: u64,
     /// Render graph counters, including compile time.
     pub graph: GraphStats,
-    /// Instances rejected by the camera frustum test.
+    /// Instances rejected by the camera frustum test (read back with GPU culling).
     pub culled: u32,
-    /// Draws recorded into all shadow maps.
+    /// Draws recorded into all shadow maps (read back with GPU culling).
     pub shadow_draws: u32,
+    /// The frame used GPU-driven culling, LOD and indirect draws (`ANVIL_GPU_CULLING`).
+    pub gpu_culling: bool,
+    /// Counters of the GPU culling passes of an earlier frame (see [`CullStats::frame`]); zero
+    /// without GPU culling. `visible`, `frustum_culled` and `occlusion_culled` live here.
+    pub cull: CullStats,
+    /// Instances re-uploaded to the persistent instance buffer this frame.
+    pub instances_uploaded: u32,
+    /// Instances in the scene (slots of the instance buffer).
+    pub instances: u32,
     /// CPU time of each preparation stage.
     pub stages: StageTimes,
     /// Per-pass GPU times of an earlier frame (`frames_in_flight` old, see
@@ -354,6 +413,19 @@ pub struct Renderer {
     white_linear: TextureId,
     flat_normal: TextureId,
     default_material: MaterialId,
+    arena: Arena,
+    /// GPU table of mesh records, indexed by mesh handle index.
+    mesh_table: BufferHandle,
+    mesh_table_address: u64,
+    /// The persistent GPU scene: per-slot instance data and last frame's visible flags.
+    scene: SceneBuffers,
+    cull_pipes: CullPipelines,
+    pyramid: Option<Pyramid>,
+    /// Per frame slot: counters readback buffer, and the frame whose counters it holds.
+    stats_readback: Vec<(BufferHandle, Option<u64>)>,
+    cull_stats: CullStats,
+    gpu_culling: bool,
+    lod_pixels: f32,
     meshes: Pool<Mesh>,
     textures: Pool<Texture>,
     materials: Pool<Material>,
@@ -362,9 +434,83 @@ pub struct Renderer {
     stats: RendererStats,
     /// Latest per-pass GPU timings read back.
     gpu: GpuTimings,
-    /// Reused instance packing buffers.
-    prep: prep::Scratch,
+    /// The CPU side of the persistent scene: change detection and per-slot items.
+    cache: prep::SceneCache,
     last_log: Instant,
+}
+
+/// The persistent instance buffers (ADR-0013 §6).
+struct SceneBuffers {
+    instances: BufferHandle,
+    address: u64,
+    /// One u32 per instance: in the camera's visible set last frame.
+    visible: BufferHandle,
+    visible_address: u64,
+    capacity: u32,
+}
+
+/// Builds the [`GeometryInputs`] of the geometry passes of a frame.
+struct GeometryBuilder {
+    addresses: [u64; 4],
+    arena: ArenaRef,
+    instances: BufId,
+    /// GPU culling: command buffer, counts buffer and the command layout.
+    gpu: Option<(BufId, BufId, CullLayout)>,
+}
+
+impl GeometryBuilder {
+    /// CPU-recorded draws.
+    fn cpu<'a>(&self, pipes: Pipes, draws: &'a [Draw]) -> GeometryInputs<'a> {
+        GeometryInputs {
+            pipes,
+            addresses: self.addresses,
+            arena: self.arena,
+            instances: self.instances,
+            source: DrawSource::Cpu(draws),
+        }
+    }
+
+    /// The GPU commands of the culling `views` when GPU culling is on, else the CPU `draws`.
+    fn pick<'a>(
+        &self,
+        pipes: Pipes,
+        draws: &'a [Draw],
+        views: &'static [usize],
+    ) -> GeometryInputs<'a> {
+        match self.gpu {
+            Some((cmds, counts, layout)) => GeometryInputs {
+                source: DrawSource::Gpu(GpuDraws {
+                    cmds,
+                    counts,
+                    layout,
+                    views,
+                }),
+                ..self.cpu(pipes, draws)
+            },
+            None => self.cpu(pipes, draws),
+        }
+    }
+}
+
+/// One copy of changed instances from the frame's ring into the instance buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UploadRun {
+    ring_offset: u64,
+    dst_offset: u64,
+    size: u64,
+}
+
+/// Merges ascending `slots` into runs `(first, end)` (end exclusive), joining runs that are at
+/// most `gap` slots apart.
+fn merge_runs(slots: &[u32], gap: u32) -> Vec<(u32, u32)> {
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for &s in slots {
+        match runs.last_mut() {
+            Some(r) if s <= r.1 + gap => r.1 = s + 1,
+            _ => runs.push((s, s + 1)),
+        }
+    }
+    runs
 }
 
 /// A persistent depth texture rendered by a shadow pass and sampled by the shaders.
@@ -471,6 +617,9 @@ fn shadow_map<D: Device>(d: &D, label: &str, size: u32) -> Result<ShadowMap, Rhi
         height: size,
         format: DEPTH_FORMAT,
         usage: TextureUsage::DEPTH_ATTACHMENT | TextureUsage::SAMPLED,
+        mip_levels: 1,
+        array_layers: 1,
+        cube: false,
     })?;
     Ok(ShadowMap {
         texture,
@@ -478,23 +627,53 @@ fn shadow_map<D: Device>(d: &D, label: &str, size: u32) -> Result<ShadowMap, Rhi
     })
 }
 
-fn gpu_only_buffer<D: Device>(
-    d: &D,
-    label: &str,
-    usage: BufferUsage,
-    data: &[u8],
-) -> Result<BufferHandle, RhiError> {
-    let b = d.create_buffer(&BufferDesc {
+fn make_compute<D: Device>(d: &D, label: &str, spirv: &[u8]) -> Result<PipelineHandle, RhiError> {
+    let module = d.create_shader_module(&ShaderModuleDesc {
+        spirv: &spirv_words(spirv),
         label: Some(label),
-        size: data.len() as u64,
-        usage: usage | BufferUsage::TRANSFER_DST,
+    })?;
+    let pipeline = d.create_compute_pipeline(&ComputePipelineDesc {
+        label: Some(label),
+        shader: ShaderStageDesc {
+            module,
+            entry: "main",
+        },
+    });
+    d.destroy_shader_module(module);
+    pipeline
+}
+
+/// Creates the instance and visible-flag buffers for `capacity` instances. The visible flags
+/// start zeroed (nothing was visible last frame).
+fn new_scene_buffers<D: Device>(device: &D, capacity: u32) -> Result<SceneBuffers, RhiError> {
+    let usage = BufferUsage::STORAGE | BufferUsage::TRANSFER_DST;
+    let instances = device.create_buffer(&BufferDesc {
+        label: Some("scene.instances"),
+        size: u64::from(capacity) * size_of::<GpuInstance>() as u64,
+        usage,
         memory: Memory::GpuOnly,
     })?;
-    if let Err(e) = d.upload_buffer(b, 0, data) {
-        d.destroy_buffer(b);
-        return Err(e);
-    }
-    Ok(b)
+    let visible_bytes = u64::from(capacity) * 4;
+    let visible = match device.create_buffer(&BufferDesc {
+        label: Some("scene.visible"),
+        size: visible_bytes,
+        usage,
+        memory: Memory::GpuOnly,
+    }) {
+        Ok(b) => b,
+        Err(e) => {
+            device.destroy_buffer(instances);
+            return Err(e);
+        }
+    };
+    device.upload_buffer(visible, 0, &vec![0u8; visible_bytes as usize])?;
+    Ok(SceneBuffers {
+        instances,
+        address: device.buffer_address(instances)?,
+        visible,
+        visible_address: device.buffer_address(visible)?,
+        capacity,
+    })
 }
 
 impl Renderer {
@@ -669,10 +848,32 @@ impl Renderer {
             let b = device.create_buffer(&BufferDesc {
                 label: Some(&format!("renderer.ring{i}")),
                 size: RING_BYTES,
-                usage: BufferUsage::STORAGE,
+                usage: BufferUsage::STORAGE | BufferUsage::TRANSFER_SRC,
                 memory: Memory::Upload,
             })?;
             rings.push((b, device.buffer_address(b)?));
+        }
+        let arena = Arena::new(device)?;
+        let mesh_table = device.create_buffer(&BufferDesc {
+            label: Some("renderer.mesh_table"),
+            size: u64::from(MESH_TABLE_CAPACITY) * size_of::<GpuMesh>() as u64,
+            usage: BufferUsage::STORAGE | BufferUsage::TRANSFER_DST,
+            memory: Memory::GpuOnly,
+        })?;
+        let cull_pipes = CullPipelines {
+            camera: make_compute(device, "renderer.cull_camera", CULL_CAMERA_COMP)?,
+            shadow: make_compute(device, "renderer.cull_shadow", CULL_SHADOW_COMP)?,
+            hiz: make_compute(device, "renderer.hiz", HIZ_COMP)?,
+        };
+        let mut stats_readback = Vec::new();
+        for i in 0..frames {
+            let b = device.create_buffer(&BufferDesc {
+                label: Some(&format!("renderer.cull_stats{i}")),
+                size: COUNTS_BYTES,
+                usage: BufferUsage::TRANSFER_DST,
+                memory: Memory::Readback,
+            })?;
+            stats_readback.push((b, None));
         }
         let mut r = Self {
             forward,
@@ -710,6 +911,19 @@ impl Renderer {
             white_linear: TextureId::NULL,
             flat_normal: TextureId::NULL,
             default_material: MaterialId::NULL,
+            arena,
+            mesh_table,
+            mesh_table_address: device.buffer_address(mesh_table)?,
+            scene: new_scene_buffers(device, INITIAL_INSTANCES)?,
+            cull_pipes,
+            pyramid: None,
+            stats_readback,
+            cull_stats: CullStats::default(),
+            gpu_culling: std::env::var("ANVIL_GPU_CULLING").as_deref() != Ok("0"),
+            lod_pixels: std::env::var("ANVIL_LOD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_LOD_PIXELS),
             meshes: Pool::new(),
             textures: Pool::new(),
             materials: Pool::new(),
@@ -717,7 +931,7 @@ impl Renderer {
             ring_used: 0,
             stats: RendererStats::default(),
             gpu: GpuTimings::default(),
-            prep: prep::Scratch::default(),
+            cache: prep::SceneCache::default(),
             last_log: Instant::now(),
         };
         r.white_srgb = r.create_texture(device, "default.white_srgb", &[255; 4], 1, 1, true)?;
@@ -739,10 +953,12 @@ impl Renderer {
         Ok(r)
     }
 
-    /// Uploads a mesh into GPU-only buffers.
+    /// Uploads a mesh into the shared mesh arena. `data.lods` are used when present, otherwise
+    /// up to three coarser levels are generated with `meshopt` ([`generate_lods`]).
     ///
     /// # Errors
-    /// [`RhiError::InvalidDescriptor`] for an empty mesh, or any buffer creation error.
+    /// [`RhiError::InvalidDescriptor`] for an empty mesh, bad LOD indices, a full arena or mesh
+    /// table, or any upload error.
     pub fn create_mesh<D: Device>(
         &mut self,
         device: &D,
@@ -754,42 +970,101 @@ impl Renderer {
                 "mesh {label} is empty"
             )));
         }
-        let vertices = gpu_only_buffer(
-            device,
-            &format!("{label}.vertices"),
-            BufferUsage::STORAGE,
-            bytemuck::cast_slice(&data.vertices),
-        )?;
-        let indices = gpu_only_buffer(
-            device,
-            &format!("{label}.indices"),
-            BufferUsage::INDEX,
-            bytemuck::cast_slice(&data.indices),
-        )?;
+        let generated;
+        let lods = if data.lods.is_empty() {
+            generated = generate_lods(data);
+            &generated
+        } else {
+            &data.lods
+        };
+        let lods = &lods[..lods.len().min(MAX_LODS - 1)];
+        let vertex_count = data.vertices.len() as u32;
+        let levels = std::iter::once(&data.indices).chain(lods.iter().map(|l| &l.indices));
+        let mut record = GpuMesh {
+            lod_count: 1 + lods.len() as u32,
+            ..GpuMesh::default()
+        };
+        let mut all_indices: Vec<u32> = Vec::new();
+        for (l, indices) in levels.enumerate() {
+            if indices.is_empty()
+                || indices.len() % 3 != 0
+                || indices.iter().any(|&i| i >= vertex_count)
+            {
+                return Err(RhiError::InvalidDescriptor(format!(
+                    "mesh {label}: level {l} has no triangles or an index out of range"
+                )));
+            }
+            record.first_index[l] = all_indices.len() as u32;
+            record.index_count[l] = indices.len() as u32;
+            all_indices.extend_from_slice(indices);
+        }
+        for (l, lod) in lods.iter().enumerate() {
+            record.lod_error[l + 1] = lod.error;
+        }
         let (center, radius) = bounding_sphere(data.vertices.iter().map(|v| Vec3::from(v.pos)));
+        record.sphere = [center.x, center.y, center.z, radius];
+        let slot = self.arena.alloc(vertex_count, all_indices.len() as u32)?;
+        record.vertex_offset = slot.vertex as i32;
+        for r in &mut record.first_index[..record.lod_count as usize] {
+            *r += slot.index;
+        }
         let id = self.meshes.insert(Mesh {
-            vertices,
-            indices,
-            vertex_address: device.buffer_address(vertices)?,
-            index_count: data.indices.len() as u32,
+            slot,
+            record,
             center,
             radius,
         });
+        let uploaded = if id.index() >= MESH_TABLE_CAPACITY {
+            Err(RhiError::InvalidDescriptor(format!(
+                "mesh table full ({MESH_TABLE_CAPACITY} meshes)"
+            )))
+        } else {
+            let vertex_bytes = size_of::<crate::Vertex>() as u64;
+            device
+                .upload_buffer(
+                    self.arena.vertices,
+                    u64::from(slot.vertex) * vertex_bytes,
+                    bytemuck::cast_slice(&data.vertices),
+                )
+                .and_then(|()| {
+                    device.upload_buffer(
+                        self.arena.indices,
+                        u64::from(slot.index) * 4,
+                        bytemuck::cast_slice(&all_indices),
+                    )
+                })
+                .and_then(|()| {
+                    device.upload_buffer(
+                        self.mesh_table,
+                        u64::from(id.index()) * size_of::<GpuMesh>() as u64,
+                        bytemuck::bytes_of(&record),
+                    )
+                })
+        };
+        if let Err(e) = uploaded {
+            self.meshes.remove(id);
+            self.arena.free(slot);
+            return Err(e);
+        }
         tracing::debug!(
             label,
             ?id,
             vertices = data.vertices.len(),
             indices = data.indices.len(),
+            lods = record.lod_count,
+            arena_vertex = slot.vertex,
+            arena_index = slot.index,
             "mesh created"
         );
         Ok(id)
     }
 
-    /// Destroys a mesh (deferred by the device).
-    pub fn destroy_mesh<D: Device>(&mut self, device: &D, id: MeshId) {
+    /// Destroys a mesh: its arena range is reused. Instances that still reference it are skipped
+    /// (with a warning) from the next frame on.
+    pub fn destroy_mesh<D: Device>(&mut self, _device: &D, id: MeshId) {
         if let Some(m) = self.meshes.remove(id) {
-            device.destroy_buffer(m.vertices);
-            device.destroy_buffer(m.indices);
+            self.arena.free(m.slot);
+            self.cache.invalidate();
             tracing::debug!(?id, "mesh destroyed");
         }
     }
@@ -817,6 +1092,9 @@ impl Renderer {
                 Format::Rgba8Unorm
             },
             usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+            mip_levels: 1,
+            array_layers: 1,
+            cube: false,
         })?;
         if let Err(e) = device.upload_texture(texture, rgba8) {
             device.destroy_texture(texture);
@@ -873,6 +1151,7 @@ impl Renderer {
     /// Destroys a material record.
     pub fn destroy_material(&mut self, id: MaterialId) {
         if self.materials.remove(id).is_some() {
+            self.cache.invalidate();
             tracing::debug!(?id, "material destroyed");
         }
     }
@@ -907,6 +1186,24 @@ impl Renderer {
         self.debug_view
     }
 
+    /// Switches GPU-driven culling, LOD and indirect draws on or off (default on; the
+    /// `ANVIL_GPU_CULLING=0` environment variable sets the initial state). Off is the M4 CPU
+    /// path: per-frame frustum culling and one draw call per instance at level of detail 0.
+    pub fn set_gpu_culling(&mut self, on: bool) {
+        self.gpu_culling = on;
+    }
+
+    /// Whether GPU-driven culling is requested.
+    pub fn gpu_culling(&self) -> bool {
+        self.gpu_culling
+    }
+
+    /// Sets the LOD error threshold in pixels (`0` always renders level 0; default 0.5, the
+    /// `ANVIL_LOD` environment variable sets the initial value).
+    pub fn set_lod_pixels(&mut self, pixels: f32) {
+        self.lod_pixels = pixels.max(0.0);
+    }
+
     /// Counters of the last rendered frame.
     pub fn stats(&self) -> RendererStats {
         self.stats.clone()
@@ -919,7 +1216,18 @@ impl Renderer {
         slot: usize,
         data: &[u8],
     ) -> Result<u64, RhiError> {
-        let (buffer, base) = self.rings[slot];
+        let base = self.rings[slot].1;
+        Ok(base + self.ring_push_offset(device, slot, data)?)
+    }
+
+    /// [`Self::ring_push`] returning the offset into the ring buffer (for buffer copies).
+    fn ring_push_offset<D: Device>(
+        &mut self,
+        device: &D,
+        slot: usize,
+        data: &[u8],
+    ) -> Result<u64, RhiError> {
+        let buffer = self.rings[slot].0;
         let offset = self.ring_used.next_multiple_of(16);
         let end = offset + data.len() as u64;
         if end > RING_BYTES {
@@ -931,7 +1239,80 @@ impl Renderer {
             device.write_buffer(buffer, offset, data)?;
         }
         self.ring_used = end;
-        Ok(base + offset)
+        Ok(offset)
+    }
+
+    /// Brings the persistent instance buffer up to date with `self.cache`: grows it when the
+    /// scene outgrew it, then uploads the changed instances. Small changes become copy runs out
+    /// of the frame's ring (returned, recorded by the `scene.upload` pass); a fresh or oversized
+    /// update goes through [`Device::upload_buffer`] instead.
+    fn sync_instances<D: Device>(
+        &mut self,
+        device: &D,
+        slot: usize,
+    ) -> Result<Vec<UploadRun>, RhiError> {
+        let n = self.cache.len() as u32;
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let stride = size_of::<GpuInstance>() as u64;
+        let mut whole = false;
+        if n > self.scene.capacity {
+            let capacity = n.next_power_of_two();
+            let old = std::mem::replace(&mut self.scene, new_scene_buffers(device, capacity)?);
+            self.graph.forget_buffer(old.instances);
+            self.graph.forget_buffer(old.visible);
+            device.destroy_buffer(old.instances);
+            device.destroy_buffer(old.visible);
+            tracing::debug!(capacity, "instance buffer grown");
+            whole = true;
+        }
+        if self.cache.changed.is_empty() && !whole {
+            return Ok(Vec::new());
+        }
+        let runs = if whole {
+            vec![(0, n)]
+        } else {
+            merge_runs(&self.cache.changed, RUN_GAP)
+        };
+        let bytes: u64 = runs.iter().map(|r| u64::from(r.1 - r.0) * stride).sum();
+        // Leave the ring half free for the frame's other data.
+        if whole || bytes > (RING_BYTES - self.ring_used) / 2 {
+            let (first, end) = (runs[0].0, runs[runs.len() - 1].1);
+            device.upload_buffer(
+                self.scene.instances,
+                u64::from(first) * stride,
+                bytemuck::cast_slice(&self.cache.gpu[first as usize..end as usize]),
+            )?;
+            return Ok(Vec::new());
+        }
+        // The mirror is moved out so the ring can be borrowed mutably meanwhile.
+        let mirror = std::mem::take(&mut self.cache.gpu);
+        let out = runs
+            .iter()
+            .map(|&(first, end)| {
+                let data = bytemuck::cast_slice(&mirror[first as usize..end as usize]);
+                Ok(UploadRun {
+                    ring_offset: self.ring_push_offset(device, slot, data)?,
+                    dst_offset: u64::from(first) * stride,
+                    size: data.len() as u64,
+                })
+            })
+            .collect();
+        self.cache.gpu = mirror;
+        out
+    }
+
+    /// Makes sure the depth pyramid exists for a `w` x `h` target.
+    fn ensure_pyramid<D: Device>(&mut self, device: &D, w: u32, h: u32) -> Result<(), RhiError> {
+        if self.pyramid.as_ref().is_some_and(|p| p.source == (w, h)) {
+            return Ok(());
+        }
+        if let Some(old) = self.pyramid.take() {
+            old.destroy(device, &mut self.graph);
+        }
+        self.pyramid = Some(Pyramid::new(device, &mut self.graph, w, h)?);
+        Ok(())
     }
 
     /// Builds and records the frame as a render graph: environment bakes (when the environment
@@ -956,6 +1337,12 @@ impl Renderer {
         let mut stages = StageTimes::default();
         if let Some(t) = self.graph.gpu_timings(device, frame.slot)? {
             self.gpu = t;
+        }
+        // GPU culling counters of the frame that used this slot before (retired by begin_frame).
+        if let (rb, Some(counted)) = self.stats_readback[slot] {
+            let mut bytes = vec![0u8; COUNTS_BYTES as usize];
+            device.read_buffer(rb, 0, &mut bytes)?;
+            self.cull_stats = CullStats::parse(counted, &bytes);
         }
 
         let (w, h) = (target.extent.0.max(1), target.extent.1.max(1));
@@ -995,6 +1382,9 @@ impl Renderer {
                     height: h,
                     format: HDR_FORMAT,
                     usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::SAMPLED,
+                    mip_levels: 1,
+                    array_layers: 1,
+                    cube: false,
                 })?;
                 self.graph.track(*t, TextureState::Undefined);
             }
@@ -1119,22 +1509,22 @@ impl Renderer {
             .expect("grid built above");
         drop(cluster_guard);
 
-        // Visible instances per view: camera (opaque sorted front to back, grouped by pipeline
-        // variant; blended sorted back to front) and each shadow map. Packing, culling and
-        // sorting run on the worker pool (ADR-0013 §3).
+        // The persistent scene: find the instances that changed since last frame and re-pack
+        // only those (ADR-0013 §6). Packing runs on the worker pool (ADR-0013 §3).
         let pack_guard = StageGuard::new(tracing::debug_span!("renderer.pack"), &mut stages.pack);
-        let mut scratch = std::mem::take(&mut self.prep);
-        prep::pack(&mut scratch, &scene.meshes, &view, |inst| {
-            let Some(mesh) = self.meshes.get(inst.mesh) else {
+        let (meshes, materials, default_material) =
+            (&self.meshes, &self.materials, self.default_material);
+        self.cache.update(&scene.meshes, |inst| {
+            let Some(mesh) = meshes.get(inst.mesh) else {
                 tracing::warn!(mesh = ?inst.mesh, "scene references a destroyed mesh, skipped");
                 return None;
             };
-            let material_id = if self.materials.get(inst.material).is_some() {
+            let material_id = if materials.get(inst.material).is_some() {
                 inst.material
             } else {
-                self.default_material
+                default_material
             };
-            let material = self.materials.get(material_id)?;
+            let material = materials.get(material_id)?;
             let double = usize::from(material.double_sided);
             let (variant, blend) = match material.alpha_mode {
                 AlphaMode::Opaque => (double, false),
@@ -1142,9 +1532,10 @@ impl Renderer {
                 AlphaMode::Blend => (double, true),
             };
             Some(Resolved {
-                vertex_address: mesh.vertex_address,
-                index_buffer: mesh.indices,
-                index_count: mesh.index_count,
+                mesh: inst.mesh.index(),
+                first_index: mesh.record.first_index[0],
+                index_count: mesh.record.index_count[0],
+                vertex_offset: mesh.record.vertex_offset,
                 center: mesh.center,
                 radius: mesh.radius,
                 material: material_id.index(),
@@ -1152,17 +1543,34 @@ impl Renderer {
                 blend,
             })
         });
+        let instances_uploaded = self.cache.changed.len() as u32;
         drop(pack_guard);
-        let (items, instances) = (&scratch.items, &scratch.instances);
+        let upload_guard =
+            StageGuard::new(tracing::debug_span!("renderer.upload"), &mut stages.upload);
+        let upload_runs = self.sync_instances(device, slot)?;
+        drop(upload_guard);
+
+        // GPU-driven culling needs at least one opaque instance; otherwise the (empty) CPU path.
+        let gpu_cull = self.gpu_culling && self.cache.variant_counts.iter().sum::<u32>() > 0;
+        let cache = &self.cache;
         let cull_guard = StageGuard::new(tracing::debug_span!("renderer.cull"), &mut stages.cull);
         let cam_frustum = Frustum::from_view_proj(view_proj_unjit);
         let (mut opaque, mut blended) = (Vec::new(), Vec::new());
-        let visible = prep::cull(items, &cam_frustum);
-        let culled = (items.len() - visible.len()) as u32;
+        let mut culled = 0u32;
         let mut triangles = 0u64;
-        for it in visible {
-            triangles += u64::from(it.draw.index_count / 3);
-            if it.blend { &mut blended } else { &mut opaque }.push(it.draw);
+        if gpu_cull {
+            // Only blended objects (they need sorting) are culled on the CPU.
+            for it in prep::cull_list(&cache.blended, &cam_frustum, &view) {
+                triangles += u64::from(it.draw.index_count / 3);
+                blended.push(it.draw);
+            }
+        } else {
+            let visible = prep::cull(&cache.items, &cam_frustum, &view);
+            culled = (cache.items.iter().flatten().count() - visible.len()) as u32;
+            for it in visible {
+                triangles += u64::from(it.draw.index_count / 3);
+                if it.blend { &mut blended } else { &mut opaque }.push(it.draw);
+            }
         }
         drop(cull_guard);
         let sort_guard = StageGuard::new(tracing::debug_span!("renderer.sort"), &mut stages.sort);
@@ -1172,9 +1580,14 @@ impl Renderer {
             tracing::debug_span!("renderer.shadow_lists"),
             &mut stages.shadow_lists,
         );
-        // One list per view, the views in parallel once there are enough instances.
+        // One list per view, the views in parallel once there are enough instances. With GPU
+        // culling the shadow views are culled by `cull_shadow.comp` instead.
+        let items = &cache.items;
         let view_lists =
             |n: usize, used: &(dyn Fn(usize) -> Option<Mat4> + Sync)| -> Vec<Vec<Draw>> {
+                if gpu_cull {
+                    return vec![Vec::new(); n];
+                }
                 let one = |i| {
                     used(i).map_or_else(Vec::new, |vp| {
                         prep::shadow_draws(items, &Frustum::from_view_proj(vp))
@@ -1208,7 +1621,7 @@ impl Renderer {
 
         let upload_guard =
             StageGuard::new(tracing::debug_span!("renderer.upload"), &mut stages.upload);
-        let instances_addr = self.ring_push(device, slot, bytemuck::cast_slice(instances))?;
+        let instances_addr = self.scene.address;
         let lights_addr = self.ring_push(device, slot, bytemuck::cast_slice(&lights))?;
         let materials_addr = self.ring_push(device, slot, bytemuck::cast_slice(&materials))?;
         let ranges_addr = self.ring_push(device, slot, bytemuck::cast_slice(&assignment.ranges))?;
@@ -1263,6 +1676,54 @@ impl Renderer {
             lights_addr,
             materials_addr,
         ];
+        // GPU culling: parameters of the compute passes (planes of the camera and every shadow
+        // view, the unjittered camera, LOD threshold, depth pyramid) and the command layout.
+        let layout = CullLayout::new(self.cache.variant_counts);
+        let cull_params = if gpu_cull {
+            self.ensure_pyramid(device, w, h)?;
+            let pyr = self.pyramid.as_ref().expect("pyramid ensured above");
+            let mut planes = [[[0.0f32; 4]; 6]; 9];
+            let mut view_mask = 0u32;
+            planes[0] = cam_frustum.planes();
+            if cascade_dir.is_some() {
+                for c in 0..CASCADES {
+                    planes[1 + c] = Frustum::from_view_proj(cascade_vp[c]).planes();
+                    view_mask |= 1 << c;
+                }
+            }
+            for i in 0..spot_used {
+                planes[1 + CASCADES + i] = Frustum::from_view_proj(spot_vp[i]).planes();
+                view_mask |= 1 << (CASCADES + i);
+            }
+            let params = GpuCullParams {
+                planes,
+                view,
+                proj: [
+                    proj_unjit.x_axis.x,
+                    proj_unjit.y_axis.y,
+                    scene.camera.near,
+                    self.lod_pixels,
+                ],
+                cam: [cam.x, cam.y, cam.z, h as f32 / (2.0 * tan_y)],
+                pyramid: [
+                    pyr.slot,
+                    pyr.sizes[0].0,
+                    pyr.sizes[0].1,
+                    pyr.sizes.len() as u32,
+                ],
+                instances: split(self.scene.address),
+                meshes: split(self.mesh_table_address),
+                visible: split(self.scene.visible_address),
+                instance_count: self.cache.len() as u32,
+                view_mask,
+                pad: [0; 2],
+                region: layout.regions(),
+                pad2: [0; 2],
+            };
+            self.ring_push(device, slot, bytemuck::bytes_of(&params))?
+        } else {
+            0
+        };
         drop(upload_guard);
 
         let build_guard = StageGuard::new(
@@ -1314,11 +1775,81 @@ impl Renderer {
         if rebake {
             self.ibl.add_bakes(&mut b, &ids, &scene.environment);
         }
-        let geometry = |pipes, draws| GeometryInputs {
-            pipes,
+        // The persistent scene buffers, and (GPU culling) the indirect command lists.
+        let inst_id = b.import_buffer("scene.instances", self.scene.instances, None);
+        if !upload_runs.is_empty() {
+            let (ring, runs) = (self.rings[slot].0, upload_runs);
+            let dst = self.scene.instances;
+            b.pass(
+                Pass::new("scene.upload")
+                    .label_color([0.6, 0.6, 0.3, 1.0])
+                    .write_buffer(inst_id, BufferState::TransferDst),
+                move |ctx| {
+                    for r in &runs {
+                        ctx.cmd.copy_buffer_to_buffer(
+                            ring,
+                            r.ring_offset,
+                            dst,
+                            r.dst_offset,
+                            r.size,
+                        );
+                    }
+                    Ok(())
+                },
+            );
+        }
+        let gpu_ids = gpu_cull.then(|| {
+            let visible = b.import_buffer("scene.visible", self.scene.visible, None);
+            let cmds = b.transient_buffer(
+                "cull.cmds",
+                TransientBufferDesc {
+                    size: layout.buffer_bytes(),
+                    usage: BufferUsage::STORAGE | BufferUsage::INDIRECT,
+                },
+            );
+            let counts = b.transient_buffer(
+                "cull.counts",
+                TransientBufferDesc {
+                    size: COUNTS_BYTES,
+                    usage: BufferUsage::STORAGE
+                        | BufferUsage::INDIRECT
+                        | BufferUsage::TRANSFER_DST
+                        | BufferUsage::TRANSFER_SRC,
+                },
+            );
+            let pyr = self.pyramid.as_ref().expect("pyramid ensured above");
+            let mips: Vec<TexId> = pyr
+                .mips
+                .iter()
+                .zip(&pyr.sizes)
+                .enumerate()
+                .map(|(l, (&t, &size))| b.import(format!("hiz.mip{l}"), t, size, None))
+                .collect();
+            let c = CullBuffers {
+                instances: inst_id,
+                visible,
+                cmds,
+                counts,
+                params: cull_params,
+                instance_count: self.cache.len() as u32,
+            };
+            (c, mips)
+        });
+        if let Some((c, _)) = &gpu_ids {
+            reset_pass(&mut b, c.counts);
+            shadow_cull_pass(&mut b, self.cull_pipes.shadow, *c);
+            camera_cull_pass(&mut b, self.cull_pipes.camera, *c, 0, &[]);
+        }
+        let geo = GeometryBuilder {
             addresses,
-            draws,
+            arena: ArenaRef {
+                vertex_address: self.arena.vertex_address,
+                indices: self.arena.indices,
+            },
+            instances: inst_id,
+            gpu: gpu_ids.as_ref().map(|(c, _)| (c.cmds, c.counts, layout)),
         };
+        let geometry = |pipes, draws, views| geo.pick(pipes, draws, views);
         for c in 0..CASCADES {
             shadow_pass(
                 &mut b,
@@ -1326,7 +1857,7 @@ impl Renderer {
                     name: CASCADE_NAMES[c],
                     texture: cascade_ids[c],
                     view_index: c as u32,
-                    geometry: geometry(self.shadow_pipes, &cascade_draws[c]),
+                    geometry: geometry(self.shadow_pipes, &cascade_draws[c], SHADOW_VIEWS[c]),
                 },
             );
         }
@@ -1337,19 +1868,43 @@ impl Renderer {
                     name: SPOT_NAMES[i],
                     texture: spot_ids[i],
                     view_index: 4 + i as u32,
-                    geometry: geometry(self.shadow_pipes, &spot_draws[i]),
+                    geometry: geometry(
+                        self.shadow_pipes,
+                        &spot_draws[i],
+                        SHADOW_VIEWS[CASCADES + i],
+                    ),
                 },
             );
         }
+        // GPU culling: phase 1 draws last frame's visible set, the pyramid is built from that
+        // depth, phase 2 draws what the pyramid does not hide. The CPU path is one prepass.
         prepass(
             &mut b,
             PrepassInputs {
+                name: "prepass",
+                phase2: false,
                 depth,
                 normal,
                 velocity,
-                geometry: geometry(self.prepass, &opaque),
+                geometry: geometry(self.prepass, &opaque, PHASE1_VIEWS),
             },
         );
+        if let Some((c, mips)) = &gpu_ids {
+            let pyr = self.pyramid.as_ref().expect("pyramid ensured above");
+            hiz_passes(&mut b, self.cull_pipes.hiz, depth, (w, h), mips, &pyr.sizes);
+            camera_cull_pass(&mut b, self.cull_pipes.camera, *c, 1, mips);
+            prepass(
+                &mut b,
+                PrepassInputs {
+                    name: "prepass.p2",
+                    phase2: true,
+                    depth,
+                    normal,
+                    velocity,
+                    geometry: geometry(self.prepass, &opaque, PHASE2_VIEWS),
+                },
+            );
+        }
         // Half-resolution SSAO then a depth-aware blur/upsample to full resolution.
         let ssao = self.post.ssao.then(|| {
             let half = TransientDesc {
@@ -1388,7 +1943,7 @@ impl Renderer {
                     depth,
                     reads: reads.clone(),
                     ssao,
-                    geometry: geometry(self.forward, &opaque),
+                    geometry: geometry(self.forward, &opaque, CAMERA_VIEWS),
                 },
             ),
             RenderPath::Deferred => {
@@ -1402,7 +1957,7 @@ impl Renderer {
                     GbufferInputs {
                         targets: gbuffer,
                         depth,
-                        geometry: geometry(self.gbuffer, &opaque),
+                        geometry: geometry(self.gbuffer, &opaque, CAMERA_VIEWS),
                     },
                 );
                 lighting_pass(
@@ -1437,9 +1992,12 @@ impl Renderer {
                     depth,
                     reads,
                     ssao: None,
-                    geometry: geometry(self.transparent, &blended),
+                    geometry: geo.cpu(self.transparent, &blended),
                 },
             );
+        }
+        if let Some((c, _)) = &gpu_ids {
+            stats_pass(&mut b, c.counts, self.stats_readback[slot].0);
         }
         // TAA resolves the lit HDR image into one of the two imported history textures.
         let mut color = hdr;
@@ -1535,7 +2093,7 @@ impl Renderer {
         if rebake {
             self.ibl.mark_baked(&scene.environment);
         }
-        self.prep = scratch;
+        self.stats_readback[slot].1 = gpu_cull.then_some(frame.frame);
         self.prev_view_proj = view_proj_unjit;
         self.frame_index = self.frame_index.wrapping_add(1);
         if taa {
@@ -1543,14 +2101,25 @@ impl Renderer {
         }
         self.taa_valid = taa;
 
+        // With GPU culling the camera counters are the delayed readback (the CPU only knows the
+        // blended draws); the CPU path counts exactly.
+        let cs = if gpu_cull {
+            self.cull_stats
+        } else {
+            CullStats::default()
+        };
         self.stats = RendererStats {
-            draws: (opaque.len() + blended.len()) as u32,
-            triangles,
+            draws: (opaque.len() + blended.len()) as u32 + cs.camera_draws,
+            triangles: triangles + u64::from(cs.triangles),
+            gpu_culling: gpu_cull,
+            cull: cs,
+            instances_uploaded,
+            instances: self.cache.len() as u32,
             lights: lights.len() as u32,
             ring_bytes_used: self.ring_used,
             graph: graph_stats,
-            culled,
-            shadow_draws: shadow_draw_count as u32,
+            culled: culled + cs.frustum_culled,
+            shadow_draws: shadow_draw_count as u32 + cs.shadow_draws,
             stages,
             gpu: self.gpu.clone(),
         };
@@ -1564,9 +2133,12 @@ impl Renderer {
     /// Destroys every GPU resource the renderer owns, including meshes and textures the app
     /// left alive.
     pub fn destroy<D: Device>(self, device: &D) {
-        for (_, m) in self.meshes.iter() {
-            device.destroy_buffer(m.vertices);
-            device.destroy_buffer(m.indices);
+        self.arena.destroy(device);
+        device.destroy_buffer(self.mesh_table);
+        device.destroy_buffer(self.scene.instances);
+        device.destroy_buffer(self.scene.visible);
+        for (b, _) in self.stats_readback {
+            device.destroy_buffer(b);
         }
         for (_, t) in self.textures.iter() {
             device.destroy_texture(t.texture);
@@ -1574,7 +2146,11 @@ impl Renderer {
         for (b, _) in self.rings {
             device.destroy_buffer(b);
         }
-        self.graph.destroy(device);
+        let mut graph = self.graph;
+        if let Some(p) = self.pyramid {
+            p.destroy(device, &mut graph);
+        }
+        graph.destroy(device);
         device.destroy_sampler(self.linear_repeat);
         device.destroy_sampler(self.linear_clamp);
         self.ibl.destroy(device);
@@ -1595,6 +2171,9 @@ impl Renderer {
             .chain(self.gbuffer)
             .chain(self.transparent)
             .chain([
+                self.cull_pipes.camera,
+                self.cull_pipes.shadow,
+                self.cull_pipes.hiz,
                 self.lighting,
                 self.tonemap,
                 self.ssao_pipeline,

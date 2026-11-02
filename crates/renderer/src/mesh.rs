@@ -16,13 +16,74 @@ pub struct Vertex {
     pub tangent: [f32; 4],
 }
 
+/// Most levels of detail of a mesh, level 0 included.
+pub const MAX_LODS: usize = 4;
+
+/// A coarser level of detail: another index list over the same vertices.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MeshLod {
+    /// Triangle list indices into the mesh's `vertices`.
+    pub indices: Vec<u32>,
+    /// Geometric error against level 0 in object-space units (the largest distance a vertex
+    /// moved). The renderer picks the level whose projected error stays under a pixel threshold.
+    pub error: f32,
+}
+
 /// CPU-side mesh: vertices plus a triangle list (counter-clockwise front faces).
 #[derive(Clone, Debug, Default)]
 pub struct MeshData {
     /// Vertices.
     pub vertices: Vec<Vertex>,
-    /// Triangle list indices into `vertices`.
+    /// Triangle list indices into `vertices` (level of detail 0).
     pub indices: Vec<u32>,
+    /// Coarser levels of detail, finest first, at most `MAX_LODS - 1`. Empty means "generate":
+    /// [`Renderer::create_mesh`](crate::Renderer::create_mesh) calls [`generate_lods`].
+    pub lods: Vec<MeshLod>,
+}
+
+/// Meshes below this many triangles get no generated levels: nothing to gain.
+const LOD_MIN_TRIANGLES: usize = 64;
+
+/// Builds up to `MAX_LODS - 1` coarser levels with `meshopt::simplify` (halving the triangle
+/// count each time, absolute error). Stops when a level is no smaller than 90 % of the previous
+/// one. Meshes under 64 triangles get none.
+pub fn generate_lods(m: &MeshData) -> Vec<MeshLod> {
+    use meshopt::{SimplifyOptions, VertexDataAdapter, simplify, simplify_scale};
+    let mut out: Vec<MeshLod> = Vec::new();
+    if m.indices.len() / 3 < LOD_MIN_TRIANGLES {
+        return out;
+    }
+    let bytes: &[u8] = bytemuck::cast_slice(&m.vertices);
+    let Ok(adapter) = VertexDataAdapter::new(bytes, size_of::<Vertex>(), 0) else {
+        return out;
+    };
+    // Absolute error limit: a fraction of the mesh extent per level (the target triangle count
+    // normally stops first).
+    let extent = simplify_scale(&adapter);
+    let mut prev = m.indices.clone();
+    let mut worst = 0.0f32;
+    for level in 1..MAX_LODS {
+        let target = (m.indices.len() >> level) / 3 * 3;
+        let mut error = 0.0f32;
+        let indices = simplify(
+            &prev,
+            &adapter,
+            target,
+            extent * 0.5,
+            SimplifyOptions::ErrorAbsolute,
+            Some(&mut error),
+        );
+        if indices.is_empty() || indices.len() * 10 >= prev.len() * 9 {
+            break;
+        }
+        worst = worst.max(error);
+        out.push(MeshLod {
+            indices: indices.clone(),
+            error: worst,
+        });
+        prev = indices;
+    }
+    out
 }
 
 /// Appends a planar quad with unit normal `n`, centered at `n * dist` and spanned by the unit
@@ -153,6 +214,29 @@ mod tests {
         check(&plane(10.0));
         check(&cube());
         check(&uv_sphere(24, 12));
+    }
+
+    #[test]
+    fn generated_lods_shrink_with_growing_error() {
+        let m = uv_sphere(32, 16);
+        let lods = generate_lods(&m);
+        assert!(
+            !lods.is_empty() && lods.len() < MAX_LODS,
+            "{} lods",
+            lods.len()
+        );
+        let mut prev_len = m.indices.len();
+        let mut prev_err = 0.0;
+        for l in &lods {
+            assert!(l.indices.len() < prev_len && l.indices.len() % 3 == 0);
+            assert!(l.error >= prev_err && l.error > 0.0, "error {}", l.error);
+            assert!(l.indices.iter().all(|&i| (i as usize) < m.vertices.len()));
+            (prev_len, prev_err) = (l.indices.len(), l.error);
+        }
+        // A sphere of radius 0.5 simplified to a quarter keeps its shape within a few percent.
+        assert!(lods.last().unwrap().error < 0.2);
+        // Tiny meshes get nothing.
+        assert!(generate_lods(&cube()).is_empty());
     }
 
     #[test]

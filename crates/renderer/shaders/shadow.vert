@@ -8,7 +8,7 @@ layout(location = 1) flat out uint v_material;
 
 void main() {
     Vertex v = pc.vertices.v[gl_VertexIndex];
-    Instance inst = pc.instances.i[gl_InstanceIndex];
+    Instance inst = pc.instances.i[uint(gl_InstanceIndex) & 0x0fffffffu];
     FrameData f = pc.frame.d;
     mat4 vp = pc.view_index < 4u ? f.cascade_vp[pc.view_index] : f.spot_vp[pc.view_index - 4u];
     v_uv = vec2(v.uv[0], v.uv[1]);

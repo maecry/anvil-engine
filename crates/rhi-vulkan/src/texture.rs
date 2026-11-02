@@ -5,7 +5,7 @@ use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use rhi::{
     AddressMode, Filter, Format, RhiError, SamplerDesc, SamplerHandle, TextureDesc, TextureHandle,
-    TextureState, TextureUsage,
+    TextureState, TextureUsage, TextureViewDesc,
 };
 
 use crate::buffer::create_staging;
@@ -20,20 +20,59 @@ use crate::{lock, read, write};
 pub(crate) enum TextureOwner {
     Swapchain,
     Device,
+    /// A view of another texture's image: no memory, destroyed as a view only.
+    View,
 }
 
 pub(crate) struct VkTexture {
     pub image: vk::Image,
     pub view: vk::ImageView,
     pub format: Format,
+    /// Size of the first mip of this texture or view.
     pub width: u32,
     pub height: u32,
     pub usage: TextureUsage,
+    /// First mip, mip count, first layer and layer count covered (the whole image for textures).
+    pub base_mip: u32,
+    pub level_count: u32,
+    pub base_layer: u32,
+    pub layer_count: u32,
+    /// Mips and layers of the underlying image (for validating views).
+    pub image_mips: u32,
+    pub image_layers: u32,
+    pub cube: bool,
     pub owner: TextureOwner,
     pub allocation: Option<Allocation>,
     /// Advisory whole-texture state (ADR-0010 §9).
     pub state: TextureState,
     pub label: String,
+}
+
+impl VkTexture {
+    pub(crate) fn range(&self) -> vk::ImageSubresourceRange {
+        vk::ImageSubresourceRange {
+            aspect_mask: aspect_of(self.format),
+            base_mip_level: self.base_mip,
+            level_count: self.level_count,
+            base_array_layer: self.base_layer,
+            layer_count: self.layer_count,
+        }
+    }
+
+    /// Plain 2D (one layer, not a cube): the only shape the bindless `texture2D` / `image2D`
+    /// arrays can hold. shortcut: cube and array views get no bindless slot until M5c adds
+    /// `textureCube[]` / `texture2DArray[]` bindings.
+    pub(crate) fn is_plain_2d(&self) -> bool {
+        self.layer_count == 1 && !self.cube
+    }
+
+    pub(crate) fn has_sampled_slot(&self) -> bool {
+        self.usage.contains(TextureUsage::SAMPLED) && self.is_plain_2d()
+    }
+
+    pub(crate) fn has_storage_slot(&self) -> bool {
+        self.usage.contains(TextureUsage::STORAGE) && self.is_plain_2d() && self.level_count == 1
+    }
 }
 
 pub(crate) struct VkSampler {
@@ -53,6 +92,7 @@ pub(crate) fn rhi_to_vk_format(f: Format) -> vk::Format {
         Format::Rg8Unorm => vk::Format::R8G8_UNORM,
         Format::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
         Format::Rg16Float => vk::Format::R16G16_SFLOAT,
+        Format::R32Float => vk::Format::R32_SFLOAT,
         Format::D32Sfloat => vk::Format::D32_SFLOAT,
     }
 }
@@ -67,6 +107,7 @@ pub(crate) fn vk_to_rhi_format(f: vk::Format) -> Option<Format> {
         vk::Format::R8G8_UNORM => Format::Rg8Unorm,
         vk::Format::R16G16B16A16_SFLOAT => Format::Rgba16Float,
         vk::Format::R16G16_SFLOAT => Format::Rg16Float,
+        vk::Format::R32_SFLOAT => Format::R32Float,
         vk::Format::D32_SFLOAT => Format::D32Sfloat,
         _ => return None,
     })
@@ -100,6 +141,7 @@ pub(crate) fn usage_to_vk(u: TextureUsage) -> vk::ImageUsageFlags {
             TextureUsage::TRANSFER_DST,
             vk::ImageUsageFlags::TRANSFER_DST,
         ),
+        (TextureUsage::STORAGE, vk::ImageUsageFlags::STORAGE),
     ] {
         if u.contains(bit) {
             f |= vk_bit;
@@ -108,8 +150,13 @@ pub(crate) fn usage_to_vk(u: TextureUsage) -> vk::ImageUsageFlags {
     f
 }
 
-fn required_features() -> [(TextureUsage, &'static str, vk::FormatFeatureFlags); 5] {
+fn required_features() -> [(TextureUsage, &'static str, vk::FormatFeatureFlags); 6] {
     [
+        (
+            TextureUsage::STORAGE,
+            "STORAGE",
+            vk::FormatFeatureFlags::STORAGE_IMAGE,
+        ),
         (
             TextureUsage::SAMPLED,
             "SAMPLED",
@@ -163,6 +210,21 @@ pub(crate) fn validate_texture_desc(
     }
     if desc.usage.is_empty() {
         return Err(invalid("create_texture: usage must not be empty"));
+    }
+    let max_mips = desc.width.max(desc.height).ilog2() + 1;
+    if desc.mip_levels == 0 || desc.mip_levels > max_mips {
+        return Err(invalid(format!(
+            "create_texture: mip_levels {} must be 1..={max_mips} for {}x{}",
+            desc.mip_levels, desc.width, desc.height
+        )));
+    }
+    if desc.array_layers == 0 {
+        return Err(invalid("create_texture: array_layers must be nonzero"));
+    }
+    if desc.cube && (desc.array_layers != 6 || desc.width != desc.height) {
+        return Err(invalid(
+            "create_texture: a cube needs 6 layers and a square extent",
+        ));
     }
     let depth = desc.format.is_depth();
     if desc.usage.contains(TextureUsage::COLOR_ATTACHMENT) && depth {
@@ -304,8 +366,13 @@ pub(crate) fn create_texture(
             height: desc.height,
             depth: 1,
         })
-        .mip_levels(1)
-        .array_layers(1)
+        .flags(if desc.cube {
+            vk::ImageCreateFlags::CUBE_COMPATIBLE
+        } else {
+            vk::ImageCreateFlags::empty()
+        })
+        .mip_levels(desc.mip_levels)
+        .array_layers(desc.array_layers)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
         .usage(usage_to_vk(desc.usage))
@@ -350,16 +417,23 @@ pub(crate) fn create_texture(
         || desc.usage.contains(TextureUsage::COLOR_ATTACHMENT)
         || desc.usage.contains(TextureUsage::DEPTH_ATTACHMENT)
     {
+        let view_type = if desc.cube {
+            vk::ImageViewType::CUBE
+        } else if desc.array_layers > 1 {
+            vk::ImageViewType::TYPE_2D_ARRAY
+        } else {
+            vk::ImageViewType::TYPE_2D
+        };
         let view_ci = vk::ImageViewCreateInfo::default()
             .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
+            .view_type(view_type)
             .format(vk_format)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: aspect_of(desc.format),
                 base_mip_level: 0,
-                level_count: 1,
+                level_count: desc.mip_levels,
                 base_array_layer: 0,
-                layer_count: 1,
+                layer_count: desc.array_layers,
             });
         // SAFETY: the image is bound; the view format/aspect match the image.
         match unsafe { s.raw.create_image_view(&view_ci, None) } {
@@ -381,6 +455,13 @@ pub(crate) fn create_texture(
         width: desc.width,
         height: desc.height,
         usage: desc.usage,
+        base_mip: 0,
+        level_count: desc.mip_levels,
+        base_layer: 0,
+        layer_count: desc.array_layers,
+        image_mips: desc.mip_levels,
+        image_layers: desc.array_layers,
+        cube: desc.cube,
         owner: TextureOwner::Device,
         allocation: Some(allocation),
         state: TextureState::Undefined,
@@ -397,29 +478,176 @@ pub(crate) fn create_texture(
         t.label.clone_from(&name);
     }
     let slot = h.index();
-    if desc.usage.contains(TextureUsage::SAMPLED) {
-        if slot >= s.bindings.sampled_image_capacity {
-            tracing::warn!(target: "rhi_vulkan::texture", slot, capacity = s.bindings.sampled_image_capacity, "bindless sampled image capacity exceeded");
-            let t = write(&s.pools.textures).remove(h);
-            if let Some(mut t) = t
-                && let Some(a) = t.allocation.take()
-            {
-                destroy_image_now(s, t.image, t.view, a);
-            }
-            return Err(RhiError::Unsupported {
-                what: format!(
-                    "bindless sampled image capacity ({}) exceeded",
-                    s.bindings.sampled_image_capacity
-                ),
-            });
+    let (sampled, storage) = {
+        let pool = read(&s.pools.textures);
+        pool.get(h).map_or((false, false), |t| {
+            (t.has_sampled_slot(), t.has_storage_slot())
+        })
+    };
+    if let Err(e) = write_slots(s, slot, view, sampled, storage) {
+        let t = write(&s.pools.textures).remove(h);
+        if let Some(mut t) = t
+            && let Some(a) = t.allocation.take()
+        {
+            destroy_image_now(s, t.image, t.view, a);
         }
-        s.bindings.write_sampled_image(&s.raw, slot, view);
+        return Err(e);
     }
     tracing::debug!(
         target: "rhi_vulkan::texture", handle = ?h, label = %name, width = desc.width,
         height = desc.height, format = ?desc.format, usage = ?desc.usage, slot, "texture created"
     );
     Ok(h)
+}
+
+/// Writes the bindless descriptors a texture or view is entitled to; `Unsupported` when `slot`
+/// is beyond a binding's capacity (the caller undoes the creation).
+fn write_slots(
+    s: &DeviceShared,
+    slot: u32,
+    view: vk::ImageView,
+    sampled: bool,
+    storage: bool,
+) -> Result<(), RhiError> {
+    for (wanted, cap, what) in [
+        (sampled, s.bindings.sampled_image_capacity, "sampled image"),
+        (storage, s.bindings.storage_image_capacity, "storage image"),
+    ] {
+        if wanted && slot >= cap {
+            tracing::warn!(target: "rhi_vulkan::texture", slot, capacity = cap, what, "bindless capacity exceeded");
+            return Err(RhiError::Unsupported {
+                what: format!("bindless {what} capacity ({cap}) exceeded"),
+            });
+        }
+    }
+    if sampled {
+        s.bindings.write_sampled_image(&s.raw, slot, view);
+    }
+    if storage {
+        s.bindings.write_storage_image(&s.raw, slot, view);
+    }
+    Ok(())
+}
+
+/// A view of `parent`'s image over a mip and layer range, as a texture of its own.
+pub(crate) fn create_texture_view(
+    s: &DeviceShared,
+    parent: TextureHandle,
+    desc: &TextureViewDesc,
+) -> Result<TextureHandle, RhiError> {
+    let p = {
+        let pool = read(&s.pools.textures);
+        let t = pool.get(parent).ok_or_else(|| stale("texture", parent))?;
+        if t.owner != TextureOwner::Device {
+            return Err(invalid(
+                "create_texture_view: the parent must be a device texture, not a view or swapchain image",
+            ));
+        }
+        (
+            t.image,
+            t.format,
+            t.width,
+            t.height,
+            t.usage,
+            t.image_mips,
+            t.image_layers,
+        )
+    };
+    let (image, format, pw, ph, pusage, mips, layers) = p;
+    let end_mip = desc.base_mip.checked_add(desc.mip_count);
+    let end_layer = desc.base_layer.checked_add(desc.layer_count);
+    if desc.mip_count == 0
+        || desc.layer_count == 0
+        || end_mip.is_none_or(|e| e > mips)
+        || end_layer.is_none_or(|e| e > layers)
+    {
+        return Err(invalid(format!(
+            "create_texture_view: mips {}+{} / layers {}+{} outside the parent's {mips} mips / {layers} layers",
+            desc.base_mip, desc.mip_count, desc.base_layer, desc.layer_count
+        )));
+    }
+    if desc.usage.is_empty() || !pusage.contains(desc.usage) {
+        return Err(invalid(format!(
+            "create_texture_view: usage {:?} is not a subset of the parent's {pusage:?}",
+            desc.usage
+        )));
+    }
+    if desc.usage.contains(TextureUsage::STORAGE) && desc.mip_count != 1 {
+        return Err(invalid("create_texture_view: a storage view has one mip"));
+    }
+    let view_ci = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(if desc.layer_count > 1 {
+            vk::ImageViewType::TYPE_2D_ARRAY
+        } else {
+            vk::ImageViewType::TYPE_2D
+        })
+        .format(rhi_to_vk_format(format))
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: aspect_of(format),
+            base_mip_level: desc.base_mip,
+            level_count: desc.mip_count,
+            base_array_layer: desc.base_layer,
+            layer_count: desc.layer_count,
+        });
+    // SAFETY: the parent image is alive (checked above, destruction is deferred and the caller
+    // keeps the parent past its views); the range was validated against its mips and layers.
+    let view = unsafe { s.raw.create_image_view(&view_ci, None) }
+        .map_err(|r| map_vk("vkCreateImageView", r))?;
+    let h = write(&s.pools.textures).insert(VkTexture {
+        image,
+        view,
+        format,
+        width: (pw >> desc.base_mip).max(1),
+        height: (ph >> desc.base_mip).max(1),
+        usage: desc.usage,
+        base_mip: desc.base_mip,
+        level_count: desc.mip_count,
+        base_layer: desc.base_layer,
+        layer_count: desc.layer_count,
+        image_mips: mips,
+        image_layers: layers,
+        cube: false,
+        owner: TextureOwner::View,
+        allocation: None,
+        state: TextureState::Undefined,
+        label: String::new(),
+    });
+    let name = desc
+        .label
+        .map_or_else(|| generated_name("texture_view", h), str::to_owned);
+    s.set_name(view, &name);
+    let (sampled, storage) = {
+        let mut pool = write(&s.pools.textures);
+        pool.get_mut(h).map_or((false, false), |t| {
+            t.label.clone_from(&name);
+            (t.has_sampled_slot(), t.has_storage_slot())
+        })
+    };
+    if let Err(e) = write_slots(s, h.index(), view, sampled, storage) {
+        write(&s.pools.textures).remove(h);
+        // SAFETY: the view was never used by a submission.
+        unsafe { s.raw.destroy_image_view(view, None) };
+        return Err(e);
+    }
+    tracing::debug!(
+        target: "rhi_vulkan::texture", handle = ?h, parent = ?parent, label = %name,
+        mips = ?(desc.base_mip, desc.mip_count), layers = ?(desc.base_layer, desc.layer_count),
+        usage = ?desc.usage, slot = h.index(), "texture view created"
+    );
+    Ok(h)
+}
+
+/// Bindless storage slot of a single-mip 2D texture or view with `STORAGE` usage.
+pub(crate) fn storage_index(s: &DeviceShared, h: TextureHandle) -> Result<u32, RhiError> {
+    let pool = read(&s.pools.textures);
+    let t = pool.get(h).ok_or_else(|| stale("texture", h))?;
+    if !t.has_storage_slot() {
+        return Err(invalid(
+            "storage_index: needs a plain 2D single-mip texture or view with TextureUsage::STORAGE",
+        ));
+    }
+    Ok(h.index())
 }
 
 pub(crate) fn destroy_texture(s: &DeviceShared, h: TextureHandle) {
@@ -438,6 +666,14 @@ pub(crate) fn destroy_texture(s: &DeviceShared, h: TextureHandle) {
         tracing::warn!(target: "rhi_vulkan::texture", handle = ?h, "destroy_texture on stale handle ignored");
         return;
     };
+    if t.owner == TextureOwner::View {
+        s.sync.defer(Doomed::View {
+            view: t.view,
+            slot: h,
+        });
+        tracing::debug!(target: "rhi_vulkan::texture", handle = ?h, label = %t.label, "texture view destroy deferred");
+        return;
+    }
     let Some(allocation) = t.allocation.take() else {
         return;
     };
@@ -458,9 +694,9 @@ pub(crate) fn texture_index(s: &DeviceShared, h: TextureHandle) -> Result<u32, R
             "texture_index: swapchain textures have no bindless slot",
         ));
     }
-    if !t.usage.contains(TextureUsage::SAMPLED) {
+    if !t.has_sampled_slot() {
         return Err(invalid(
-            "texture_index: texture lacks TextureUsage::SAMPLED",
+            "texture_index: needs a plain 2D (not array or cube) texture or view with TextureUsage::SAMPLED",
         ));
     }
     Ok(h.index())
@@ -475,7 +711,12 @@ pub(crate) fn upload_texture(
     let t = pool.get_mut(h).ok_or_else(|| stale("texture", h))?;
     if t.owner != TextureOwner::Device {
         return Err(invalid(
-            "upload_texture: swapchain textures cannot be uploaded to",
+            "upload_texture: only device textures (not views or swapchain images) can be uploaded to",
+        ));
+    }
+    if t.image_layers != 1 {
+        return Err(invalid(
+            "upload_texture: layered textures are not supported",
         ));
     }
     if !t.usage.contains(TextureUsage::TRANSFER_DST) {
@@ -578,11 +819,20 @@ pub(crate) fn destroy_leaked(s: &DeviceShared) {
         let hs = p.handles();
         hs.into_iter()
             .filter_map(|h| p.remove(h).map(|v| (h, v)))
-            .filter(|(_, t)| t.owner == TextureOwner::Device)
+            .filter(|(_, t)| t.owner != TextureOwner::Swapchain)
             .collect::<Vec<_>>()
     };
-    for (h, mut t) in textures {
+    let (views, textures): (Vec<_>, Vec<_>) = textures
+        .into_iter()
+        .partition(|(_, t)| t.owner == TextureOwner::View);
+    for (h, t) in views.into_iter().chain(textures) {
+        let mut t = t;
         tracing::warn!(target: "rhi_vulkan::texture", handle = ?h, label = %t.label, "leaked texture destroyed at shutdown");
+        if t.owner == TextureOwner::View {
+            // SAFETY: device idle; removed from the pool so destroyed once.
+            unsafe { s.raw.destroy_image_view(t.view, None) };
+            continue;
+        }
         if let Some(allocation) = t.allocation.take() {
             // SAFETY: device idle; removed from the pool so destroyed once. The Doomed release
             // of the (already removed) slot is a no-op.
@@ -639,6 +889,9 @@ mod tests {
             height: h,
             format,
             usage,
+            mip_levels: 1,
+            array_layers: 1,
+            cube: false,
         }
     }
 

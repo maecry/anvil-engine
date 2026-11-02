@@ -9,7 +9,7 @@
 //! Env: `ANVIL_EXIT_AFTER_FRAMES=n` renders n frames and exits (code 1 on validation errors).
 //! `ANVIL_SCREENSHOT=path.png` (with `ANVIL_EXIT_AFTER_FRAMES`) writes the last frame as a PNG.
 //! `ANVIL_RENDER_PATH=forward|deferred`, `ANVIL_STRESS_LIGHTS=1`,
-//! `ANVIL_DEBUG_VIEW=clusters|cascades|ssao`, `ANVIL_SSAO=0|1`, `ANVIL_TAA=0|1`,
+//! `ANVIL_DEBUG_VIEW=clusters|cascades|ssao|lod|occlusion`, `ANVIL_SSAO=0|1`, `ANVIL_TAA=0|1`,
 //! `ANVIL_BLOOM=0|1` (default 1), `ANVIL_TOGGLE_POST=n` (cycle all combinations every n frames) select the initial state headlessly; `ANVIL_CAMERA_ORBIT=1`
 //! slowly orbits the camera (a function of the frame number, to inspect TAA in motion).
 //! `ANVIL_BENCH=path.json` runs the benchmark protocol (ADR-0013 §1): the camera orbits, vsync
@@ -687,12 +687,10 @@ fn main() -> anyhow::Result<()> {
             toggle_post: std::env::var("ANVIL_TOGGLE_POST")
                 .ok()
                 .and_then(|v| v.parse().ok()),
-            debug: match std::env::var("ANVIL_DEBUG_VIEW").as_deref() {
-                Ok("clusters") => DebugView::Clusters,
-                Ok("cascades") => DebugView::Cascades,
-                Ok("ssao") => DebugView::Ssao,
-                _ => DebugView::None,
-            },
+            debug: std::env::var("ANVIL_DEBUG_VIEW")
+                .ok()
+                .and_then(|v| DebugView::from_name(&v))
+                .unwrap_or(DebugView::None),
             bench: None,
             last: Instant::now(),
             rendered: 0,

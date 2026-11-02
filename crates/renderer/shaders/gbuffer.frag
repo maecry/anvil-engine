@@ -7,6 +7,7 @@ layout(location = 1) in vec3 v_normal;
 layout(location = 2) in vec2 v_uv;
 layout(location = 3) in vec4 v_tangent;
 layout(location = 4) flat in uint v_material;
+layout(location = 7) flat in uint v_flags;
 layout(location = 0) out vec4 out_albedo;
 layout(location = 1) out vec4 out_normal;
 layout(location = 2) out vec4 out_emissive;
@@ -16,7 +17,7 @@ void main() {
 #ifdef MASK
     if (s.alpha < pc.materials.m[v_material].alpha_cutoff) discard;
 #endif
-    out_albedo = vec4(s.base, s.metallic);
+    out_albedo = vec4(s.base * instance_tint(pc.frame.d.debug_mode, v_flags), s.metallic);
     out_normal = vec4(s.n, s.roughness);
     out_emissive = vec4(s.emissive, s.ao);
 }

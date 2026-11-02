@@ -17,14 +17,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rhi::{
-    ColorAttachment, CommandEncoder, DepthAttachment, Device, FrameToken, Rect2D, RenderingDesc,
-    RhiError, TextureDesc, TextureHandle, TextureState, Viewport,
+    BufferDesc, BufferHandle, BufferState, ColorAttachment, CommandEncoder, DepthAttachment,
+    Device, FrameToken, Memory, Rect2D, RenderingDesc, RhiError, TextureDesc, TextureHandle,
+    TextureState, Viewport,
 };
 
 pub use describe::{BarrierDesc, GraphDescription, PassDesc, ResourceDesc};
-pub use plan::{ColorTarget, DepthTarget, GraphError, Pass, TexId, TransientDesc};
+pub use plan::{
+    BufId, ColorTarget, DepthTarget, GraphError, Pass, TexId, TransientBufferDesc, TransientDesc,
+};
 
-use plan::{Decls, Plan, pass_extent};
+use plan::{Decls, Plan, St, pass_extent};
 use pool::TransientPool;
 
 /// Counters of one frame's graph (ADR-0012 §5).
@@ -71,9 +74,23 @@ pub struct PassContext<'c, D: Device> {
     /// The device the graph runs on.
     pub device: &'c D,
     textures: &'c [TextureHandle],
+    buffers: &'c [BufferHandle],
 }
 
 impl<D: Device> PassContext<'_, D> {
+    /// The buffer behind `id`. Only valid for buffers the pass declared.
+    pub fn buffer(&self, id: BufId) -> BufferHandle {
+        self.buffers[id.0 as usize]
+    }
+
+    /// Device address of the buffer behind `id`.
+    ///
+    /// # Errors
+    /// [`RhiError`] from the device.
+    pub fn buffer_address(&self, id: BufId) -> Result<u64, RhiError> {
+        self.device.buffer_address(self.buffer(id))
+    }
+
     /// The texture behind `id`. Only valid for textures the pass declared.
     pub fn texture(&self, id: TexId) -> TextureHandle {
         self.textures[id.0 as usize]
@@ -129,6 +146,28 @@ impl<'a, D: Device> GraphBuilder<'a, D> {
         self.decls.import(name.into(), texture, extent, initial)
     }
 
+    /// Declares a transient GPU buffer, allocated from the pool when a live pass uses it. Its
+    /// contents are undefined at the start of the frame: a pass must write it before any read.
+    pub fn transient_buffer(
+        &mut self,
+        name: impl Into<Cow<'static, str>>,
+        desc: TransientBufferDesc,
+    ) -> BufId {
+        self.decls.transient_buffer(name.into(), desc)
+    }
+
+    /// Imports a persistent buffer. `initial` overrides the state the graph remembers; with
+    /// `None` the remembered state is used (`Undefined` the first time) and the final state is
+    /// remembered for the next frame.
+    pub fn import_buffer(
+        &mut self,
+        name: impl Into<Cow<'static, str>>,
+        buffer: BufferHandle,
+        initial: Option<BufferState>,
+    ) -> BufId {
+        self.decls.import_buffer(name.into(), buffer, initial)
+    }
+
     /// `tex` must end the frame in `state` (e.g. `Present`). Exports are roots.
     pub fn export(&mut self, tex: TexId, state: TextureState) {
         self.decls.exports.push((tex, state));
@@ -169,7 +208,9 @@ impl<D: Device> CompiledGraph<'_, D> {
 /// Persistent part of the graph: remembered states of imported textures and the transient pool.
 pub struct RenderGraph {
     states: HashMap<TextureHandle, TextureState>,
-    pool: TransientPool,
+    buffer_states: HashMap<BufferHandle, BufferState>,
+    pool: TransientPool<TransientDesc, TextureHandle, TextureState>,
+    buffer_pool: TransientPool<TransientBufferDesc, BufferHandle, BufferState>,
     /// Per frame slot: the frame number and pass names its timestamps belong to.
     timed: Vec<Option<(u64, Vec<Cow<'static, str>>)>>,
 }
@@ -199,7 +240,9 @@ impl RenderGraph {
     pub fn new(frames_in_flight: u32) -> Self {
         Self {
             states: HashMap::new(),
+            buffer_states: HashMap::new(),
             pool: TransientPool::new(frames_in_flight),
+            buffer_pool: TransientPool::new(frames_in_flight),
             timed: vec![None; frames_in_flight as usize],
         }
     }
@@ -214,6 +257,11 @@ impl RenderGraph {
         self.states.remove(&texture);
     }
 
+    /// Stops remembering `buffer`; call before destroying an imported buffer.
+    pub fn forget_buffer(&mut self, buffer: BufferHandle) {
+        self.buffer_states.remove(&buffer);
+    }
+
     /// Validates, culls, orders and plans the frame.
     ///
     /// # Errors
@@ -224,7 +272,7 @@ impl RenderGraph {
     ) -> Result<CompiledGraph<'a, D>, GraphError> {
         let t0 = Instant::now();
         let GraphBuilder { decls, bodies } = builder;
-        let plan = plan::plan(&decls, &self.states)?;
+        let plan = plan::plan(&decls, &self.states, &self.buffer_states)?;
         let culled = plan.live.iter().filter(|l| !**l).count() as u32;
         let stats = GraphStats {
             passes: decls.passes.len() as u32,
@@ -288,13 +336,16 @@ impl RenderGraph {
             let name = &decls.res[s.first_owner.0 as usize].name;
             let (entry, created) = self
                 .pool
-                .acquire(s.desc, frame.frame, || {
+                .acquire(s.desc, frame.frame, TextureState::Undefined, || {
                     device.create_texture(&TextureDesc {
                         label: Some(name),
                         width: s.desc.width,
                         height: s.desc.height,
                         format: s.desc.format,
                         usage: s.desc.usage,
+                        mip_levels: 1,
+                        array_layers: 1,
+                        cube: false,
                     })
                 })
                 .map_err(|e| rhi_err(name, e))?;
@@ -307,10 +358,35 @@ impl RenderGraph {
             .enumerate()
             .map(|(i, r)| match (&r.kind, plan.slot_of[i]) {
                 (plan::ResKind::Imported { texture, .. }, _) => *texture,
-                (_, Some(s)) => self.pool.entries[slot_entry[s]].texture,
+                (_, Some(s)) => self.pool.entries[slot_entry[s]].handle,
                 _ => TextureHandle::NULL,
             })
             .collect();
+        // Transient buffers: one pooled buffer each (no aliasing).
+        let mut buffer_entry = vec![usize::MAX; decls.res.len()];
+        let mut buffers = vec![BufferHandle::NULL; decls.res.len()];
+        for (i, r) in decls.res.iter().enumerate() {
+            match r.kind {
+                plan::ResKind::ImportedBuf { buffer, .. } => buffers[i] = buffer,
+                plan::ResKind::TransientBuf(desc) if plan.lifetime[i].is_some() => {
+                    let (e, created) = self
+                        .buffer_pool
+                        .acquire(desc, frame.frame, BufferState::Undefined, || {
+                            device.create_buffer(&BufferDesc {
+                                label: Some(&r.name),
+                                size: desc.size,
+                                usage: desc.usage,
+                                memory: Memory::GpuOnly,
+                            })
+                        })
+                        .map_err(|e| rhi_err(&r.name, e))?;
+                    stats.textures_created += u32::from(created);
+                    buffer_entry[i] = e;
+                    buffers[i] = self.buffer_pool.entries[e].handle;
+                }
+                _ => {}
+            }
+        }
 
         let timed = device.timestamp_info().is_some();
         let mut names = Vec::new();
@@ -318,22 +394,37 @@ impl RenderGraph {
             cmd.write_timestamp(0);
         }
         let mut next_barrier = 0;
-        let mut emit = |cmd: &mut D::Commands, pool: &TransientPool, upto: usize| {
+        let mut emit = |cmd: &mut D::Commands,
+                        pool: &TransientPool<TransientDesc, TextureHandle, TextureState>,
+                        bpool: &TransientPool<TransientBufferDesc, BufferHandle, BufferState>,
+                        upto: usize| {
             while let Some(b) = plan.barriers.get(next_barrier).filter(|b| b.before <= upto) {
-                let mut from = b.from;
-                // A pooled texture's first barrier starts from the state its last frame left.
-                if from == TextureState::Undefined
-                    && let Some(s) = plan.slot_of[b.tex.0 as usize]
-                    && plan.slots[s].first_owner == b.tex
-                {
-                    from = pool.entries[slot_entry[s]].state;
+                let r = b.tex.0 as usize;
+                match (b.from, b.to) {
+                    (St::T(mut from), St::T(to)) => {
+                        // A pooled texture's first barrier starts from the state its last
+                        // frame left.
+                        if from == TextureState::Undefined
+                            && let Some(s) = plan.slot_of[r]
+                            && plan.slots[s].first_owner == b.tex
+                        {
+                            from = pool.entries[slot_entry[s]].state;
+                        }
+                        cmd.texture_barrier(textures[r], from, to);
+                    }
+                    (St::B(mut from), St::B(to)) => {
+                        if from == BufferState::Undefined && buffer_entry[r] != usize::MAX {
+                            from = bpool.entries[buffer_entry[r]].state;
+                        }
+                        cmd.buffer_barrier(buffers[r], from, to);
+                    }
+                    _ => unreachable!("a resource is either a texture or a buffer"),
                 }
-                cmd.texture_barrier(textures[b.tex.0 as usize], from, b.to);
                 next_barrier += 1;
             }
         };
         for (k, &pi) in plan.order.iter().enumerate() {
-            emit(cmd, &self.pool, k);
+            emit(cmd, &self.pool, &self.buffer_pool, k);
             let pass = &decls.passes[pi];
             tracing::trace!(pass = %pass.name, position = k, "graph pass");
             cmd.begin_label(&pass.name, pass.label_color);
@@ -380,6 +471,7 @@ impl RenderGraph {
                     cmd,
                     device,
                     textures: &textures,
+                    buffers: &buffers,
                 })
                 .map_err(|e| rhi_err(&pass.name, e))?;
             }
@@ -394,7 +486,7 @@ impl RenderGraph {
                 names.push(pass.name.clone());
             }
         }
-        emit(cmd, &self.pool, usize::MAX);
+        emit(cmd, &self.pool, &self.buffer_pool, usize::MAX);
         if timed {
             cmd.write_timestamp(names.len() as u32 + 1);
             names.push(Cow::Borrowed("export barriers"));
@@ -405,6 +497,18 @@ impl RenderGraph {
             self.pool.entries[e].state = plan.slot_final[s];
         }
         for (i, r) in decls.res.iter().enumerate() {
+            if let (St::B(fin), true) = (plan.res_final[i], buffer_entry[i] != usize::MAX) {
+                self.buffer_pool.entries[buffer_entry[i]].state = fin;
+            }
+            if let plan::ResKind::ImportedBuf {
+                buffer,
+                initial: None,
+            } = r.kind
+                && plan.lifetime[i].is_some()
+                && let St::B(fin) = plan.res_final[i]
+            {
+                self.buffer_states.insert(buffer, fin);
+            }
             // An explicit initial state is re-declared every frame (swapchain images), so it is
             // never remembered; this keeps stale swapchain handles out of the map.
             if let plan::ResKind::Imported {
@@ -413,12 +517,15 @@ impl RenderGraph {
                 ..
             } = r.kind
                 && plan.lifetime[i].is_some()
+                && let St::T(fin) = plan.res_final[i]
             {
-                self.states.insert(texture, plan.res_final[i]);
+                self.states.insert(texture, fin);
             }
         }
         self.pool.evict(frame.frame, |t| device.destroy_texture(t));
-        stats.pool_size = self.pool.entries.len() as u32;
+        self.buffer_pool
+            .evict(frame.frame, |b| device.destroy_buffer(b));
+        stats.pool_size = (self.pool.entries.len() + self.buffer_pool.entries.len()) as u32;
         Ok(stats)
     }
 
@@ -458,7 +565,10 @@ impl RenderGraph {
     /// Destroys the pooled textures. Imported textures belong to the caller.
     pub fn destroy<D: Device>(self, device: &D) {
         for e in self.pool.entries {
-            device.destroy_texture(e.texture);
+            device.destroy_texture(e.handle);
+        }
+        for e in self.buffer_pool.entries {
+            device.destroy_buffer(e.handle);
         }
     }
 }

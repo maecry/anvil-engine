@@ -118,6 +118,7 @@ fn lowered_device(inst: &crate::VulkanInstance, images: u32, samplers: u32) -> c
         Some(crate::bindings::BindlessLimits {
             sampled_images: images,
             samplers,
+            storage_images: 64,
         }),
     )
     .unwrap()
@@ -180,6 +181,9 @@ fn bindless_capacity_exceeded() {
         height: 4,
         format: Format::Rgba8Unorm,
         usage: TextureUsage::SAMPLED,
+        mip_levels: 1,
+        array_layers: 1,
+        cube: false,
     };
     let held: Vec<_> = (0..4).map(|_| dev.create_texture(&tex).unwrap()).collect();
     let allocated = dev.diagnostics().memory.allocated_bytes;

@@ -11,6 +11,7 @@ layout(location = 3) in vec4 v_tangent;
 layout(location = 4) flat in uint v_material;
 layout(location = 5) in vec4 v_clip;
 layout(location = 6) in vec4 v_prev_clip;
+layout(location = 7) flat in uint v_flags;  // debug tags; declared so the vertex output is consumed
 layout(location = 0) out vec2 out_normal;
 layout(location = 1) out vec2 out_velocity;
 
@@ -27,5 +28,5 @@ void main() {
 #endif
     vec3 n = normalize(v_normal) * (gl_FrontFacing ? 1.0 : -1.0);
     out_normal = oct_encode(normalize(mat3(pc.frame.d.view) * n));
-    out_velocity = (v_clip.xy / v_clip.w - v_prev_clip.xy / v_prev_clip.w) * 0.5;
+    out_velocity = (v_clip.xy / v_clip.w - v_prev_clip.xy / v_prev_clip.w) * 0.5 + vec2(0.0 * float(v_flags));
 }

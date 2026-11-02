@@ -18,6 +18,8 @@ pub static SAMPLE_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sample
 pub static FLAT_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/flat.vert.spv"));
 pub static FLAT_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/flat.frag.spv"));
 
+pub static FILL_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fill.comp.spv"));
+pub static STORAGE_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/storage.comp.spv"));
 pub static EMPTY_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/empty.frag.spv"));
 
 pub fn enabled() -> bool {
@@ -210,6 +212,9 @@ pub fn offscreen_target(dev: &VulkanDevice, w: u32, h: u32) -> TextureHandle {
         height: h,
         format: Format::Rgba8Unorm,
         usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
+        mip_levels: 1,
+        array_layers: 1,
+        cube: false,
     })
     .unwrap()
 }

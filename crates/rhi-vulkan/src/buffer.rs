@@ -50,6 +50,8 @@ pub(crate) fn usage_to_vk(u: BufferUsage) -> vk::BufferUsageFlags {
             BufferUsage::TRANSFER_DST,
             vk::BufferUsageFlags::TRANSFER_DST,
         ),
+        (BufferUsage::INDIRECT, vk::BufferUsageFlags::INDIRECT_BUFFER),
+        (BufferUsage::VERTEX, vk::BufferUsageFlags::VERTEX_BUFFER),
     ] {
         if u.contains(bit) {
             f |= vk_bit;

@@ -12,12 +12,15 @@ use crate::lock;
 /// Wanted capacities (ADR-0010 §1).
 pub(crate) const WANTED_IMAGES: u32 = 65536;
 pub(crate) const WANTED_SAMPLERS: u32 = 1024;
+/// Storage images share the sampled images' slot space (a texture's slot is its pool index).
+pub(crate) const WANTED_STORAGE_IMAGES: u32 = 65536;
 
 /// Already clamped to the device limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BindlessLimits {
     pub sampled_images: u32,
     pub samplers: u32,
+    pub storage_images: u32,
 }
 
 pub(crate) fn bindless_capacity(device_limit: u32, wanted: u32) -> u32 {
@@ -25,10 +28,11 @@ pub(crate) fn bindless_capacity(device_limit: u32, wanted: u32) -> u32 {
 }
 
 impl BindlessLimits {
-    pub(crate) fn from_device(l_img: u32, l_smp: u32) -> Self {
+    pub(crate) fn from_device(l_img: u32, l_smp: u32, l_storage: u32) -> Self {
         Self {
             sampled_images: bindless_capacity(l_img, WANTED_IMAGES),
             samplers: bindless_capacity(l_smp, WANTED_SAMPLERS),
+            storage_images: bindless_capacity(l_storage, WANTED_STORAGE_IMAGES),
         }
     }
 }
@@ -36,7 +40,7 @@ impl BindlessLimits {
 /// Pure description of the set layout bindings: `(binding, type, count, binding flags)`.
 pub(crate) fn layout_binding_descs(
     l: BindlessLimits,
-) -> [(u32, vk::DescriptorType, u32, vk::DescriptorBindingFlags); 2] {
+) -> [(u32, vk::DescriptorType, u32, vk::DescriptorBindingFlags); 3] {
     let flags =
         vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND;
     [
@@ -47,12 +51,23 @@ pub(crate) fn layout_binding_descs(
             flags,
         ),
         (1, vk::DescriptorType::SAMPLER, l.samplers, flags),
+        (
+            2,
+            vk::DescriptorType::STORAGE_IMAGE,
+            l.storage_images,
+            flags,
+        ),
     ]
 }
 
+/// Stages that see the global set and the push constants: every graphics stage and compute.
+pub(crate) const ALL_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::from_raw(
+    vk::ShaderStageFlags::ALL_GRAPHICS.as_raw() | vk::ShaderStageFlags::COMPUTE.as_raw(),
+);
+
 pub(crate) const fn push_range() -> vk::PushConstantRange {
     vk::PushConstantRange {
-        stage_flags: vk::ShaderStageFlags::ALL_GRAPHICS,
+        stage_flags: ALL_STAGES,
         offset: 0,
         size: PUSH_CONSTANT_BYTES,
     }
@@ -81,6 +96,7 @@ pub(crate) struct GlobalBindings {
     pub set: vk::DescriptorSet,
     pub sampled_image_capacity: u32,
     pub sampler_capacity: u32,
+    pub storage_image_capacity: u32,
     /// External synchronization for `vkUpdateDescriptorSets` on `set`.
     update: Mutex<()>,
     pub image_high_water: AtomicU32,
@@ -98,7 +114,7 @@ impl GlobalBindings {
                     .binding(binding)
                     .descriptor_type(ty)
                     .descriptor_count(count)
-                    .stage_flags(vk::ShaderStageFlags::ALL_GRAPHICS)
+                    .stage_flags(ALL_STAGES)
             })
             .collect();
         let flags: Vec<_> = descs.iter().map(|d| d.3).collect();
@@ -135,6 +151,10 @@ impl GlobalBindings {
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLER,
                 descriptor_count: limits.samplers,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: limits.storage_images,
             },
         ];
         let pool_ci = vk::DescriptorPoolCreateInfo::default()
@@ -174,6 +194,7 @@ impl GlobalBindings {
             target: "rhi_vulkan::bindings",
             sampled_image_capacity = limits.sampled_images,
             sampler_capacity = limits.samplers,
+            storage_image_capacity = limits.storage_images,
             push_constant_bytes = PUSH_CONSTANT_BYTES,
             "global bindings created"
         );
@@ -184,6 +205,7 @@ impl GlobalBindings {
             set,
             sampled_image_capacity: limits.sampled_images,
             sampler_capacity: limits.samplers,
+            storage_image_capacity: limits.storage_images,
             update: Mutex::new(()),
             image_high_water: AtomicU32::new(0),
             sampler_high_water: AtomicU32::new(0),
@@ -204,6 +226,19 @@ impl GlobalBindings {
             .fetch_max(slot + 1, Ordering::Relaxed)
             .max(slot + 1);
         tracing::trace!(target: "rhi_vulkan::texture", binding = 0, slot, high_water = hw, "bindless descriptor written");
+    }
+
+    /// Writes a storage image descriptor into binding 2 (`GENERAL` layout).
+    /// `slot < storage_image_capacity`.
+    pub(crate) fn write_storage_image(&self, device: &ash::Device, slot: u32, view: vk::ImageView) {
+        debug_assert!(slot < self.storage_image_capacity);
+        let info = [vk::DescriptorImageInfo {
+            sampler: vk::Sampler::null(),
+            image_view: view,
+            image_layout: vk::ImageLayout::GENERAL,
+        }];
+        self.write(device, 2, vk::DescriptorType::STORAGE_IMAGE, slot, &info);
+        tracing::trace!(target: "rhi_vulkan::texture", binding = 2, slot, "bindless descriptor written");
     }
 
     /// Writes a sampler descriptor into binding 1. `slot < sampler_capacity`.
@@ -274,10 +309,16 @@ mod tests {
         assert_eq!(bindless_capacity(100, 65536), 100);
         assert_eq!(bindless_capacity(65536, 65536), 65536);
         assert_eq!(bindless_capacity(1_000_000, 65536), 65536);
-        let l = BindlessLimits::from_device(1_000_000, 500);
-        assert_eq!((l.sampled_images, l.samplers), (65536, 500));
-        let l = BindlessLimits::from_device(2000, 5000);
-        assert_eq!((l.sampled_images, l.samplers), (2000, 1024));
+        let l = BindlessLimits::from_device(1_000_000, 500, 90);
+        assert_eq!(
+            (l.sampled_images, l.samplers, l.storage_images),
+            (65536, 500, 90)
+        );
+        let l = BindlessLimits::from_device(2000, 5000, 1_000_000);
+        assert_eq!(
+            (l.sampled_images, l.samplers, l.storage_images),
+            (2000, 1024, 65536)
+        );
     }
 
     #[test]
@@ -285,20 +326,25 @@ mod tests {
         let d = layout_binding_descs(BindlessLimits {
             sampled_images: 7,
             samplers: 3,
+            storage_images: 5,
         });
         let f = vk::DescriptorBindingFlags::PARTIALLY_BOUND
             | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND;
         assert_eq!(d[0], (0, vk::DescriptorType::SAMPLED_IMAGE, 7, f));
         assert_eq!(d[1], (1, vk::DescriptorType::SAMPLER, 3, f));
+        assert_eq!(d[2], (2, vk::DescriptorType::STORAGE_IMAGE, 5, f));
         assert!(!f.contains(vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT));
     }
 
     #[test]
-    fn push_range_is_128_all_graphics() {
+    fn push_range_is_128_graphics_and_compute() {
         let r = push_range();
         assert_eq!(r.offset, 0);
         assert_eq!(r.size, 128);
-        assert_eq!(r.stage_flags, vk::ShaderStageFlags::ALL_GRAPHICS);
+        assert_eq!(
+            r.stage_flags,
+            vk::ShaderStageFlags::ALL_GRAPHICS | vk::ShaderStageFlags::COMPUTE
+        );
     }
 
     #[test]

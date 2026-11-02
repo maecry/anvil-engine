@@ -16,6 +16,11 @@ thiserror.workspace = true
 tracing.workspace = true
 bytemuck.workspace = true
 rayon.workspace = true
+meshopt = "0.7.0"
 
 [build-dependencies]
 shaderc = "0.10.1"
+
+[dev-dependencies]
+rhi-vulkan = { path = "../rhi-vulkan" }
+foundation = { path = "../foundation", features = ["log-init"] }

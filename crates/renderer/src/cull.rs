@@ -26,6 +26,11 @@ impl Frustum {
         Self { planes }
     }
 
+    /// The six inward planes (normal xyz, offset w) as plain arrays, for the GPU.
+    pub fn planes(&self) -> [[f32; 4]; 6] {
+        self.planes.map(|p| p.to_array())
+    }
+
     /// True unless the sphere is entirely outside one plane (conservative).
     pub fn intersects_sphere(&self, center: Vec3, radius: f32) -> bool {
         self.planes
@@ -45,15 +50,19 @@ pub(crate) fn bounding_sphere(points: impl Iterator<Item = Vec3> + Clone) -> (Ve
     (center, radius)
 }
 
-/// World-space sphere of an object-space sphere under `model` (radius scaled by the largest axis).
-pub(crate) fn transform_sphere(model: &Mat4, center: Vec3, radius: f32) -> (Vec3, f32) {
-    let scale = model
+/// Largest axis scale of `model`.
+pub(crate) fn max_scale(model: &Mat4) -> f32 {
+    model
         .x_axis
         .truncate()
         .length()
         .max(model.y_axis.truncate().length())
-        .max(model.z_axis.truncate().length());
-    (model.transform_point3(center), radius * scale)
+        .max(model.z_axis.truncate().length())
+}
+
+/// World-space sphere of an object-space sphere under `model` (radius scaled by the largest axis).
+pub(crate) fn transform_sphere(model: &Mat4, center: Vec3, radius: f32) -> (Vec3, f32) {
+    (model.transform_point3(center), radius * max_scale(model))
 }
 
 #[cfg(test)]

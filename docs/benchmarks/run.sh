@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the BENCH-001 workloads 3 times each (release build, vsync off, 1920x1080) and writes
 # docs/benchmarks/results/<date>-<workload>-<tag>.json: the run with the median frame interval,
-# plus a "repetitions" array with all three. Usage: docs/benchmarks/run.sh <tag> (baseline, m5a, ...)
+# plus a "repetitions" array with all three. Usage: docs/benchmarks/run.sh <tag> (baseline, m5a, m5b, ...)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 tag=${1:?usage: run.sh <tag>}
@@ -32,3 +32,5 @@ PY
 workload pbr-scene-forward pbr-scene
 workload pbr-scene-deferred-stress pbr-scene ANVIL_RENDER_PATH=deferred ANVIL_STRESS_LIGHTS=1
 workload many-draws many-draws
+# The M4 CPU path for comparison (ANVIL_GPU_CULLING=0 is ignored by renderers before M5b).
+workload many-draws-cpu-path many-draws ANVIL_GPU_CULLING=0

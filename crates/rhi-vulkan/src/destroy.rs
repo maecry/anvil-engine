@@ -29,6 +29,11 @@ pub(crate) enum Doomed {
         allocation: Allocation,
         slot: TextureHandle,
     },
+    /// A texture view (the image belongs to the parent); `slot` is released afterwards.
+    View {
+        view: vk::ImageView,
+        slot: TextureHandle,
+    },
     Sampler {
         sampler: vk::Sampler,
         slot: SamplerHandle,
@@ -43,6 +48,7 @@ impl Doomed {
             Doomed::Buffer { staging: true, .. } => "staging",
             Doomed::Buffer { .. } => "buffer",
             Doomed::Image { .. } => "image",
+            Doomed::View { .. } => "image_view",
             Doomed::Sampler { .. } => "sampler",
         }
     }
@@ -105,6 +111,10 @@ pub(crate) unsafe fn destroy_doomed(s: &DeviceShared, d: Doomed) {
                 s.free(allocation);
                 write(&s.pools.textures).release(slot);
                 tracing::debug!(target: "rhi_vulkan::texture", slot = slot.index(), "bindless image slot released");
+            }
+            Doomed::View { view, slot } => {
+                s.raw.destroy_image_view(view, None);
+                write(&s.pools.textures).release(slot);
             }
             Doomed::Sampler { sampler, slot } => {
                 s.raw.destroy_sampler(sampler, None);

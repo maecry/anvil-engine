@@ -8,7 +8,8 @@
 //! `ANVIL_SSAO|ANVIL_TAA|ANVIL_BLOOM=0|1`, `ANVIL_EXIT_AFTER_FRAMES=n`,
 //! `ANVIL_SCREENSHOT=path.png` (with `ANVIL_EXIT_AFTER_FRAMES`: writes the last frame),
 //! `ANVIL_BENCH=path.json` (benchmark protocol, see `pbr-scene`), `ANVIL_WINDOW=WxH`,
-//! `ANVIL_VSYNC=0`.
+//! `ANVIL_VSYNC=0`, `ANVIL_GPU_CULLING=0` (the CPU path), `ANVIL_LOD=0|<pixels>`,
+//! `ANVIL_DEBUG_VIEW=lod|occlusion`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,8 +19,8 @@ use anyhow::Context;
 use foundation::math::{Mat4, Quat, Vec3};
 use platform::{App, AppError, Control, Event, KeyCode, Window, WindowConfig};
 use renderer::{
-    Camera, Environment, Light, MaterialDesc, MeshData, MeshInstance, PostSettings, RenderPath,
-    RenderScene, Renderer, Vertex, bench::Bench, mesh,
+    Camera, DebugView, Environment, Light, MaterialDesc, MeshData, MeshInstance, PostSettings,
+    RenderPath, RenderScene, Renderer, Vertex, bench::Bench, mesh,
 };
 use rhi::{
     Acquire, Backend, BufferDesc, BufferUsage, CommandEncoder, Device, DeviceDesc,
@@ -152,6 +153,7 @@ struct ManyDraws {
     gfx: Option<Gfx>,
     path: RenderPath,
     post: PostSettings,
+    debug: DebugView,
     bench: Option<Bench>,
     rendered: u64,
     exit_after: Option<u64>,
@@ -277,6 +279,7 @@ impl ManyDraws {
             Acquire::Minimized => return Ok(false),
         };
         g.renderer.set_render_path(self.path);
+        g.renderer.set_debug_view(self.debug);
         g.renderer.set_post(self.post);
         let scene = RenderScene {
             camera,
@@ -465,6 +468,10 @@ fn main() -> anyhow::Result<()> {
                 taa: env_flag("ANVIL_TAA"),
                 bloom: env_flag("ANVIL_BLOOM"),
             },
+            debug: std::env::var("ANVIL_DEBUG_VIEW")
+                .ok()
+                .and_then(|v| DebugView::from_name(&v))
+                .unwrap_or(DebugView::None),
             bench: None,
             rendered: 0,
             exit_after,

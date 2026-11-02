@@ -1,0 +1,90 @@
+#version 460
+// Camera culling, two-phase (ADR-0013 §6). Phase 0 draws last frame's visible set that is still
+// in the frustum. Phase 1 (after the depth pyramid was built from phase 0's depth) tests every
+// instance against the frustum and the pyramid, draws the newly visible ones and stores the new
+// visible set. Reverse-Z: the pyramid holds the farthest (minimum) depth of each footprint.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_samplerless_texture_functions : require
+#include "cull.glsl"
+
+layout(set = 0, binding = 0) uniform texture2D textures[];
+layout(push_constant, std430) uniform Push { Params params; Commands commands; Counts counts; uint phase; } pc;
+layout(local_size_x = 64) in;
+
+// Conservative screen rect of a sphere (Mara and McGuire, tangent planes) tested against the
+// pyramid. True when the whole sphere is behind everything already drawn in its footprint.
+bool occluded(Params P, vec4 sphere) {
+    vec3 c = (P.p.view * vec4(sphere.xyz, 1.0)).xyz;
+    c.z = -c.z;                                  // forward distance
+    float r = sphere.w, near = P.p.proj.z;
+    if (c.z < r + near) return false;            // reaches the near plane
+    vec3 cr = c * r;
+    float czr2 = c.z * c.z - r * r;
+    float vx = sqrt(c.x * c.x + czr2);
+    float minx = (vx * c.x - cr.z) / (vx * c.z + cr.x);
+    float maxx = (vx * c.x + cr.z) / (vx * c.z - cr.x);
+    float vy = sqrt(c.y * c.y + czr2);
+    float miny = (vy * c.y - cr.z) / (vy * c.z + cr.y);
+    float maxy = (vy * c.y + cr.z) / (vy * c.z - cr.y);
+    float ya = miny * P.p.proj.y * 0.5 + 0.5, yb = maxy * P.p.proj.y * 0.5 + 0.5;   // P11 < 0 flips y
+    vec4 rect = clamp(vec4(minx * P.p.proj.x * 0.5 + 0.5, min(ya, yb), maxx * P.p.proj.x * 0.5 + 0.5, max(ya, yb)), 0.0, 1.0);
+    ivec2 size0 = ivec2(P.p.pyramid.yz);
+    float extent = max((rect.z - rect.x) * float(size0.x), (rect.w - rect.y) * float(size0.y));
+    int level = clamp(int(ceil(log2(max(extent, 1.0)))), 0, int(P.p.pyramid.w) - 1);
+    ivec2 size = max(size0 >> level, ivec2(1));
+    ivec2 lo = clamp(ivec2(rect.xy * vec2(size)), ivec2(0), size - 1);
+    ivec2 hi = clamp(ivec2(rect.zw * vec2(size)), ivec2(0), size - 1);
+    uint t = P.p.pyramid.x;
+    float farthest = min(min(texelFetch(textures[nonuniformEXT(t)], ivec2(lo.x, lo.y), level).x,
+                             texelFetch(textures[nonuniformEXT(t)], ivec2(hi.x, lo.y), level).x),
+                         min(texelFetch(textures[nonuniformEXT(t)], ivec2(lo.x, hi.y), level).x,
+                             texelFetch(textures[nonuniformEXT(t)], ivec2(hi.x, hi.y), level).x));
+    // Reverse-Z infinite far: depth = near / distance. The 0.2 % margin absorbs the TAA jitter
+    // the depth was rendered with.
+    float nearest = near / (c.z - r);
+    return nearest * 1.002 < farthest;
+}
+
+void main() {
+    Params P = pc.params;
+    Counts counts = pc.counts;
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= P.p.instance_count) return;
+    Instance inst = P.p.instances.i[i];
+    bool drawable = (inst.flags & 12u) == 8u;    // valid and not blended
+    bool prev = drawable && P.p.visible.v[i] != 0u;
+    if (pc.phase == 0u) {
+        if (!prev || !in_frustum(P, 0u, inst.sphere)) return;
+        MeshRecord m = P.p.meshes.m[inst.mesh];
+        uint lod = select_lod(P, m, inst);
+        emit_draw(P, pc.commands, counts, 0u, inst.flags & 3u, m, lod, i, 0u);
+        atomicAdd(counts.c[STATS + 3u], m.index_count[lod] / 3u);
+        atomicAdd(counts.c[STATS + 4u], 1u);
+        return;
+    }
+    if (!drawable) {
+        P.p.visible.v[i] = 0u;
+        return;
+    }
+    if (!in_frustum(P, 0u, inst.sphere)) {
+        P.p.visible.v[i] = 0u;
+        atomicAdd(counts.c[STATS + 1u], 1u);
+        return;
+    }
+    if (occluded(P, inst.sphere)) {
+        P.p.visible.v[i] = 0u;
+        atomicAdd(counts.c[STATS + 2u], 1u);
+        return;
+    }
+    P.p.visible.v[i] = 1u;
+    atomicAdd(counts.c[STATS + 0u], 1u);
+    if (prev) return;                            // already drawn by phase 0
+    MeshRecord m = P.p.meshes.m[inst.mesh];
+    uint lod = select_lod(P, m, inst);
+    emit_draw(P, pc.commands, counts, 1u, inst.flags & 3u, m, lod, i, 0x80000000u);
+    atomicAdd(counts.c[STATS + 3u], m.index_count[lod] / 3u);
+    atomicAdd(counts.c[STATS + 4u], 1u);
+    atomicAdd(counts.c[STATS + 5u], 1u);
+}

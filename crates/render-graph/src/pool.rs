@@ -1,26 +1,25 @@
-//! Cross-frame pool of transient textures (ADR-0012 §6).
+//! Cross-frame pool of transient textures and buffers (ADR-0012 §6), generic over the
+//! description `D` (the key), the handle `H` and the state `S` a pooled object was left in.
 
-use rhi::{RhiError, TextureHandle, TextureState};
-
-use crate::plan::TransientDesc;
+use rhi::RhiError;
 
 /// Unused entries are destroyed after this many frames.
 pub(crate) const EVICT_AFTER_FRAMES: u64 = 8;
 
-pub(crate) struct Entry {
-    pub desc: TransientDesc,
-    pub texture: TextureHandle,
-    /// State the texture was left in by its last frame.
-    pub state: TextureState,
+pub(crate) struct Entry<D, H, S> {
+    pub desc: D,
+    pub handle: H,
+    /// State the object was left in by its last frame.
+    pub state: S,
     last_used: u64,
 }
 
-pub(crate) struct TransientPool {
-    pub entries: Vec<Entry>,
+pub(crate) struct TransientPool<D, H, S> {
+    pub entries: Vec<Entry<D, H, S>>,
     frames_in_flight: u64,
 }
 
-impl TransientPool {
+impl<D: PartialEq + Copy, H: Copy, S: Copy> TransientPool<D, H, S> {
     pub fn new(frames_in_flight: u32) -> Self {
         Self {
             entries: Vec::new(),
@@ -34,9 +33,10 @@ impl TransientPool {
     // (and alias memory) when M5 adds many resolution-sized targets.
     pub fn acquire(
         &mut self,
-        desc: TransientDesc,
+        desc: D,
         frame: u64,
-        create: impl FnOnce() -> Result<TextureHandle, RhiError>,
+        initial: S,
+        create: impl FnOnce() -> Result<H, RhiError>,
     ) -> Result<(usize, bool), RhiError> {
         let fif = self.frames_in_flight;
         if let Some(i) = self
@@ -49,21 +49,21 @@ impl TransientPool {
         }
         self.entries.push(Entry {
             desc,
-            texture: create()?,
-            state: TextureState::Undefined,
+            handle: create()?,
+            state: initial,
             last_used: frame,
         });
         Ok((self.entries.len() - 1, true))
     }
 
-    /// Removes entries unused for [`EVICT_AFTER_FRAMES`], handing their textures to `destroy`.
+    /// Removes entries unused for [`EVICT_AFTER_FRAMES`], handing their objects to `destroy`.
     /// Indices handed out by `acquire` are invalid afterwards.
-    pub fn evict(&mut self, frame: u64, mut destroy: impl FnMut(TextureHandle)) -> usize {
+    pub fn evict(&mut self, frame: u64, mut destroy: impl FnMut(H)) -> usize {
         let before = self.entries.len();
         self.entries.retain(|e| {
             let dead = e.last_used + EVICT_AFTER_FRAMES <= frame;
             if dead {
-                destroy(e.texture);
+                destroy(e.handle);
             }
             !dead
         });
@@ -74,7 +74,10 @@ impl TransientPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rhi::{Format, TextureTag, TextureUsage};
+    use crate::plan::TransientDesc;
+    use rhi::{Format, TextureHandle, TextureState, TextureTag, TextureUsage};
+
+    type TransientPool = super::TransientPool<TransientDesc, TextureHandle, TextureState>;
 
     fn desc(w: u32) -> TransientDesc {
         TransientDesc {
@@ -96,8 +99,10 @@ mod tests {
         let mut pool = TransientPool::new(2);
         let mut next = h.iter().copied();
         let mut get = |pool: &mut TransientPool, frame| {
-            pool.acquire(desc(8), frame, || Ok(next.next().unwrap()))
-                .unwrap()
+            pool.acquire(desc(8), frame, TextureState::Undefined, || {
+                Ok(next.next().unwrap())
+            })
+            .unwrap()
         };
         assert_eq!(get(&mut pool, 1), (0, true));
         // Frame 2 may still overlap frame 1 on the GPU: a second texture is created.
@@ -106,15 +111,21 @@ mod tests {
         assert_eq!(get(&mut pool, 3), (0, false));
         assert_eq!(get(&mut pool, 4), (1, false));
         // A different desc never matches.
-        assert_eq!(pool.acquire(desc(16), 5, || Ok(h[2])).unwrap(), (2, true));
+        assert_eq!(
+            pool.acquire(desc(16), 5, TextureState::Undefined, || Ok(h[2]))
+                .unwrap(),
+            (2, true)
+        );
     }
 
     #[test]
     fn unused_entries_are_evicted() {
         let h = handles(2);
         let mut pool = TransientPool::new(2);
-        pool.acquire(desc(8), 1, || Ok(h[0])).unwrap();
-        pool.acquire(desc(16), 5, || Ok(h[1])).unwrap();
+        pool.acquire(desc(8), 1, TextureState::Undefined, || Ok(h[0]))
+            .unwrap();
+        pool.acquire(desc(16), 5, TextureState::Undefined, || Ok(h[1]))
+            .unwrap();
         let mut destroyed = Vec::new();
         assert_eq!(
             pool.evict(1 + EVICT_AFTER_FRAMES - 1, |t| destroyed.push(t)),

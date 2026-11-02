@@ -63,6 +63,7 @@ pub(crate) struct PhysicalDeviceFacts {
     pub bindless_sampled_images: u32,
     /// `L_smp` of MODULE-007 §6.3.
     pub bindless_samplers: u32,
+    pub bindless_storage_images: u32,
     pub max_image_dimension_2d: u32,
     pub non_coherent_atom_size: u64,
     pub queue_families: Vec<QueueFamilyFacts>,
@@ -550,6 +551,9 @@ fn gather_facts(
         bindless_samplers: p12
             .max_per_stage_descriptor_update_after_bind_samplers
             .min(p12.max_descriptor_set_update_after_bind_samplers),
+        bindless_storage_images: p12
+            .max_per_stage_descriptor_update_after_bind_storage_images
+            .min(p12.max_descriptor_set_update_after_bind_storage_images),
         max_image_dimension_2d: props.limits.max_image_dimension2_d,
         non_coherent_atom_size: props.limits.non_coherent_atom_size,
         queue_families,
@@ -620,7 +624,16 @@ pub(crate) fn create_device_with(
         .runtime_descriptor_array(true)
         .shader_sampled_image_array_non_uniform_indexing(true)
         .descriptor_binding_sampled_image_update_after_bind(true)
-        .descriptor_binding_partially_bound(true);
+        .descriptor_binding_partially_bound(true)
+        // M5b: bindless storage images and GPU-driven rendering. shortcut: enabled without a
+        // capability check (all desktop Vulkan 1.3 drivers have them), add facts and a
+        // Rejection when a driver without them has to be supported.
+        .shader_storage_image_array_non_uniform_indexing(true)
+        .descriptor_binding_storage_image_update_after_bind(true)
+        .draw_indirect_count(true);
+    let features = vk::PhysicalDeviceFeatures::default()
+        .multi_draw_indirect(true)
+        .draw_indirect_first_instance(true);
     let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
         .dynamic_rendering(true)
         .synchronization2(true)
@@ -629,6 +642,7 @@ pub(crate) fn create_device_with(
         .shader_demote_to_helper_invocation(true);
     let ci = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_ci)
+        .enabled_features(&features)
         .enabled_extension_names(&ext_names)
         .push_next(&mut f12)
         .push_next(&mut f13);
@@ -637,7 +651,11 @@ pub(crate) fn create_device_with(
         .map_err(|r| map_vk("vkCreateDevice", r))?;
 
     let limits = bindless_override.unwrap_or_else(|| {
-        BindlessLimits::from_device(f.bindless_sampled_images, f.bindless_samplers)
+        BindlessLimits::from_device(
+            f.bindless_sampled_images,
+            f.bindless_samplers,
+            f.bindless_storage_images,
+        )
     });
     let bindings = match GlobalBindings::new(&raw, limits) {
         Ok(b) => b,
@@ -952,6 +970,18 @@ impl rhi::Device for VulkanDevice {
         texture::create_texture(&self.shared, desc)
     }
 
+    fn create_texture_view(
+        &self,
+        parent: TextureHandle,
+        desc: &rhi::TextureViewDesc,
+    ) -> Result<TextureHandle, RhiError> {
+        texture::create_texture_view(&self.shared, parent, desc)
+    }
+
+    fn storage_index(&self, h: TextureHandle) -> Result<u32, RhiError> {
+        texture::storage_index(&self.shared, h)
+    }
+
     fn destroy_texture(&self, h: TextureHandle) {
         texture::destroy_texture(&self.shared, h);
     }
@@ -1013,6 +1043,13 @@ impl rhi::Device for VulkanDevice {
         desc: &GraphicsPipelineDesc,
     ) -> Result<PipelineHandle, RhiError> {
         crate::commands::create_graphics_pipeline(&self.shared, desc)
+    }
+
+    fn create_compute_pipeline(
+        &self,
+        desc: &rhi::ComputePipelineDesc,
+    ) -> Result<PipelineHandle, RhiError> {
+        crate::commands::create_compute_pipeline(&self.shared, desc)
     }
 
     fn destroy_shader_module(&self, h: ShaderModuleHandle) {
@@ -1123,6 +1160,7 @@ mod tests {
             descriptor_binding_partially_bound: true,
             bindless_sampled_images: 65536,
             bindless_samplers: 1024,
+            bindless_storage_images: 4096,
             max_image_dimension_2d: 16384,
             non_coherent_atom_size: 64,
             queue_families: vec![QueueFamilyFacts {

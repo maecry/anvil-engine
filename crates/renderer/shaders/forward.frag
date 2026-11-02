@@ -8,6 +8,7 @@ layout(location = 1) in vec3 v_normal;
 layout(location = 2) in vec2 v_uv;
 layout(location = 3) in vec4 v_tangent;
 layout(location = 4) flat in uint v_material;
+layout(location = 7) flat in uint v_flags;
 layout(location = 0) out vec4 out_color;
 
 void main() {
@@ -19,5 +20,5 @@ void main() {
     vec3 diff, spec;
     shade(s, v_world_pos, gl_FragCoord.xy, diff, spec);
     vec3 color = debug_view(f, diff * s.alpha + spec, v_world_pos, gl_FragCoord.xy);
-    out_color = vec4(color, s.alpha);
+    out_color = vec4(color * instance_tint(f.debug_mode, v_flags), s.alpha);
 }

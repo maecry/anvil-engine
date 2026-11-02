@@ -119,3 +119,7 @@ Unit tests against `NullBackend` or no backend at all: add/update/remove semanti
 6. Resolved (ADR-0011 §2): full rebuild per frame.
 7. Resolved (ADR-0011 §4): AoS, world matrices pre-multiplied (plus a normal matrix).
 8. How draw lists feed render-graph passes without the graph depending on renderer types (MODULE-009 Q7); the M3 pass functions take explicit input structs for this reason.
+
+## 16. M5b: persistent scene and GPU-driven culling (as built)
+
+The render world of M3 stays implicit in `Renderer`; M5b makes its instance state persistent (LAYER-005 M5b, LAYER-007 §17): `SceneCache` (`prep.rs`) diffs `RenderScene::meshes` against the previous frame by index and keeps, per slot, the resolved `Item` (world sphere, `Draw`), the mirror of the GPU `GpuInstance` (224 bytes) and the list of changed slots; the instance buffer, the `visible` flags, the mesh table and the arena are GPU-resident and updated incrementally. `Renderer::update`-style change detection is therefore an implementation detail of `render`: the public API is unchanged except `MeshData::lods`, `Renderer::set_gpu_culling`, `Renderer::set_lod_pixels`, `DebugView::{Lod, Occlusion}`, `RendererStats::{cull, gpu_culling, instances, instances_uploaded}` and the public type `CullStats`. `MeshInstance` gained `PartialEq` (it is the change detector). The visible set of the concept above is the GPU `visible` buffer; draw lists exist only for blended objects and for the CPU oracle path.

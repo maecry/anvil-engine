@@ -37,3 +37,14 @@ float surface_alpha(uint material, uint smp, vec2 uv) {
     Material m = pc.materials.m[material];
     return m.base_color.a * sample_tex(m.base_color_tex, smp, uv).a;
 }
+
+// Per-instance debug tints (debug_mode 4: LOD level, 5: drawn by occlusion phase 2). `flags` is
+// forward.vert's v_flags: LOD in bits 0-2, phase 2 in bit 3.
+vec3 instance_tint(uint mode, uint flags) {
+    if (mode == 4u) {
+        const vec3 lod[4] = vec3[4](vec3(0.3, 1.0, 0.3), vec3(1.0, 1.0, 0.2), vec3(1.0, 0.5, 0.1), vec3(1.0, 0.15, 0.15));
+        return lod[min(flags & 7u, 3u)];
+    }
+    if (mode == 5u && (flags & 8u) != 0u) return vec3(1.0, 0.1, 1.0);
+    return vec3(1.0);
+}

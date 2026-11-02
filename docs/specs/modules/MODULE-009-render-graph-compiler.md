@@ -57,9 +57,18 @@ let stats = graph.execute(compiled, &device, &mut cmd, &frame)?;
 
 Errors: `GraphError { ReadBeforeWrite, ReadAndWrite, BoundTwice, NoInitialState, ExtentMismatch, ExportUnwritten, Rhi }`.
 
+M5b additions (LAYER-006 §8b): `b.transient_buffer(name, TransientBufferDesc { size, usage })`, `b.import_buffer(name, buffer, initial)`, `Pass::read_buffer / write_buffer / modify_buffer(buf, BufferState)` and `Pass::write_storage(tex)`; bodies use `ctx.buffer(id)` and `ctx.buffer_address(id)`. A culling frame in short:
+
+```rust
+let counts = b.transient_buffer("cull.counts", TransientBufferDesc { size: 192, usage: STORAGE | INDIRECT | TRANSFER_DST });
+b.pass(Pass::new("cull.reset").write_buffer(counts, BufferState::TransferDst), move |ctx| { ctx.cmd.fill_buffer(ctx.buffer(counts), 0, 192, 0); Ok(()) });
+b.pass(Pass::new("cull").read_buffer(instances, BufferState::ShaderRead).modify_buffer(counts, BufferState::ShaderWrite), /* dispatch */);
+b.pass(Pass::new("draw").read_buffer(counts, BufferState::Indirect).color(hdr, ..), /* draw_indexed_indirect_count */);
+```
+
 ## 6. Data structures
 
-`plan.rs` (pure): `Decls { res: Vec<ResDecl>, passes: Vec<Pass>, exports }` in; `Plan { live, order, barriers: Vec<Barrier { before, tex, from, to }>, lifetime, slot_of, slots, slot_final, res_final }` out. `pool.rs`: `TransientPool { entries: Vec<Entry { desc, texture, state, last_used }> }`. `describe.rs`: `GraphDescription` (plain data, DOT and JSON writers). `lib.rs`: builder, `CompiledGraph`, `RenderGraph { states: HashMap<TextureHandle, TextureState>, pool }`, execution. Compile output is a pure function of the declarations and the remembered states.
+`plan.rs` (pure): `Decls { res: Vec<ResDecl>, passes: Vec<Pass>, exports }` in (`ResKind` is `Transient`, `Imported`, `TransientBuf` or `ImportedBuf`; one index space shared by `TexId` and `BufId`); `Plan { live, order, barriers: Vec<Barrier { before, tex, from: St, to: St }>, lifetime, slot_of, slots, slot_final, res_final: Vec<St> }` out, where `St` is `T(TextureState)` or `B(BufferState)`. `pool.rs`: `TransientPool<D, H, S> { entries: Vec<Entry { desc, handle, state, last_used }> }`, one instance for textures and one for buffers. `describe.rs`: `GraphDescription` (plain data, DOT and JSON writers). `lib.rs`: builder, `CompiledGraph`, `RenderGraph { states: HashMap<TextureHandle, TextureState>, pool }`, execution. Compile output is a pure function of the declarations and the remembered states.
 
 ## 7. Ownership and lifetime
 
@@ -115,3 +124,7 @@ As LAYER-006 §13. Unit tests: `plan::tests` (ordering and barrier states, culli
 5. Multi-queue: M5.
 6. Final state of the swapchain image: the caller passes it to `Renderer::render`, which `export`s it (`Present` or `TransferSrc`).
 7. Draw lists: passes capture renderer data in their closures; the graph never sees meshes.
+
+## 16. M5b status
+
+Compute passes, buffers (transient and imported) with `BufferState` barriers, `StorageWrite` textures and per-mip tracking through view textures are implemented (LAYER-006 §8b); open question 1 is resolved by them. Not done (ADR-0013 §5 conditional items): transient memory aliasing (the pool still gives every transient its own memory; BENCH-001 VRAM, 260 to 312 MiB allocated, did not justify it) and async compute (one graphics queue; the culling passes depend on the frame's earlier work, so there is little to overlap on this renderer). Unit tests in `plan.rs` and `pool.rs`; GPU coverage through the renderer (LAYER-005 M5b).

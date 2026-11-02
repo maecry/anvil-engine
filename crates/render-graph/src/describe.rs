@@ -80,11 +80,15 @@ pub(crate) fn describe(d: &Decls, p: &Plan) -> GraphDescription {
         .enumerate()
         .map(|(i, r)| ResourceDesc {
             name: r.name.to_string(),
-            imported: matches!(r.kind, ResKind::Imported { .. }),
+            imported: matches!(
+                r.kind,
+                ResKind::Imported { .. } | ResKind::ImportedBuf { .. }
+            ),
             extent: r.extent(),
             format: match &r.kind {
                 ResKind::Transient(t) => Some(format!("{:?}", t.format)),
-                ResKind::Imported { .. } => None,
+                ResKind::TransientBuf(b) => Some(format!("buffer, {} bytes", b.size)),
+                ResKind::Imported { .. } | ResKind::ImportedBuf { .. } => None,
             },
             lifetime: p.lifetime[i],
             slot: p.slot_of[i],
@@ -96,8 +100,8 @@ pub(crate) fn describe(d: &Decls, p: &Plan) -> GraphDescription {
         .map(|b| BarrierDesc {
             before_pass: p.order.get(b.before).map(|&i| d.passes[i].name.to_string()),
             texture: name(b.tex),
-            from: format!("{:?}", b.from),
-            to: format!("{:?}", b.to),
+            from: b.from.name(),
+            to: b.to.name(),
         })
         .collect();
     GraphDescription {

@@ -373,6 +373,9 @@ fn tex_desc(w: u32, h: u32, format: Format, usage: TextureUsage) -> TextureDesc<
         height: h,
         format,
         usage,
+        mip_levels: 1,
+        array_layers: 1,
+        cube: false,
     }
 }
 

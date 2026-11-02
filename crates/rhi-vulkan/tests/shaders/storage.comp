@@ -1,0 +1,10 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+layout(set = 0, binding = 2, r32f) uniform writeonly image2D storage_images[];
+layout(push_constant, std430) uniform Push { uint slot; uint w; uint h; float value; } pc;
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x < pc.w && p.y < pc.h) imageStore(storage_images[nonuniformEXT(pc.slot)], p, vec4(pc.value + float(p.x)));
+}

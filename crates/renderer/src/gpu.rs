@@ -46,15 +46,80 @@ pub(crate) struct GpuFrame {
     pub cluster_params: [f32; 4],
 }
 
-/// Per-instance data.
+/// Persistent per-instance data (`Instance` in `types.glsl`): transforms, world bounds and the
+/// ids the GPU culling pass needs. Lives in the persistent instance buffer, indexed by the
+/// instance's position in the scene.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(crate) struct GpuInstance {
     pub model: Mat4,
     pub normal_matrix: Mat4,
     pub prev_model: Mat4,
+    /// World-space bounding sphere: center xyz, radius w.
+    pub sphere: [f32; 4],
     pub material: u32,
-    pub pad: [u32; 3],
+    /// Index of the mesh record in the mesh table.
+    pub mesh: u32,
+    /// Bits 0-1 pipeline variant, bit 2 blended, bit 3 valid ([`FLAG_VALID`], [`FLAG_BLEND`]).
+    pub flags: u32,
+    /// Largest axis scale of `model` (object error to world error).
+    pub scale: f32,
+}
+
+/// Instance has a resolvable mesh and material.
+pub(crate) const FLAG_VALID: u32 = 8;
+/// Instance is alpha-blended: drawn by the CPU transparent pass, never by GPU culling.
+pub(crate) const FLAG_BLEND: u32 = 4;
+
+/// A mesh arena record (`MeshRecord` in `types.glsl`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub(crate) struct GpuMesh {
+    /// Object-space bounding sphere: center xyz, radius w.
+    pub sphere: [f32; 4],
+    pub first_index: [u32; 4],
+    pub index_count: [u32; 4],
+    /// Object-space error of each level of detail (level 0 = 0).
+    pub lod_error: [f32; 4],
+    pub vertex_offset: i32,
+    pub lod_count: u32,
+    pub pad: [u32; 2],
+}
+
+/// Number of culling views: camera phase 1 and 2, 4 cascades, 4 spot lights.
+pub(crate) const CULL_VIEWS: usize = 10;
+/// Pipeline variants per view (`Draw::variant`).
+pub(crate) const VARIANTS: usize = 4;
+/// Index of the first statistics counter after the `CULL_VIEWS * VARIANTS` draw counters.
+pub(crate) const STATS: usize = CULL_VIEWS * VARIANTS;
+/// Statistics words: visible, frustum culled, occlusion culled, triangles, camera draws,
+/// phase 2 draws, shadow draws, spare.
+pub(crate) const STAT_WORDS: usize = 8;
+/// Bytes of the counts buffer (draw counters then statistics).
+pub(crate) const COUNTS_BYTES: u64 = ((STATS + STAT_WORDS) * 4) as u64;
+
+/// Parameters of the culling compute passes (`CullParams` in `cull.glsl`).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct GpuCullParams {
+    /// Inward frustum planes of 9 views: the camera, then 4 cascades and 4 spot lights.
+    pub planes: [[[f32; 4]; 6]; 9],
+    pub view: Mat4,
+    /// P00, P11, near, LOD error threshold in pixels.
+    pub proj: [f32; 4],
+    /// Camera position, pixels per world unit at distance 1.
+    pub cam: [f32; 4],
+    /// Depth pyramid: bindless slot, mip 0 width and height, mip count.
+    pub pyramid: [u32; 4],
+    pub instances: [u32; 2],
+    pub meshes: [u32; 2],
+    pub visible: [u32; 2],
+    pub instance_count: u32,
+    pub view_mask: u32,
+    pub pad: [u32; 2],
+    /// First command of each (view, variant) region.
+    pub region: [[u32; VARIANTS]; CULL_VIEWS],
+    pub pad2: [u32; 2],
 }
 
 /// One light; see `common.glsl` for the field meaning.
@@ -153,7 +218,9 @@ mod tests {
     #[test]
     fn layouts_match_std430() {
         assert_eq!(size_of::<GpuFrame>(), 1200);
-        assert_eq!(size_of::<GpuInstance>(), 208);
+        assert_eq!(size_of::<GpuInstance>(), 224);
+        assert_eq!(size_of::<GpuMesh>(), 80);
+        assert_eq!(size_of::<GpuCullParams>(), 1184);
         assert_eq!(size_of::<GpuLight>(), 64);
         assert_eq!(size_of::<GpuMaterial>(), 80);
     }

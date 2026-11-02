@@ -1,10 +1,10 @@
 # BENCH-001: Benchmark baseline
 
-- Status: Accepted (M5a, 2026-11-02)
+- Status: Accepted (M5b, 2026-11-02)
 - Implements: MASTER-004 §5, ADR-0013 §1; supports NFR-PERF-001..015
-- Results: `docs/benchmarks/results/2026-11-02-<workload>-<tag>.json` (`baseline`, `m5a`)
+- Results: `docs/benchmarks/results/2026-11-02-<workload>-<tag>.json` (`baseline`, `m5a`, `m5b`; plus `many-draws-cpu-path-m5b`)
 
-MASTER-000 §4.3 and §22 p3 forbid performance targets until this spec exists. It defines how the engine is measured and records the M4 renderer's numbers (the baseline) and the first optimization against them (M5a threading). **No target is set**: targets need more workloads (asset loading, streaming) and a second machine.
+MASTER-000 §4.3 and §22 p3 forbid performance targets until this spec exists. It defines how the engine is measured and records the M4 renderer's numbers (the baseline) and the optimizations against them (M5a threading, M5b GPU-driven rendering). **No target is set**: targets need more workloads (asset loading, streaming) and a second machine.
 
 ## 1. Reference hardware (MASTER-004 §5 "Reference hardware")
 
@@ -161,6 +161,39 @@ Notes:
 - `pbr-scene-deferred-stress` graph recording stages read 0.072 ms before and 0.097 ms after; the +0.025 ms is in the 25 % noise band of such short stages (the cluster assignment now wakes the pool, and the main thread's caches and frequency are affected). The workload remains GPU-bound; its interval and GPU time are unchanged.
 - Two failed first attempts are worth recording: a naive `par_iter().collect()` of the packing made the stage slower with more threads (3.5 ms at 20 threads against 2.7 ms serial) because 14 MB of freshly allocated vectors page-faulted on first touch every frame; reusing the buffers fixed it. And parallelizing tiny scenes doubled the CPU frame of `pbr-scene-forward` (0.103 to 0.26 ms) until inputs under 2048 instances or 16 lights ran on the calling thread.
 - Results are identical to the serial path: unit tests compare against plain serial code and a 1-thread pool, and the `many-draws` screenshot at frame 240 is byte-identical before and after.
+
+## 12. M5b: GPU-driven rendering before/after
+
+M5b replaces the per-frame instance pack and upload, the CPU culling and the one-draw-per-instance recording with a persistent GPU scene, GPU frustum and two-phase Hi-Z occlusion culling, LOD selection and indirect draws (LAYER-005 M5b). Same machine and protocol, `m5b` files; the median of three runs is committed. Defaults: GPU culling on, LOD threshold 0.5 px. Median / p99 in ms; the last two columns are the median change against M5a and against the baseline.
+
+| Workload | Metric | Baseline | M5a | M5b | vs M5a | vs baseline |
+|---|---|---|---|---|---|---|
+| pbr-scene-forward | CPU frame | 0.103 / 0.208 | 0.104 / 0.155 | 0.109 / 0.246 | +4.9 % | +5.7 % |
+| pbr-scene-forward | Frame interval | 0.862 / 1.008 | 0.856 / 0.991 | 0.864 / 1.022 | +1.0 % | +0.3 % |
+| pbr-scene-forward | GPU frame | 0.838 / 0.899 | 0.836 / 0.897 | 0.844 / 0.913 | +0.9 % | +0.7 % |
+| pbr-scene-deferred-stress | CPU frame | 0.381 / 0.441 | 0.311 / 0.486 | 0.327 / 0.503 | +5.4 % | -14.2 % |
+| pbr-scene-deferred-stress | Frame interval | 0.914 / 1.047 | 0.911 / 1.124 | 0.931 / 1.155 | +2.2 % | +1.9 % |
+| pbr-scene-deferred-stress | GPU frame | 0.896 / 0.947 | 0.891 / 0.937 | 0.912 / 0.973 | +2.4 % | +1.8 % |
+| many-draws | CPU frame | 9.272 / 10.405 | 7.184 / 8.382 | **0.606 / 0.796** | **-91.6 %** | **-93.5 %** |
+| many-draws | Frame interval | 9.518 / 10.678 | 7.259 / 8.479 | **1.276 / 1.491** | **-82.4 %** | **-86.6 %** |
+| many-draws | GPU frame | 2.220 / 2.446 | 2.208 / 2.425 | **1.248 / 1.365** | **-43.5 %** | **-43.8 %** |
+| many-draws, `ANVIL_GPU_CULLING=0` | CPU frame | | | 1.908 / 2.693 | | |
+| many-draws, `ANVIL_GPU_CULLING=0` | Frame interval | | | 1.954 / 2.745 | | |
+| many-draws, `ANVIL_GPU_CULLING=0` | GPU frame | | | 1.556 / 1.730 | | |
+
+Counters of the last frame (GPU path `many-draws`, read back with the 2 frame delay): 50 001 instances, 39 809 frustum-culled, 140 occlusion-culled, 10 052 visible, 10 150 camera indirect draws (45 from phase 2), 3 454 shadow draws, **502 576 triangles after LOD against 2 862 742** (-82 %), 0 instances uploaded per frame (the baseline packed and uploaded all 50 001, 10.4 MB, every frame). `pbr-scene` (26 instances): 23 visible, 0 culled, 32 272 camera triangles after LOD against 53 008 submitted before (the sphere LODs).
+
+CPU stages, `many-draws` medians (ms), M5a to M5b: pack 0.807 to 0.102 (now the change detection: one compare per instance), cull 0.154 to 0.000, sort 0.195 to 0.000, shadow_lists 0.141 to 0.000, upload 0.967 to 0.007, execute 4.236 to 0.071 (about 50 indirect draw calls and 20 dispatches instead of about 24 000 `draw_indexed` calls). What remains is the cluster assignment (0.021), graph build and compile (0.028) and the application's own scene extraction. The GPU path scales with the GPU, not the draw count.
+
+GPU, `many-draws` per pass medians (ms), M5a to M5b: prepass 0.485 to 0.205 (+ `prepass.p2` 0.007), forward 1.026 to 0.492, shadow.cascade3 0.258 to 0.106, ssao 0.069 to 0.037, culling passes `cull.shadow` 0.033, `cull.camera.p1` 0.012, `cull.camera.p2` 0.022, depth pyramid `hiz.0..9` 0.024 in total, `cull.stats` 0.003: the whole culling machinery costs about 0.10 ms of the 1.25 ms frame. The frame is now GPU-bound (interval 1.276 against GPU 1.248 ms) and CPU 0.6 ms: the CPU idles 52 %.
+
+**The CPU path (`ANVIL_GPU_CULLING=0`) also improved** on the same persistent buffers: CPU frame 7.18 to 1.91 ms (no instance pack or upload; the draw loop writes the push constants and binds the index buffer once per pass instead of per draw, `execute` 4.24 to 0.79 ms) and GPU frame 2.21 to 1.56 ms (less state per draw), still drawing 2.86 M triangles at level 0. So of the 7.18 to 0.61 ms gain, about 5.3 ms comes from the arena and the persistent scene and 1.3 ms from GPU culling, LOD and indirect draws.
+
+**GPU on `pbr-scene` (reported honestly):** forward +0.9 % (0.836 to 0.844 ms, p99 0.897 to 0.913), deferred with 259 lights +2.4 % (0.891 to 0.912 ms). Not a regression by the 10 % rule of section 9 and at the 5 % noise level of section 8, but it is consistent across the three runs: a 26-instance scene gains nothing from GPU culling and pays for the extra passes, the eleven pyramid dispatches (`hiz.*`, 0.024 ms), `prepass.p2` (0.006), `cull.stats` and the culling dispatches (0.010), about 0.04 ms, of which the LOD savings (sphere levels in the shadow and forward passes: forward 0.350 to 0.337 ms, cascade 0 0.072 to 0.064) take back about 0.03 ms. The pbr-scene CPU frame rose 0.104 to 0.109 ms (+4.9 %, about 20 more passes to declare and record). VRAM allocated: pbr-scene 260 to 280 MiB, many-draws 260 to 312 MiB (the 16 MiB arena, the 14.7 MiB instance buffer at 65 536 slots, the 10 MiB command buffer, the pyramid).
+
+Visual equivalence (screenshots at frame 120, 1242x1350, pixel diffs in `docs/benchmarks/README.md`): with `ANVIL_LOD=0` the GPU path is **byte-identical** to the CPU path and to the M5a build for `many-draws` (also at frames 2, 61, 400 and 900) and `pbr-scene` (forward and deferred), so frustum and occlusion culling are exact on these scenes; with the default 0.5 px LOD `pbr-scene` differs in 0.22 % of the pixels (0.003 % by more than 8/255, maximum 69) and `many-draws` in 6.7 % (0.67 % by more than 8/255, mean absolute difference 0.2/255), at the silhouettes of far spheres and tori.
+
+Caveats: the `many-draws` field is sparse (140 of 50 001 instances are occluded), so the occlusion win is small here; the two-phase scheme is exercised on denser occluders by the renderer's GPU test (a wall hides 400 spheres: 371 of the 407 instances are occlusion-culled, 29 frustum-culled, 7 drawn, image identical to the CPU path). LOD error is geometric only, normals are not part of the metric (hence the silhouette-only differences at 0.5 px). The `many-draws-cpu-path` file is the comparison run required by M5b; it is meaningless for earlier tags (the variable is ignored there).
 
 ## 12. Related
 

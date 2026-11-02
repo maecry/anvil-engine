@@ -125,6 +125,8 @@ pub enum Format {
     Rgba16Float,
     /// 16-bit float two channel (e.g. a BRDF LUT).
     Rg16Float,
+    /// 32-bit float single channel (storage-capable; the depth pyramid).
+    R32Float,
     /// 32-bit float depth.
     D32Sfloat,
 }
@@ -150,6 +152,7 @@ impl Format {
             | Format::Rgba8Srgb
             | Format::Rgba8Unorm
             | Format::Rg16Float
+            | Format::R32Float
             | Format::D32Sfloat => 4,
             Format::Rgba16Float => 8,
         }
@@ -174,6 +177,37 @@ pub enum TextureState {
     TransferSrc,
     /// Written (and depth-tested) as a depth attachment.
     DepthAttachment,
+    /// Written (and read) by compute shaders through a bindless storage image (`GENERAL`).
+    StorageWrite,
+}
+
+/// Buffer state used by [`CommandEncoder::buffer_barrier`]. Buffers have no layouts: a state is
+/// a pair of pipeline stages and access types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BufferState {
+    /// Contents undefined / not yet used; only valid as a `from` state.
+    Undefined,
+    /// Read by shaders (storage / BDA reads) in any stage.
+    ShaderRead,
+    /// Written (and read) by compute shaders.
+    ShaderWrite,
+    /// Source of a transfer.
+    TransferSrc,
+    /// Destination of a transfer (copy or fill).
+    TransferDst,
+    /// Consumed as indirect draw / dispatch arguments or counts.
+    Indirect,
+    /// Read as vertex attributes.
+    Vertex,
+    /// Read as indices.
+    Index,
+}
+
+impl BufferState {
+    /// True for states that write the buffer.
+    pub fn is_write(self) -> bool {
+        matches!(self, Self::ShaderWrite | Self::TransferDst)
+    }
 }
 
 /// Validation layer policy.
@@ -216,6 +250,10 @@ impl BufferUsage {
     pub const TRANSFER_SRC: Self = Self(1 << 3);
     /// Transfer destination (required by [`Device::upload_buffer`]).
     pub const TRANSFER_DST: Self = Self(1 << 4);
+    /// Indirect draw / dispatch arguments and draw counts.
+    pub const INDIRECT: Self = Self(1 << 5);
+    /// Vertex buffer (state tracking only; shaders pull vertices through BDA).
+    pub const VERTEX: Self = Self(1 << 6);
 
     /// True when every flag of `other` is set.
     pub const fn contains(self, other: Self) -> bool {
@@ -265,6 +303,8 @@ impl TextureUsage {
     pub const TRANSFER_SRC: Self = Self(1 << 3);
     /// Transfer destination (required by [`Device::upload_texture`]).
     pub const TRANSFER_DST: Self = Self(1 << 4);
+    /// Written by compute shaders as a bindless storage image (binding 2, one mip per view).
+    pub const STORAGE: Self = Self(1 << 5);
 
     /// True when every flag of `other` is set.
     pub const fn contains(self, other: Self) -> bool {
@@ -284,7 +324,8 @@ impl std::ops::BitOr for TextureUsage {
     }
 }
 
-/// Parameters for [`Device::create_texture`]: a single-mip, single-layer 2D image.
+/// Parameters for [`Device::create_texture`]: a 2D image with `mip_levels` mips and
+/// `array_layers` layers (6 and `cube` for a cube map).
 #[derive(Clone, Copy, Debug)]
 pub struct TextureDesc<'a> {
     /// Debug label (ADR-0009).
@@ -296,6 +337,53 @@ pub struct TextureDesc<'a> {
     /// Texel format.
     pub format: Format,
     /// Usage flags, nonempty.
+    pub usage: TextureUsage,
+    /// Mip levels, `1..=log2(max(width, height)) + 1`.
+    pub mip_levels: u32,
+    /// Array layers, at least 1.
+    pub array_layers: u32,
+    /// Cube-compatible (needs `array_layers == 6`; the default view is a cube view).
+    pub cube: bool,
+}
+
+impl<'a> TextureDesc<'a> {
+    /// A single-mip, single-layer 2D texture.
+    pub fn new_2d(
+        label: Option<&'a str>,
+        width: u32,
+        height: u32,
+        format: Format,
+        usage: TextureUsage,
+    ) -> Self {
+        Self {
+            label,
+            width,
+            height,
+            format,
+            usage,
+            mip_levels: 1,
+            array_layers: 1,
+            cube: false,
+        }
+    }
+}
+
+/// Parameters for [`Device::create_texture_view`]: a 2D view of a mip range and layer range.
+/// The view is a texture handle of its own (own bindless slots, own tracked state); it shares the
+/// parent's image. Destroy views before their parent.
+#[derive(Clone, Copy, Debug)]
+pub struct TextureViewDesc<'a> {
+    /// Debug label.
+    pub label: Option<&'a str>,
+    /// First mip level.
+    pub base_mip: u32,
+    /// Number of mip levels (`1` for a storage view or an attachment).
+    pub mip_count: u32,
+    /// First array layer.
+    pub base_layer: u32,
+    /// Number of layers (`1` gives a plain 2D view).
+    pub layer_count: u32,
+    /// Usage of the view, a subset of the parent's (`SAMPLED`, `STORAGE`, attachments).
     pub usage: TextureUsage,
 }
 
@@ -654,6 +742,16 @@ pub struct GraphicsPipelineDesc<'a> {
     pub blend: &'a [BlendState],
 }
 
+/// Parameters for [`Device::create_compute_pipeline`]. The pipeline uses the one global layout
+/// (bindless sets + [`PUSH_CONSTANT_BYTES`] of push constants), like graphics pipelines.
+#[derive(Clone, Copy, Debug)]
+pub struct ComputePipelineDesc<'a> {
+    /// Debug label.
+    pub label: Option<&'a str>,
+    /// The compute stage.
+    pub shader: ShaderStageDesc<'a>,
+}
+
 /// What happens to an attachment's contents at the start of rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoadOp {
@@ -970,6 +1068,11 @@ pub trait Device: Sized + Send {
         &self,
         desc: &GraphicsPipelineDesc,
     ) -> Result<PipelineHandle, RhiError>;
+    /// Creates a compute pipeline over the global layout.
+    fn create_compute_pipeline(
+        &self,
+        desc: &ComputePipelineDesc,
+    ) -> Result<PipelineHandle, RhiError>;
     /// Destroys a shader module (deferred).
     fn destroy_shader_module(&self, h: ShaderModuleHandle);
     /// Destroys a pipeline (deferred).
@@ -993,8 +1096,19 @@ pub trait Device: Sized + Send {
     /// submission. Overlapping ranges within one submit are unspecified.
     fn upload_buffer(&self, h: BufferHandle, offset: u64, data: &[u8]) -> Result<(), RhiError>;
 
-    /// Creates a texture (2D, one mip, one layer). Samplable textures get a bindless slot.
+    /// Creates a texture (2D, optionally mipped, layered or a cube). Plain 2D textures with
+    /// `SAMPLED` (or single-mip `STORAGE`) usage get bindless slots.
     fn create_texture(&self, desc: &TextureDesc) -> Result<TextureHandle, RhiError>;
+    /// Creates a view of `parent` for a mip and layer range, as a texture handle of its own with
+    /// its own bindless slots. The parent must outlive the view.
+    fn create_texture_view(
+        &self,
+        parent: TextureHandle,
+        desc: &TextureViewDesc,
+    ) -> Result<TextureHandle, RhiError>;
+    /// Bindless storage image slot (set 0, binding 2) of a single-mip 2D texture or view with
+    /// [`TextureUsage::STORAGE`]; it equals [`Device::texture_index`] of the same handle.
+    fn storage_index(&self, h: TextureHandle) -> Result<u32, RhiError>;
     /// Destroys a texture (deferred). Stale or swapchain-owned handles are ignored with a warning.
     fn destroy_texture(&self, h: TextureHandle);
     /// Bindless slot of a [`TextureUsage::SAMPLED`] texture in the global image array.
@@ -1039,8 +1153,17 @@ pub trait Device: Sized + Send {
 pub trait CommandEncoder {
     /// Finished command buffer, consumed by [`Device::submit`].
     type Finished;
-    /// Transitions a texture between states.
+    /// Transitions a texture (or the mip and layer range of a view) between states.
     fn texture_barrier(&mut self, t: TextureHandle, from: TextureState, to: TextureState);
+    /// Orders buffer accesses: writes of `from` become visible to `to` (outside rendering).
+    fn buffer_barrier(&mut self, b: BufferHandle, from: BufferState, to: BufferState);
+    /// Fills a range with a 32-bit `value` (outside rendering; needs `TRANSFER_DST`; `offset` and
+    /// `size` multiples of 4).
+    fn fill_buffer(&mut self, b: BufferHandle, offset: u64, size: u64, value: u32);
+    /// Dispatches the bound compute pipeline (outside rendering).
+    fn dispatch(&mut self, x: u32, y: u32, z: u32);
+    /// Dispatches with `(x, y, z)` read from `b` at `offset` (needs `INDIRECT`).
+    fn dispatch_indirect(&mut self, b: BufferHandle, offset: u64);
     /// Begins a dynamic rendering scope.
     fn begin_rendering(&mut self, desc: &RenderingDesc);
     /// Ends the rendering scope.
@@ -1067,6 +1190,21 @@ pub trait CommandEncoder {
         first_index: u32,
         vertex_offset: i32,
         first_instance: u32,
+    );
+    /// Indexed draws from `draw_count` `VkDrawIndexedIndirectCommand`-layout records
+    /// (`index_count, instance_count, first_index, vertex_offset, first_instance`, 20 bytes) in
+    /// `b` at `offset`, `stride` bytes apart (`stride >= 20`, multiple of 4). Needs `INDIRECT`.
+    fn draw_indexed_indirect(&mut self, b: BufferHandle, offset: u64, draw_count: u32, stride: u32);
+    /// Like [`CommandEncoder::draw_indexed_indirect`] but the draw count is the u32 at
+    /// `count_offset` in `count`, clamped to `max_draw_count`.
+    fn draw_indexed_indirect_count(
+        &mut self,
+        b: BufferHandle,
+        offset: u64,
+        count: BufferHandle,
+        count_offset: u64,
+        max_draw_count: u32,
+        stride: u32,
     );
     /// Binds an index buffer (inside rendering). `offset` must be a multiple of the index size.
     fn bind_index_buffer(&mut self, b: BufferHandle, offset: u64, format: IndexFormat);
@@ -1293,6 +1431,16 @@ mod tests {
         fn create_texture(&self, _: &TextureDesc) -> Result<TextureHandle, RhiError> {
             Ok(TextureHandle::NULL)
         }
+        fn create_texture_view(
+            &self,
+            _: TextureHandle,
+            _: &TextureViewDesc,
+        ) -> Result<TextureHandle, RhiError> {
+            Ok(TextureHandle::NULL)
+        }
+        fn storage_index(&self, _: TextureHandle) -> Result<u32, RhiError> {
+            Ok(0)
+        }
         fn destroy_texture(&self, _: TextureHandle) {}
         fn texture_index(&self, _: TextureHandle) -> Result<u32, RhiError> {
             Ok(0)
@@ -1333,6 +1481,12 @@ mod tests {
         ) -> Result<PipelineHandle, RhiError> {
             Ok(PipelineHandle::NULL)
         }
+        fn create_compute_pipeline(
+            &self,
+            _: &ComputePipelineDesc,
+        ) -> Result<PipelineHandle, RhiError> {
+            Ok(PipelineHandle::NULL)
+        }
         fn destroy_shader_module(&self, _: ShaderModuleHandle) {}
         fn destroy_pipeline(&self, _: PipelineHandle) {}
         fn begin_frame(&mut self) -> Result<FrameToken, RhiError> {
@@ -1361,6 +1515,21 @@ mod tests {
     impl CommandEncoder for MockCommands {
         type Finished = u32;
         fn texture_barrier(&mut self, _: TextureHandle, _: TextureState, _: TextureState) {}
+        fn buffer_barrier(&mut self, _: BufferHandle, _: BufferState, _: BufferState) {}
+        fn fill_buffer(&mut self, _: BufferHandle, _: u64, _: u64, _: u32) {}
+        fn dispatch(&mut self, _: u32, _: u32, _: u32) {}
+        fn dispatch_indirect(&mut self, _: BufferHandle, _: u64) {}
+        fn draw_indexed_indirect(&mut self, _: BufferHandle, _: u64, _: u32, _: u32) {}
+        fn draw_indexed_indirect_count(
+            &mut self,
+            _: BufferHandle,
+            _: u64,
+            _: BufferHandle,
+            _: u64,
+            _: u32,
+            _: u32,
+        ) {
+        }
         fn begin_rendering(&mut self, _: &RenderingDesc) {}
         fn end_rendering(&mut self) {}
         fn bind_pipeline(&mut self, _: PipelineHandle) {}

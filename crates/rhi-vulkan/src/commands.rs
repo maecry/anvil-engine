@@ -6,10 +6,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ash::vk;
 use rhi::{
-    BlendFactor, BlendOp, BlendState, BufferHandle, BufferUsage, CommandEncoder, CullMode,
-    DepthState, Format, FrameToken, FrontFace, GraphicsPipelineDesc, IndexFormat, LoadOp, Memory,
-    PipelineHandle, PrimitiveTopology, Rect2D, RenderingDesc, RhiError, ShaderModuleDesc,
-    ShaderModuleHandle, StoreOp, TextureHandle, TextureState, TextureUsage, Viewport,
+    BlendFactor, BlendOp, BlendState, BufferHandle, BufferState, BufferUsage, CommandEncoder,
+    ComputePipelineDesc, CullMode, DepthState, Format, FrameToken, FrontFace, GraphicsPipelineDesc,
+    IndexFormat, LoadOp, Memory, PipelineHandle, PrimitiveTopology, Rect2D, RenderingDesc,
+    RhiError, ShaderModuleDesc, ShaderModuleHandle, StoreOp, TextureHandle, TextureState,
+    TextureUsage, Viewport,
 };
 
 use crate::bindings::check_push_constants;
@@ -19,7 +20,7 @@ use crate::device::DeviceShared;
 use crate::error::{invalid, map_vk, stale};
 use crate::registry::generated_name;
 use crate::texture::{
-    StateCheck, TextureOwner, aspect_of, check_tracked_state, compare_to_vk, rhi_to_vk_format,
+    StateCheck, TextureOwner, check_tracked_state, compare_to_vk, rhi_to_vk_format,
 };
 use crate::upload::{self, PendingUpload};
 use crate::{lock, read, write};
@@ -61,6 +62,7 @@ pub(crate) fn state_as_source(s: TextureState) -> BarrierHalf {
             S::EARLY_FRAGMENT_TESTS | S::LATE_FRAGMENT_TESTS,
             A::DEPTH_STENCIL_ATTACHMENT_WRITE,
         ),
+        TextureState::StorageWrite => (L::GENERAL, S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE),
     };
     BarrierHalf {
         layout,
@@ -93,6 +95,11 @@ pub(crate) fn state_as_destination(s: TextureState) -> Result<BarrierHalf, RhiEr
             S::EARLY_FRAGMENT_TESTS | S::LATE_FRAGMENT_TESTS,
             A::DEPTH_STENCIL_ATTACHMENT_READ | A::DEPTH_STENCIL_ATTACHMENT_WRITE,
         ),
+        TextureState::StorageWrite => (
+            L::GENERAL,
+            S::COMPUTE_SHADER,
+            A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE,
+        ),
     };
     Ok(BarrierHalf {
         layout,
@@ -107,6 +114,28 @@ pub(crate) fn image_barrier(
     from: TextureState,
     to: TextureState,
 ) -> Result<vk::ImageMemoryBarrier2<'static>, RhiError> {
+    image_barrier_range(
+        image,
+        vk::ImageSubresourceRange {
+            aspect_mask: aspect,
+            base_mip_level: 0,
+            level_count: vk::REMAINING_MIP_LEVELS,
+            base_array_layer: 0,
+            layer_count: vk::REMAINING_ARRAY_LAYERS,
+        },
+        from,
+        to,
+    )
+}
+
+/// [`image_barrier`] over an explicit mip and layer range (views, per-mip tracking).
+pub(crate) fn image_barrier_range(
+    image: vk::Image,
+    range: vk::ImageSubresourceRange,
+    from: TextureState,
+    to: TextureState,
+) -> Result<vk::ImageMemoryBarrier2<'static>, RhiError> {
+    let aspect = range.aspect_mask;
     let (mut src, dst) = (state_as_source(from), state_as_destination(to)?);
     if from == TextureState::Undefined && aspect.contains(vk::ImageAspectFlags::DEPTH) {
         // A depth image re-transitioned from `Undefined` every frame must be ordered after the
@@ -124,13 +153,56 @@ pub(crate) fn image_barrier(
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image)
-        .subresource_range(vk::ImageSubresourceRange {
-            aspect_mask: aspect,
-            base_mip_level: 0,
-            level_count: vk::REMAINING_MIP_LEVELS,
-            base_array_layer: 0,
-            layer_count: vk::REMAINING_ARRAY_LAYERS,
-        }))
+        .subresource_range(range))
+}
+
+/// Pipeline stages and access of a buffer state: `(stage, access)`.
+pub(crate) fn buffer_state_masks(s: BufferState) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+    use vk::{AccessFlags2 as A, PipelineStageFlags2 as S};
+    match s {
+        BufferState::Undefined => (S::NONE, A::NONE),
+        BufferState::ShaderRead => (
+            S::VERTEX_SHADER | S::FRAGMENT_SHADER | S::COMPUTE_SHADER,
+            A::SHADER_STORAGE_READ,
+        ),
+        BufferState::ShaderWrite => (
+            S::COMPUTE_SHADER,
+            A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE,
+        ),
+        BufferState::TransferSrc => (S::ALL_TRANSFER, A::TRANSFER_READ),
+        BufferState::TransferDst => (S::ALL_TRANSFER, A::TRANSFER_WRITE),
+        BufferState::Indirect => (S::DRAW_INDIRECT, A::INDIRECT_COMMAND_READ),
+        BufferState::Vertex => (S::VERTEX_INPUT, A::VERTEX_ATTRIBUTE_READ),
+        BufferState::Index => (S::INDEX_INPUT, A::INDEX_READ),
+    }
+}
+
+/// Buffer memory barrier for `from` -> `to`. The source access is only the writes of `from`
+/// (reads need no availability); `Undefined` as a source orders against nothing.
+pub(crate) fn buffer_barrier2(
+    buffer: vk::Buffer,
+    from: BufferState,
+    to: BufferState,
+) -> Result<vk::BufferMemoryBarrier2<'static>, RhiError> {
+    if to == BufferState::Undefined {
+        return Err(invalid("Undefined is not a valid destination buffer state"));
+    }
+    let (ss, sa) = buffer_state_masks(from);
+    let (ds, da) = buffer_state_masks(to);
+    Ok(vk::BufferMemoryBarrier2::default()
+        .src_stage_mask(ss)
+        .src_access_mask(if from.is_write() {
+            sa
+        } else {
+            vk::AccessFlags2::NONE
+        })
+        .dst_stage_mask(ds)
+        .dst_access_mask(da)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .buffer(buffer)
+        .offset(0)
+        .size(vk::WHOLE_SIZE))
 }
 
 // ---------------------------------------------------------------- slot tracker (pure)
@@ -179,8 +251,13 @@ pub(crate) struct EncoderState {
     formats: [Option<Format>; MAX_COLOR_ATTACHMENTS],
     depth: Option<Format>,
     index_bound: bool,
-    /// The global descriptor set was bound in this command buffer.
+    /// A compute pipeline is bound (cleared by binding a graphics pipeline never; compute is
+    /// only valid outside rendering).
+    compute_bound: bool,
+    /// The global descriptor set was bound in this command buffer (graphics bind point).
     global_bound: bool,
+    /// Same for the compute bind point.
+    global_bound_compute: bool,
 }
 
 impl EncoderState {
@@ -283,6 +360,35 @@ impl EncoderState {
     /// Returns true the first time, when the caller must bind the global descriptor set.
     pub(crate) fn take_global_unbound(&mut self) -> bool {
         !std::mem::replace(&mut self.global_bound, true)
+    }
+
+    /// Compute bind point variant of [`Self::take_global_unbound`].
+    pub(crate) fn take_global_unbound_compute(&mut self) -> bool {
+        !std::mem::replace(&mut self.global_bound_compute, true)
+    }
+
+    /// A compute pipeline may be bound outside rendering only.
+    pub(crate) fn check_bind_compute(&mut self) -> bool {
+        if !self.check_outside_rendering("bind_pipeline (compute)") {
+            return false;
+        }
+        self.compute_bound = true;
+        true
+    }
+
+    pub(crate) fn check_dispatch(&mut self) -> bool {
+        if !self.check_outside_rendering("dispatch") {
+            return false;
+        }
+        if !self.compute_bound {
+            self.record(invalid("dispatch requires a bound compute pipeline"));
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn check_draw_indirect(&mut self) -> bool {
+        self.check_draw_indexed()
     }
 
     pub(crate) fn push_label(&mut self) {
@@ -635,7 +741,38 @@ pub struct VulkanCommands {
     st: EncoderState,
 }
 
+/// Indirect command stride: a multiple of 4 and at least one record (checked when drawing more
+/// than one).
+pub(crate) fn check_indirect_stride(stride: u32, count: u32) -> Result<(), RhiError> {
+    if !stride.is_multiple_of(4) || (count > 1 && stride < 20) {
+        return Err(invalid(format!(
+            "indirect stride {stride} must be a multiple of 4 and at least 20"
+        )));
+    }
+    Ok(())
+}
+
 impl VulkanCommands {
+    /// The raw buffer if it has `INDIRECT` usage and `offset..offset + len` is inside it.
+    fn indirect_buffer(
+        &self,
+        what: &str,
+        b: BufferHandle,
+        offset: u64,
+        len: u64,
+    ) -> Result<vk::Buffer, RhiError> {
+        let pool = read(&self.shared.pools.buffers);
+        let buf = pool.get(b).ok_or_else(|| stale("buffer", b))?;
+        if !buf.usage.contains(BufferUsage::INDIRECT) {
+            return Err(invalid(format!("{what} needs BufferUsage::INDIRECT")));
+        }
+        if !offset.is_multiple_of(4) {
+            return Err(invalid(format!("{what}: offset must be a multiple of 4")));
+        }
+        check_range(what, offset, len, buf.size)?;
+        Ok(buf.raw)
+    }
+
     /// Makes a preceding copy visible to host reads (`Readback` destinations).
     fn host_read_barrier(&self) {
         let mb = [vk::MemoryBarrier2::default()
@@ -684,7 +821,7 @@ impl CommandEncoder for VulkanCommands {
             drop(pool);
             return self.st.record(stale("texture", t));
         };
-        let device_owned = tex.owner == TextureOwner::Device;
+        let device_owned = tex.owner != TextureOwner::Swapchain;
         if device_owned && (from == TextureState::Present || to == TextureState::Present) {
             return self.st.record(RhiError::Unsupported {
                 what: "Present state on a non-swapchain texture".to_owned(),
@@ -699,7 +836,7 @@ impl CommandEncoder for VulkanCommands {
                 tex.format
             )));
         }
-        match image_barrier(tex.image, aspect_of(tex.format), from, to) {
+        match image_barrier_range(tex.image, tex.range(), from, to) {
             Ok(b) => {
                 if device_owned
                     && let StateCheck::Mismatch { tracked } = check_tracked_state(tex.state, from)
@@ -717,6 +854,158 @@ impl CommandEncoder for VulkanCommands {
             }
             Err(e) => self.st.record(e),
         }
+    }
+
+    fn buffer_barrier(&mut self, b: BufferHandle, from: BufferState, to: BufferState) {
+        if self.st.failed() || !self.st.check_outside_rendering("buffer_barrier") {
+            return;
+        }
+        let raw = match read(&self.shared.pools.buffers).get(b) {
+            Some(v) => v.raw,
+            None => return self.st.record(stale("buffer", b)),
+        };
+        match buffer_barrier2(raw, from, to) {
+            Ok(bb) => {
+                let barriers = [bb];
+                let dep = vk::DependencyInfo::default().buffer_memory_barriers(&barriers);
+                // SAFETY: open command buffer outside rendering; the buffer is alive (stale
+                // handles rejected above, a later destroy is deferred past this submission).
+                unsafe { self.shared.raw.cmd_pipeline_barrier2(self.cb, &dep) };
+            }
+            Err(e) => self.st.record(e),
+        }
+    }
+
+    fn fill_buffer(&mut self, b: BufferHandle, offset: u64, size: u64, value: u32) {
+        if self.st.failed() || !self.st.check_outside_rendering("fill_buffer") {
+            return;
+        }
+        let raw = {
+            let pool = read(&self.shared.pools.buffers);
+            let Some(buf) = pool.get(b) else {
+                drop(pool);
+                return self.st.record(stale("buffer", b));
+            };
+            if !buf.usage.contains(BufferUsage::TRANSFER_DST) {
+                return self
+                    .st
+                    .record(invalid("fill_buffer needs BufferUsage::TRANSFER_DST"));
+            }
+            if !offset.is_multiple_of(4) || !size.is_multiple_of(4) {
+                return self.st.record(invalid(
+                    "fill_buffer offset and size must be multiples of 4",
+                ));
+            }
+            if let Err(e) = check_range("fill_buffer", offset, size, buf.size) {
+                return self.st.record(e);
+            }
+            buf.raw
+        };
+        if size == 0 {
+            return;
+        }
+        // SAFETY: open command buffer outside rendering; buffer alive; range and usage validated.
+        unsafe {
+            self.shared
+                .raw
+                .cmd_fill_buffer(self.cb, raw, offset, size, value)
+        };
+    }
+
+    fn dispatch(&mut self, x: u32, y: u32, z: u32) {
+        if self.st.failed() || !self.st.check_dispatch() {
+            return;
+        }
+        // SAFETY: open command buffer outside rendering with a bound compute pipeline (checked).
+        unsafe { self.shared.raw.cmd_dispatch(self.cb, x, y, z) };
+    }
+
+    fn dispatch_indirect(&mut self, b: BufferHandle, offset: u64) {
+        if self.st.failed() || !self.st.check_dispatch() {
+            return;
+        }
+        let raw = match self.indirect_buffer("dispatch_indirect", b, offset, 12) {
+            Ok(r) => r,
+            Err(e) => return self.st.record(e),
+        };
+        // SAFETY: as dispatch; the buffer has INDIRECT usage and holds 12 bytes at `offset`.
+        unsafe { self.shared.raw.cmd_dispatch_indirect(self.cb, raw, offset) };
+    }
+
+    fn draw_indexed_indirect(
+        &mut self,
+        b: BufferHandle,
+        offset: u64,
+        draw_count: u32,
+        stride: u32,
+    ) {
+        if self.st.failed() || !self.st.check_draw_indirect() {
+            return;
+        }
+        if let Err(e) = check_indirect_stride(stride, draw_count) {
+            return self.st.record(e);
+        }
+        let len = u64::from(stride) * u64::from(draw_count.saturating_sub(1)) + 20;
+        let raw = match self.indirect_buffer("draw_indexed_indirect", b, offset, len) {
+            Ok(r) => r,
+            Err(e) => return self.st.record(e),
+        };
+        // SAFETY: open command buffer inside rendering with pipeline and index buffer bound
+        // (checked); the buffer has INDIRECT usage and holds `draw_count` records at `offset`.
+        unsafe {
+            self.shared
+                .raw
+                .cmd_draw_indexed_indirect(self.cb, raw, offset, draw_count, stride)
+        };
+    }
+
+    fn draw_indexed_indirect_count(
+        &mut self,
+        b: BufferHandle,
+        offset: u64,
+        count: BufferHandle,
+        count_offset: u64,
+        max_draw_count: u32,
+        stride: u32,
+    ) {
+        if self.st.failed() || !self.st.check_draw_indirect() {
+            return;
+        }
+        if let Err(e) = check_indirect_stride(stride, max_draw_count) {
+            return self.st.record(e);
+        }
+        let len = u64::from(stride) * u64::from(max_draw_count.saturating_sub(1)) + 20;
+        let raw = match self.indirect_buffer("draw_indexed_indirect_count", b, offset, len) {
+            Ok(r) => r,
+            Err(e) => return self.st.record(e),
+        };
+        let count_raw = match self.indirect_buffer(
+            "draw_indexed_indirect_count (count)",
+            count,
+            count_offset,
+            4,
+        ) {
+            Ok(r) => r,
+            Err(e) => return self.st.record(e),
+        };
+        if !count_offset.is_multiple_of(4) {
+            return self
+                .st
+                .record(invalid("indirect count offset must be a multiple of 4"));
+        }
+        // SAFETY: as draw_indexed_indirect; the count buffer has INDIRECT usage and holds a u32 at
+        // `count_offset`; the drawIndirectCount feature is enabled at device creation.
+        unsafe {
+            self.shared.raw.cmd_draw_indexed_indirect_count(
+                self.cb,
+                raw,
+                offset,
+                count_raw,
+                count_offset,
+                max_draw_count,
+                stride,
+            )
+        };
     }
 
     fn begin_rendering(&mut self, desc: &RenderingDesc) {
@@ -829,21 +1118,35 @@ impl CommandEncoder for VulkanCommands {
         if self.st.failed() {
             return;
         }
-        let (pipeline, formats, depth) = match read(&self.shared.pools.pipelines).get(p) {
-            Some(v) => (v.pipeline, v.color_formats, v.depth_format),
+        let (pipeline, formats, depth, compute) = match read(&self.shared.pools.pipelines).get(p) {
+            Some(v) => (v.pipeline, v.color_formats, v.depth_format, v.compute),
             None => return self.st.record(stale("pipeline", p)),
         };
-        if !self.st.check_pipeline(&formats, depth) {
+        let (ok, first, point) = if compute {
+            (
+                self.st.check_bind_compute(),
+                self.st.take_global_unbound_compute(),
+                vk::PipelineBindPoint::COMPUTE,
+            )
+        } else {
+            (
+                self.st.check_pipeline(&formats, depth),
+                self.st.take_global_unbound(),
+                vk::PipelineBindPoint::GRAPHICS,
+            )
+        };
+        if !ok {
             return;
         }
-        if self.st.take_global_unbound() {
+        if first {
             let b = &self.shared.bindings;
             // SAFETY: open command buffer; the set and layout live as long as the device. The
-            // set is bound once per command buffer: every pipeline shares the global layout.
+            // set is bound once per bind point and command buffer: every pipeline shares the
+            // global layout.
             unsafe {
                 self.shared.raw.cmd_bind_descriptor_sets(
                     self.cb,
-                    vk::PipelineBindPoint::GRAPHICS,
+                    point,
                     b.pipeline_layout,
                     0,
                     &[b.set],
@@ -854,11 +1157,7 @@ impl CommandEncoder for VulkanCommands {
         }
         // SAFETY: open command buffer; the pipeline is alive: stale handles are rejected above and
         // a later destroy is deferred past the submission recording it (doom_tag).
-        unsafe {
-            self.shared
-                .raw
-                .cmd_bind_pipeline(self.cb, vk::PipelineBindPoint::GRAPHICS, pipeline)
-        };
+        unsafe { self.shared.raw.cmd_bind_pipeline(self.cb, point, pipeline) };
     }
 
     fn set_viewport(&mut self, v: Viewport) {
@@ -988,7 +1287,7 @@ impl CommandEncoder for VulkanCommands {
             self.shared.raw.cmd_push_constants(
                 self.cb,
                 self.shared.bindings.pipeline_layout,
-                vk::ShaderStageFlags::ALL_GRAPHICS,
+                crate::bindings::ALL_STAGES,
                 offset,
                 data,
             )
@@ -1070,7 +1369,7 @@ impl CommandEncoder for VulkanCommands {
         if self.st.failed() || !self.st.check_outside_rendering("copy_texture_to_buffer") {
             return;
         }
-        let (image, extent, bytes, tracked) = {
+        let (image, extent, bytes, tracked, mip, layer) = {
             let pool = read(&self.shared.pools.textures);
             let Some(tex) = pool.get(t) else {
                 drop(pool);
@@ -1089,11 +1388,13 @@ impl CommandEncoder for VulkanCommands {
                 (tex.width, tex.height),
                 bytes,
                 // swapchain textures are not state-tracked
-                if tex.owner == TextureOwner::Device {
-                    tex.state
-                } else {
+                if tex.owner == TextureOwner::Swapchain {
                     TextureState::TransferSrc
+                } else {
+                    tex.state
                 },
+                tex.base_mip,
+                tex.base_layer,
             )
         };
         let (draw, host_read) = {
@@ -1121,8 +1422,8 @@ impl CommandEncoder for VulkanCommands {
             buffer_image_height: 0,
             image_subresource: vk::ImageSubresourceLayers {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
+                mip_level: mip,
+                base_array_layer: layer,
                 layer_count: 1,
             },
             image_offset: vk::Offset3D::default(),
@@ -1236,6 +1537,7 @@ pub(crate) struct VkShaderModule {
 
 pub(crate) struct VkPipeline {
     pub pipeline: vk::Pipeline,
+    pub compute: bool,
     pub color_formats: [Option<Format>; MAX_COLOR_ATTACHMENTS],
     pub depth_format: Option<Format>,
 }
@@ -1443,6 +1745,7 @@ pub(crate) fn create_graphics_pipeline(
     }
     let h = write(&s.pools.pipelines).insert(VkPipeline {
         pipeline,
+        compute: false,
         color_formats,
         depth_format: desc.depth.map(|d| d.format),
     });
@@ -1451,6 +1754,53 @@ pub(crate) fn create_graphics_pipeline(
         .map_or_else(|| generated_name("pipeline", h), str::to_owned);
     s.set_name(pipeline, &name);
     tracing::debug!(handle = ?h, label = %name, color_formats = ?desc.color_formats, depth = ?desc.depth, topology = ?desc.topology, "pipeline created");
+    Ok(h)
+}
+
+pub(crate) fn create_compute_pipeline(
+    s: &DeviceShared,
+    desc: &ComputePipelineDesc,
+) -> Result<PipelineHandle, RhiError> {
+    let name =
+        CString::new(desc.shader.entry).map_err(|_| invalid("shader entry name contains NUL"))?;
+    let module = read(&s.pools.shader_modules)
+        .get(desc.shader.module)
+        .ok_or_else(|| stale("shader_module", desc.shader.module))?
+        .raw;
+    let stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(module)
+        .name(&name);
+    let ci = vk::ComputePipelineCreateInfo::default()
+        .stage(stage)
+        .layout(s.bindings.pipeline_layout);
+    // SAFETY: `ci`, the entry name and the module outlive the call; the layout is alive.
+    let pipeline = match unsafe {
+        s.raw
+            .create_compute_pipelines(s.pipeline_cache, &[ci], None)
+    } {
+        Ok(v) => v[0],
+        Err((made, r)) => {
+            // SAFETY: partially created pipelines are owned here and unused.
+            unsafe {
+                for p in made.into_iter().filter(|p| *p != vk::Pipeline::null()) {
+                    s.raw.destroy_pipeline(p, None);
+                }
+            }
+            return Err(map_vk("vkCreateComputePipelines", r));
+        }
+    };
+    let h = write(&s.pools.pipelines).insert(VkPipeline {
+        pipeline,
+        compute: true,
+        color_formats: [None; MAX_COLOR_ATTACHMENTS],
+        depth_format: None,
+    });
+    let label = desc
+        .label
+        .map_or_else(|| generated_name("compute_pipeline", h), str::to_owned);
+    s.set_name(pipeline, &label);
+    tracing::debug!(handle = ?h, label = %label, "compute pipeline created");
     Ok(h)
 }
 
@@ -1811,5 +2161,60 @@ mod tests {
             validate_pipeline_desc(&d),
             Err(RhiError::InvalidDescriptor(_))
         ));
+    }
+
+    #[test]
+    fn buffer_barrier_halves() {
+        use BufferState as B;
+        use vk::{AccessFlags2 as A, PipelineStageFlags2 as S};
+        // A write chains to a read: only the write's access is the source access.
+        let b = buffer_barrier2(vk::Buffer::null(), B::ShaderWrite, B::Indirect).unwrap();
+        assert_eq!(b.src_stage_mask, S::COMPUTE_SHADER);
+        assert!(b.src_access_mask.contains(A::SHADER_STORAGE_WRITE));
+        assert_eq!(b.dst_stage_mask, S::DRAW_INDIRECT);
+        assert_eq!(b.dst_access_mask, A::INDIRECT_COMMAND_READ);
+        // A read as the source has no availability to make: only the execution dependency.
+        let b = buffer_barrier2(vk::Buffer::null(), B::ShaderRead, B::TransferDst).unwrap();
+        assert_eq!(b.src_access_mask, A::NONE);
+        assert_eq!(b.dst_access_mask, A::TRANSFER_WRITE);
+        // Undefined orders against nothing, and is not a destination.
+        let b = buffer_barrier2(vk::Buffer::null(), B::Undefined, B::ShaderWrite).unwrap();
+        assert_eq!((b.src_stage_mask, b.src_access_mask), (S::NONE, A::NONE));
+        assert!(buffer_barrier2(vk::Buffer::null(), B::ShaderRead, B::Undefined).is_err());
+        for s in [
+            B::ShaderRead,
+            B::ShaderWrite,
+            B::TransferSrc,
+            B::TransferDst,
+            B::Indirect,
+            B::Vertex,
+            B::Index,
+        ] {
+            let (stage, access) = buffer_state_masks(s);
+            assert!(!stage.is_empty() && !access.is_empty(), "{s:?}");
+        }
+        // The storage-write texture state is GENERAL, compute only.
+        let h = state_as_destination(TextureState::StorageWrite).unwrap();
+        assert_eq!(
+            (h.layout, h.stage),
+            (vk::ImageLayout::GENERAL, S::COMPUTE_SHADER)
+        );
+        assert!(
+            state_as_source(TextureState::StorageWrite)
+                .access
+                .contains(A::SHADER_STORAGE_WRITE)
+        );
+    }
+
+    #[test]
+    fn indirect_stride_rules() {
+        assert!(check_indirect_stride(20, 100).is_ok());
+        assert!(check_indirect_stride(32, 2).is_ok());
+        assert!(check_indirect_stride(16, 2).is_err(), "records overlap");
+        assert!(
+            check_indirect_stride(0, 1).is_ok(),
+            "a single draw has no stride"
+        );
+        assert!(check_indirect_stride(22, 1).is_err(), "unaligned");
     }
 }

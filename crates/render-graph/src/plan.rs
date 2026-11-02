@@ -4,11 +4,56 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use rhi::{Format, LoadOp, StoreOp, TextureHandle, TextureState, TextureUsage};
+use rhi::{
+    BufferHandle, BufferState, BufferUsage, Format, LoadOp, StoreOp, TextureHandle, TextureState,
+    TextureUsage,
+};
 
 /// A texture of the graph under construction, valid for one frame's builder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TexId(pub(crate) u32);
+
+/// A buffer of the graph under construction, valid for one frame's builder. Shares the index
+/// space of [`TexId`] (one list of resources).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BufId(pub(crate) u32);
+
+/// Description of a transient buffer (GPU-only memory); also the pool key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TransientBufferDesc {
+    /// Size in bytes.
+    pub size: u64,
+    /// Usage flags (include `TRANSFER_DST` when a pass fills it).
+    pub usage: BufferUsage,
+}
+
+/// How a pass uses a buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BufMode {
+    /// Reads earlier contents.
+    Read,
+    /// Overwrites; earlier contents are not needed.
+    Write,
+    /// Writes and needs the earlier contents (atomics, in-place updates).
+    Modify,
+}
+
+/// A texture or buffer state; the planner tracks both in one list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum St {
+    T(TextureState),
+    B(BufferState),
+}
+
+impl St {
+    /// State name for dumps.
+    pub(crate) fn name(self) -> String {
+        match self {
+            St::T(t) => format!("{t:?}"),
+            St::B(b) => format!("{b:?}"),
+        }
+    }
+}
 
 /// Description of a transient texture; also the pool key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -73,6 +118,9 @@ pub struct Pass {
     pub(crate) name: Cow<'static, str>,
     pub(crate) label_color: [f32; 4],
     pub(crate) reads: Vec<TexId>,
+    /// Textures written by compute shaders through storage images.
+    pub(crate) storage: Vec<TexId>,
+    pub(crate) buffers: Vec<(BufId, BufferState, BufMode)>,
     pub(crate) colors: Vec<(TexId, ColorTarget)>,
     pub(crate) depth: Option<(TexId, DepthTarget)>,
     pub(crate) side_effect: bool,
@@ -85,6 +133,8 @@ impl Pass {
             name: name.into(),
             label_color: [0.5, 0.5, 0.5, 1.0],
             reads: Vec::new(),
+            storage: Vec::new(),
+            buffers: Vec::new(),
             colors: Vec::new(),
             depth: None,
             side_effect: false,
@@ -100,6 +150,33 @@ impl Pass {
     /// The pass samples `t` in shaders.
     pub fn read(mut self, t: TexId) -> Self {
         self.reads.push(t);
+        self
+    }
+
+    /// A compute pass writes `t` through a bindless storage image ([`TextureState::StorageWrite`]).
+    pub fn write_storage(mut self, t: TexId) -> Self {
+        self.storage.push(t);
+        self
+    }
+
+    /// The pass reads `b` in a read `state` (`ShaderRead`, `Indirect`, `TransferSrc`, ...).
+    pub fn read_buffer(mut self, b: BufId, state: BufferState) -> Self {
+        debug_assert!(!state.is_write(), "read_buffer with a write state");
+        self.buffers.push((b, state, BufMode::Read));
+        self
+    }
+
+    /// The pass overwrites `b` (`ShaderWrite` or `TransferDst`); earlier contents are not needed.
+    pub fn write_buffer(mut self, b: BufId, state: BufferState) -> Self {
+        debug_assert!(state.is_write(), "write_buffer with a read state");
+        self.buffers.push((b, state, BufMode::Write));
+        self
+    }
+
+    /// The pass updates `b` in place (`ShaderWrite`): it needs the earlier contents.
+    pub fn modify_buffer(mut self, b: BufId, state: BufferState) -> Self {
+        debug_assert!(state.is_write(), "modify_buffer with a read state");
+        self.buffers.push((b, state, BufMode::Modify));
         self
     }
 
@@ -130,6 +207,11 @@ pub(crate) enum ResKind {
         extent: (u32, u32),
         initial: Option<TextureState>,
     },
+    TransientBuf(TransientBufferDesc),
+    ImportedBuf {
+        buffer: BufferHandle,
+        initial: Option<BufferState>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +225,7 @@ impl ResDecl {
         match &self.kind {
             ResKind::Transient(d) => (d.width, d.height),
             ResKind::Imported { extent, .. } => *extent,
+            ResKind::TransientBuf(_) | ResKind::ImportedBuf { .. } => (0, 0),
         }
     }
 }
@@ -162,6 +245,37 @@ impl Decls {
             kind: ResKind::Transient(desc),
         });
         TexId(self.res.len() as u32 - 1)
+    }
+
+    pub fn transient_buffer(
+        &mut self,
+        name: Cow<'static, str>,
+        desc: TransientBufferDesc,
+    ) -> BufId {
+        self.res.push(ResDecl {
+            name,
+            kind: ResKind::TransientBuf(desc),
+        });
+        BufId(self.res.len() as u32 - 1)
+    }
+
+    /// Importing the same buffer twice returns the first id.
+    pub fn import_buffer(
+        &mut self,
+        name: Cow<'static, str>,
+        buffer: BufferHandle,
+        initial: Option<BufferState>,
+    ) -> BufId {
+        let same =
+            |r: &ResDecl| matches!(r.kind, ResKind::ImportedBuf { buffer: b, .. } if b == buffer);
+        if let Some(i) = self.res.iter().position(same) {
+            return BufId(i as u32);
+        }
+        self.res.push(ResDecl {
+            name,
+            kind: ResKind::ImportedBuf { buffer, initial },
+        });
+        BufId(self.res.len() as u32 - 1)
     }
 
     /// Importing the same texture twice returns the first id.
@@ -194,9 +308,10 @@ impl Decls {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Barrier {
     pub before: usize,
+    /// The texture or buffer (one index space).
     pub tex: TexId,
-    pub from: TextureState,
-    pub to: TextureState,
+    pub from: St,
+    pub to: St,
 }
 
 /// A physical texture shared by transients with disjoint lifetimes.
@@ -224,7 +339,7 @@ pub(crate) struct Plan {
     /// State of each slot at the end of the frame.
     pub slot_final: Vec<TextureState>,
     /// State of each resource at the end of the frame.
-    pub res_final: Vec<TextureState>,
+    pub res_final: Vec<St>,
 }
 
 /// Why a graph does not compile or run. Messages name the pass and the resource.
@@ -300,7 +415,7 @@ fn later(w: &Option<String>) -> String {
 /// One texture use of a pass.
 struct Use {
     tex: TexId,
-    state: TextureState,
+    state: St,
     /// Needs earlier contents (sampled, or `LoadOp::Load`).
     needs_content: bool,
     write: bool,
@@ -309,23 +424,39 @@ struct Use {
 fn uses(p: &Pass) -> impl Iterator<Item = Use> + '_ {
     let reads = p.reads.iter().map(|&tex| Use {
         tex,
-        state: TextureState::ShaderRead,
+        state: St::T(TextureState::ShaderRead),
         needs_content: true,
         write: false,
     });
+    let storage = p.storage.iter().map(|&tex| Use {
+        tex,
+        state: St::T(TextureState::StorageWrite),
+        needs_content: false,
+        write: true,
+    });
     let colors = p.colors.iter().map(|(tex, t)| Use {
         tex: *tex,
-        state: TextureState::ColorAttachment,
+        state: St::T(TextureState::ColorAttachment),
         needs_content: t.load == LoadOp::Load,
         write: true,
     });
     let depth = p.depth.iter().map(|(tex, t)| Use {
         tex: *tex,
-        state: TextureState::DepthAttachment,
+        state: St::T(TextureState::DepthAttachment),
         needs_content: t.load == LoadOp::Load,
         write: true,
     });
-    reads.chain(colors).chain(depth)
+    let buffers = p.buffers.iter().map(|&(b, state, mode)| Use {
+        tex: TexId(b.0),
+        state: St::B(state),
+        needs_content: mode != BufMode::Write,
+        write: mode != BufMode::Read,
+    });
+    reads
+        .chain(storage)
+        .chain(colors)
+        .chain(depth)
+        .chain(buffers)
 }
 
 /// Extent of the pass's attachments, `None` for a pass without any.
@@ -336,8 +467,24 @@ pub(crate) fn pass_extent(d: &Decls, p: &Pass) -> Option<(u32, u32)> {
 
 /// Sampled and rendered-to textures of a pass.
 pub(crate) fn pass_io(p: &Pass) -> (Vec<TexId>, Vec<TexId>) {
-    let writes = p.colors.iter().map(|c| c.0).chain(p.depth.map(|d| d.0));
-    (p.reads.clone(), writes.collect())
+    let writes = p
+        .colors
+        .iter()
+        .map(|c| c.0)
+        .chain(p.depth.map(|d| d.0))
+        .chain(p.storage.iter().copied());
+    let mut reads = p.reads.clone();
+    let mut writes: Vec<TexId> = writes.collect();
+    for &(b, _, mode) in &p.buffers {
+        let id = TexId(b.0);
+        if mode != BufMode::Write {
+            reads.push(id);
+        }
+        if mode != BufMode::Read {
+            writes.push(id);
+        }
+    }
+    (reads, writes)
 }
 
 fn validate(d: &Decls) -> Result<(), GraphError> {
@@ -378,6 +525,7 @@ fn validate(d: &Decls) -> Result<(), GraphError> {
 pub(crate) fn plan(
     d: &Decls,
     known: &HashMap<TextureHandle, TextureState>,
+    known_bufs: &HashMap<BufferHandle, BufferState>,
 ) -> Result<Plan, GraphError> {
     validate(d)?;
     let (n, np) = (d.res.len(), d.passes.len());
@@ -458,21 +606,38 @@ pub(crate) fn plan(
 
     // Barriers. Physical state lives per import and per slot.
     let phys = |r: usize| slot_of[r].map_or(r, |s| n + s);
-    let mut state = vec![TextureState::Undefined; n + slots.len()];
+    let mut state = vec![St::T(TextureState::Undefined); n + slots.len()];
+    for (i, r) in d.res.iter().enumerate() {
+        if matches!(
+            r.kind,
+            ResKind::TransientBuf(_) | ResKind::ImportedBuf { .. }
+        ) {
+            state[i] = St::B(BufferState::Undefined);
+        }
+    }
     let mut has_state = vec![true; n];
     let mut written = vec![false; n];
     for (i, r) in d.res.iter().enumerate() {
-        if let ResKind::Imported {
-            texture, initial, ..
-        } = &r.kind
-        {
-            match initial.or(known.get(texture).copied()) {
+        match &r.kind {
+            ResKind::Imported {
+                texture, initial, ..
+            } => match initial.or(known.get(texture).copied()) {
                 Some(s) => {
-                    state[i] = s;
+                    state[i] = St::T(s);
                     written[i] = s != TextureState::Undefined;
                 }
                 None => has_state[i] = false,
+            },
+            // A persistent buffer always has contents; an unknown state starts Undefined.
+            ResKind::ImportedBuf { buffer, initial } => {
+                state[i] = St::B(
+                    initial
+                        .or(known_bufs.get(buffer).copied())
+                        .unwrap_or(BufferState::Undefined),
+                );
+                written[i] = true;
             }
+            _ => {}
         }
     }
     let mut barriers = Vec::new();
@@ -522,14 +687,14 @@ pub(crate) fn plan(
             });
         }
         let cur = state[phys(r)];
-        if cur != fin {
+        if cur != St::T(fin) {
             barriers.push(Barrier {
                 before: order.len(),
                 tex: t,
                 from: cur,
-                to: fin,
+                to: St::T(fin),
             });
-            state[phys(r)] = fin;
+            state[phys(r)] = St::T(fin);
         }
     }
     let res_final = (0..n).map(|r| state[phys(r)]).collect();
@@ -539,7 +704,13 @@ pub(crate) fn plan(
         barriers,
         lifetime,
         slot_of,
-        slot_final: state[n..].to_vec(),
+        slot_final: state[n..]
+            .iter()
+            .map(|s| match s {
+                St::T(t) => *t,
+                St::B(_) => TextureState::Undefined,
+            })
+            .collect(),
         res_final,
         slots,
     })
@@ -572,7 +743,7 @@ mod tests {
     }
 
     fn run(d: &Decls) -> Result<Plan, GraphError> {
-        plan(d, &HashMap::new())
+        plan(d, &HashMap::new(), &HashMap::new())
     }
 
     fn names(d: &Decls, p: &Plan) -> Vec<String> {
@@ -586,7 +757,25 @@ mod tests {
         p.barriers
             .iter()
             .filter(|b| b.tex == tex)
-            .map(|b| (b.before, b.from, b.to))
+            .map(|b| (b.before, tex_of(b.from), tex_of(b.to)))
+            .collect()
+    }
+
+    fn tex_of(s: St) -> TextureState {
+        match s {
+            St::T(t) => t,
+            St::B(b) => panic!("buffer state {b:?} where a texture state was expected"),
+        }
+    }
+
+    fn buf_bar(p: &Plan, b: BufId) -> Vec<(usize, BufferState, BufferState)> {
+        p.barriers
+            .iter()
+            .filter(|x| x.tex.0 == b.0)
+            .map(|x| match (x.from, x.to) {
+                (St::B(f), St::B(t)) => (x.before, f, t),
+                _ => panic!("texture barrier on a buffer"),
+            })
             .collect()
     }
 
@@ -694,9 +883,9 @@ mod tests {
             initial: None,
         };
         let known = HashMap::from([(h, Sr)]);
-        let p = plan(&d2, &known).unwrap();
+        let p = plan(&d2, &known, &HashMap::new()).unwrap();
         assert_eq!(bar(&p, shadow)[0], (0, Sr, Dep));
-        assert_eq!(p.res_final[shadow.0 as usize], Sr);
+        assert_eq!(p.res_final[shadow.0 as usize], St::T(Sr));
         assert!(matches!(run(&d2), Err(GraphError::NoInitialState { .. })));
     }
 
@@ -805,5 +994,213 @@ mod tests {
         // Exported transients are never recycled.
         d.exports.push((a, Sr));
         assert_ne!(run(&d).unwrap().slots.len(), 2);
+    }
+
+    use BufferState as B;
+
+    fn tbuf(d: &mut Decls, n: &'static str) -> BufId {
+        d.transient_buffer(
+            n.into(),
+            TransientBufferDesc {
+                size: 256,
+                usage: BufferUsage::STORAGE | BufferUsage::INDIRECT | BufferUsage::TRANSFER_DST,
+            },
+        )
+    }
+
+    /// reset (fill) -> cull (modify counts, write commands) -> draw (indirect reads) -> draw 2.
+    #[test]
+    fn buffer_barriers_for_a_culling_frame() {
+        let h = handles(1);
+        let mut d = Decls::default();
+        let counts = tbuf(&mut d, "counts");
+        let cmds = tbuf(&mut d, "cmds");
+        let hdr = d.import("hdr".into(), h[0], (8, 8), Some(Un));
+        d.passes
+            .push(Pass::new("reset").write_buffer(counts, B::TransferDst));
+        d.passes.push(
+            Pass::new("cull")
+                .modify_buffer(counts, B::ShaderWrite)
+                .write_buffer(cmds, B::ShaderWrite),
+        );
+        for (name, load) in [("draw1", LoadOp::DontCare), ("draw2", LoadOp::Load)] {
+            d.passes.push(
+                Pass::new(name)
+                    .read_buffer(cmds, B::Indirect)
+                    .read_buffer(counts, B::Indirect)
+                    .color(
+                        hdr,
+                        ColorTarget {
+                            load,
+                            ..ColorTarget::dont_care()
+                        },
+                    ),
+            );
+        }
+        d.exports.push((hdr, Sr));
+        let p = run(&d).unwrap();
+        assert_eq!(names(&d, &p), ["reset", "cull", "draw1", "draw2"]);
+        // The first use needs no barrier source; writes are chained; a second reader is free.
+        assert_eq!(
+            buf_bar(&p, counts),
+            [
+                (0, B::Undefined, B::TransferDst),
+                (1, B::TransferDst, B::ShaderWrite),
+                (2, B::ShaderWrite, B::Indirect)
+            ]
+        );
+        assert_eq!(
+            buf_bar(&p, cmds),
+            [
+                (1, B::Undefined, B::ShaderWrite),
+                (2, B::ShaderWrite, B::Indirect)
+            ]
+        );
+        assert_eq!(p.res_final[cmds.0 as usize], St::B(B::Indirect));
+    }
+
+    #[test]
+    fn consecutive_buffer_writes_and_read_state_changes_barrier() {
+        let mut d = Decls::default();
+        let b = tbuf(&mut d, "b");
+        d.passes
+            .push(Pass::new("w1").write_buffer(b, B::ShaderWrite));
+        d.passes
+            .push(Pass::new("w2").modify_buffer(b, B::ShaderWrite));
+        d.passes
+            .push(Pass::new("r1").read_buffer(b, B::ShaderRead).side_effect());
+        d.passes
+            .push(Pass::new("r2").read_buffer(b, B::ShaderRead).side_effect());
+        d.passes
+            .push(Pass::new("r3").read_buffer(b, B::Indirect).side_effect());
+        d.passes.push(
+            Pass::new("w3")
+                .write_buffer(b, B::TransferDst)
+                .side_effect(),
+        );
+        let p = run(&d).unwrap();
+        assert_eq!(
+            buf_bar(&p, b),
+            [
+                (0, B::Undefined, B::ShaderWrite),
+                (1, B::ShaderWrite, B::ShaderWrite),
+                (2, B::ShaderWrite, B::ShaderRead),
+                (4, B::ShaderRead, B::Indirect),
+                (5, B::Indirect, B::TransferDst)
+            ]
+        );
+    }
+
+    #[test]
+    fn buffer_dataflow_errors_and_culling() {
+        // Reading a transient buffer nobody wrote.
+        let mut d = Decls::default();
+        let b = tbuf(&mut d, "scratch");
+        d.passes.push(
+            Pass::new("reader")
+                .read_buffer(b, B::ShaderRead)
+                .side_effect(),
+        );
+        assert_eq!(
+            msg(run(&d)),
+            "pass `reader` reads `scratch` before any pass wrote it"
+        );
+        // Modifying one needs contents as well; a pure write does not.
+        let mut d = Decls::default();
+        let b = tbuf(&mut d, "scratch");
+        d.passes.push(
+            Pass::new("rmw")
+                .modify_buffer(b, B::ShaderWrite)
+                .side_effect(),
+        );
+        assert!(matches!(run(&d), Err(GraphError::ReadBeforeWrite { .. })));
+        // Twice in one pass.
+        let mut d = Decls::default();
+        let b = tbuf(&mut d, "scratch");
+        d.passes.push(
+            Pass::new("p")
+                .write_buffer(b, B::ShaderWrite)
+                .read_buffer(b, B::ShaderRead)
+                .side_effect(),
+        );
+        assert_eq!(msg(run(&d)), "pass `p` both reads and writes `scratch`");
+        // A cull pass whose output nobody reads is dropped; one feeding a live pass is kept.
+        let mut d = Decls::default();
+        let (dead, live) = (tbuf(&mut d, "dead"), tbuf(&mut d, "live"));
+        d.passes
+            .push(Pass::new("dead_cull").write_buffer(dead, B::ShaderWrite));
+        d.passes
+            .push(Pass::new("live_cull").write_buffer(live, B::ShaderWrite));
+        d.passes.push(
+            Pass::new("draw")
+                .read_buffer(live, B::Indirect)
+                .side_effect(),
+        );
+        assert_eq!(names(&d, &run(&d).unwrap()), ["live_cull", "draw"]);
+    }
+
+    #[test]
+    fn imported_buffer_state_is_remembered_and_never_unknown() {
+        let mut p = foundation::Pool::<rhi::BufferTag>::new();
+        let h = p.insert(rhi::BufferTag);
+        let mut d = Decls::default();
+        let b = d.import_buffer("instances".into(), h, None);
+        assert_eq!(d.import_buffer("again".into(), h, None), b, "deduplicated");
+        d.passes.push(
+            Pass::new("cull")
+                .read_buffer(b, B::ShaderRead)
+                .side_effect(),
+        );
+        // Unknown: starts Undefined (no error); remembered: continues from it.
+        let first = plan(&d, &HashMap::new(), &HashMap::new()).unwrap();
+        assert_eq!(buf_bar(&first, b), [(0, B::Undefined, B::ShaderRead)]);
+        let known = HashMap::from([(h, B::TransferDst)]);
+        let next = plan(&d, &HashMap::new(), &known).unwrap();
+        assert_eq!(buf_bar(&next, b), [(0, B::TransferDst, B::ShaderRead)]);
+        assert_eq!(next.res_final[b.0 as usize], St::B(B::ShaderRead));
+    }
+
+    /// The depth pyramid: each mip view is its own graph texture. Mip k is written by a compute
+    /// pass (StorageWrite) and sampled by the pass that builds mip k+1, so only the written mip
+    /// ever transitions; the consumer samples all of them.
+    #[test]
+    fn per_mip_views_are_tracked_independently() {
+        let h = handles(4);
+        let mut d = Decls::default();
+        let mips: Vec<TexId> = (0..3)
+            .map(|i| d.import(format!("mip{i}").into(), h[i], (8 >> i, 8 >> i), None))
+            .collect();
+        let depth = d.import("depth".into(), h[3], (16, 16), Some(Dep));
+        d.passes
+            .push(Pass::new("hiz0").read(depth).write_storage(mips[0]));
+        for i in 1..3 {
+            d.passes.push(
+                Pass::new(format!("hiz{i}"))
+                    .read(mips[i - 1])
+                    .write_storage(mips[i]),
+            );
+        }
+        d.passes.push(
+            Pass::new("cull2")
+                .read(mips[0])
+                .read(mips[1])
+                .read(mips[2])
+                .side_effect(),
+        );
+        // Last frame left every mip sampled.
+        let known: HashMap<_, _> = h[..3].iter().map(|&t| (t, Sr)).collect();
+        let p = plan(&d, &known, &HashMap::new()).unwrap();
+        assert_eq!(names(&d, &p), ["hiz0", "hiz1", "hiz2", "cull2"]);
+        let sw = TextureState::StorageWrite;
+        assert_eq!(bar(&p, depth), [(0, Dep, Sr)]);
+        assert_eq!(bar(&p, mips[0]), [(0, Sr, sw), (1, sw, Sr)]);
+        assert_eq!(bar(&p, mips[1]), [(1, Sr, sw), (2, sw, Sr)]);
+        // The last mip is only sampled by the consumer.
+        assert_eq!(bar(&p, mips[2]), [(2, Sr, sw), (3, sw, Sr)]);
+        // A storage write does not need earlier contents; sampling a never-written mip fails.
+        let mut d2 = d.clone();
+        d2.passes.remove(0);
+        let e = plan(&d2, &HashMap::new(), &HashMap::new());
+        assert!(matches!(e, Err(GraphError::NoInitialState { .. })));
     }
 }

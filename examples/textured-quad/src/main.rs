@@ -172,6 +172,9 @@ impl TexturedQuad {
             height: TEX_SIZE,
             format: Format::Rgba8Srgb,
             usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+            mip_levels: 1,
+            array_layers: 1,
+            cube: false,
         })?;
         device.upload_texture(texture, &checkerboard())?;
         let sampler = device.create_sampler(&SamplerDesc {

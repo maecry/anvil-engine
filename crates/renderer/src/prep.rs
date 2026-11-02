@@ -1,12 +1,20 @@
-//! Parallel CPU preparation (ADR-0013 §3): instance packing, frustum culling and draw-list
-//! sorting on the `rayon` pool. Every function returns exactly what the serial loop would
-//! (order-preserving collects, stable sorts); the tests compare against serial references.
+//! Parallel CPU preparation (ADR-0013 §3, §6): the persistent scene cache that finds the
+//! instances changed since the previous frame, frustum culling and draw-list sorting on the
+//! `rayon` pool. Every function returns exactly what the serial loop would (order-preserving
+//! collects, stable sorts); the tests compare against serial references.
+//!
+//! Change detection compares each [`MeshInstance`] with the one at the same scene index last
+//! frame (bitwise-equal fields) instead of adding stable ids or generations to the scene API:
+//! the app keeps rebuilding `RenderScene` the way it always did, the comparison is one pass over
+//! `n` instances (about 150 bytes each, parallel), and an unchanged scene uploads nothing.
+//! shortcut: instance identity is its scene index, so removing an instance from the middle
+//! re-uploads everything after it; add stable instance ids when scenes churn.
 
 use foundation::math::{Mat4, Vec3};
 use rayon::prelude::*;
 
-use crate::cull::{Frustum, transform_sphere};
-use crate::gpu::GpuInstance;
+use crate::cull::{Frustum, max_scale, transform_sphere};
+use crate::gpu::{FLAG_BLEND, FLAG_VALID, GpuInstance};
 use crate::passes::Draw;
 use crate::scene::MeshInstance;
 
@@ -18,9 +26,12 @@ pub(crate) const PAR_MIN: usize = 2048;
 /// A scene instance after resolving its mesh and material, before world bounds.
 #[derive(Clone, Copy)]
 pub(crate) struct Resolved {
-    pub vertex_address: u64,
-    pub index_buffer: rhi::BufferHandle,
+    /// Index of the mesh record in the GPU mesh table.
+    pub mesh: u32,
+    /// Level 0 of the mesh in the arena.
+    pub first_index: u32,
     pub index_count: u32,
+    pub vertex_offset: i32,
     /// Object-space bounding sphere.
     pub center: Vec3,
     pub radius: f32,
@@ -31,100 +42,170 @@ pub(crate) struct Resolved {
     pub blend: bool,
 }
 
-/// One drawable instance with its world-space bounds.
+/// One drawable instance with its world-space bounds. `draw.depth` is filled when culling.
 #[derive(Clone, Copy)]
 pub(crate) struct Item {
     pub draw: Draw,
     pub center: Vec3,
     pub radius: f32,
     pub blend: bool,
-    /// Index into the scene's instance list.
-    src: u32,
-    material: u32,
 }
 
-/// Buffers reused every frame: fresh multi-megabyte allocations page-fault on every first touch,
-/// which costs more than the packing itself and does not scale across threads.
+/// The persistent scene: what the GPU instance buffer holds, plus the CPU-side items for the
+/// CPU culling path and the transparent pass.
 #[derive(Default)]
-pub(crate) struct Scratch {
-    slots: Vec<Option<Item>>,
-    /// Drawable instances in scene order, compacted.
-    pub items: Vec<Item>,
-    /// GPU instance data, parallel to `items`.
-    pub instances: Vec<GpuInstance>,
+pub(crate) struct SceneCache {
+    /// Last frame's scene instances, by scene index.
+    prev: Vec<MeshInstance>,
+    /// Drawable items by slot (`None` for unresolvable instances).
+    pub items: Vec<Option<Item>>,
+    /// Mirror of the GPU instance buffer contents.
+    pub gpu: Vec<GpuInstance>,
+    /// Slots updated by the last [`SceneCache::update`], ascending.
+    pub changed: Vec<u32>,
+    /// Opaque (non-blended) drawable instances per pipeline variant.
+    pub variant_counts: [u32; 4],
+    /// Blended items, rebuilt when something changed.
+    pub blended: Vec<Item>,
 }
 
-/// Resolves, bounds and packs every instance for which `resolve` returns `Some` into
-/// `scratch.items` / `scratch.instances`; `Draw::instance` is the position in those arrays.
-/// `view` gives the sort depth.
-pub(crate) fn pack(
-    scratch: &mut Scratch,
-    meshes: &[MeshInstance],
-    view: &Mat4,
-    resolve: impl Fn(&MeshInstance) -> Option<Resolved> + Sync,
-) {
-    let Scratch {
-        slots,
-        items,
-        instances,
-    } = scratch;
-    slots.clear();
-    slots.par_extend(
-        meshes
-            .par_iter()
-            .enumerate()
-            .with_min_len(PAR_MIN)
-            .map(|(src, inst)| {
-                let r = resolve(inst)?;
+impl SceneCache {
+    /// Number of instances in the scene.
+    pub fn len(&self) -> usize {
+        self.gpu.len()
+    }
+
+    /// Forgets last frame's scene: the next update treats every instance as changed (call when
+    /// meshes or materials were destroyed, so resolved data cannot go stale).
+    pub fn invalidate(&mut self) {
+        self.prev.clear();
+    }
+
+    /// Diffs `meshes` against last frame's, re-resolves and re-packs the changed instances and
+    /// fills `changed`. `resolve` maps an instance to its mesh and material data.
+    pub fn update(
+        &mut self,
+        meshes: &[MeshInstance],
+        resolve: impl Fn(&MeshInstance) -> Option<Resolved> + Sync,
+    ) {
+        let n = meshes.len();
+        let prev = &self.prev;
+        let differs = |i: &usize| prev.get(*i) != Some(&meshes[*i]);
+        self.changed.clear();
+        if n >= PAR_MIN {
+            self.changed.par_extend(
+                (0..n)
+                    .into_par_iter()
+                    .with_min_len(PAR_MIN)
+                    .filter(differs)
+                    .map(|i| i as u32),
+            );
+        } else {
+            self.changed
+                .extend((0..n).filter(differs).map(|i| i as u32));
+        }
+        let pack = |&slot: &u32| {
+            let inst = &meshes[slot as usize];
+            let item = resolve(inst).map(|r| {
                 let (center, radius) = transform_sphere(&inst.transform, r.center, r.radius);
-                Some(Item {
+                let gpu = GpuInstance {
+                    model: inst.transform,
+                    normal_matrix: inst.transform.inverse().transpose(),
+                    prev_model: inst.prev_transform,
+                    sphere: [center.x, center.y, center.z, radius],
+                    material: r.material,
+                    mesh: r.mesh,
+                    flags: r.variant as u32 | FLAG_VALID | if r.blend { FLAG_BLEND } else { 0 },
+                    scale: max_scale(&inst.transform),
+                };
+                let item = Item {
                     draw: Draw {
-                        vertex_address: r.vertex_address,
-                        index_buffer: r.index_buffer,
+                        first_index: r.first_index,
                         index_count: r.index_count,
-                        instance: 0,
+                        vertex_offset: r.vertex_offset,
+                        instance: slot,
                         variant: r.variant,
-                        depth: -view.transform_point3(center).z,
+                        depth: 0.0,
                     },
                     center,
                     radius,
                     blend: r.blend,
-                    src: src as u32,
-                    material: r.material,
-                })
-            }),
-    );
-    items.clear();
-    items.extend(
-        slots
-            .iter()
-            .flatten()
-            .copied()
-            .enumerate()
-            .map(|(i, mut it)| {
-                it.draw.instance = i as u32;
-                it
-            }),
-    );
-    instances.clear();
-    instances.par_extend(items.par_iter().with_min_len(PAR_MIN).map(|it| {
-        let inst = &meshes[it.src as usize];
-        GpuInstance {
-            model: inst.transform,
-            normal_matrix: inst.transform.inverse().transpose(),
-            prev_model: inst.prev_transform,
-            material: it.material,
-            pad: [0; 3],
+                };
+                (gpu, item)
+            });
+            item.map_or((bytemuck::Zeroable::zeroed(), None), |(g, i)| (g, Some(i)))
+        };
+        let packed: Vec<(GpuInstance, Option<Item>)> = if self.changed.len() >= PAR_MIN {
+            self.changed
+                .par_iter()
+                .with_min_len(PAR_MIN)
+                .map(pack)
+                .collect()
+        } else {
+            self.changed.iter().map(pack).collect()
+        };
+        self.gpu.resize(n, bytemuck::Zeroable::zeroed());
+        self.items.resize(n, None);
+        self.prev.truncate(n);
+        for (&slot, (gpu, item)) in self.changed.iter().zip(packed) {
+            let s = slot as usize;
+            self.gpu[s] = gpu;
+            self.items[s] = item;
+            if s < self.prev.len() {
+                self.prev[s] = meshes[s];
+            } else {
+                self.prev.push(meshes[s]);
+            }
         }
-    }));
+        debug_assert_eq!(self.prev.len(), n);
+        if !self.changed.is_empty() {
+            self.variant_counts = [0; 4];
+            self.blended.clear();
+            for it in self.items.iter().flatten() {
+                if it.blend {
+                    self.blended.push(*it);
+                } else {
+                    self.variant_counts[it.draw.variant] += 1;
+                }
+            }
+        }
+    }
 }
 
-/// Items whose bounding sphere touches the frustum, in input order.
-pub(crate) fn cull<'a>(items: &'a [Item], f: &Frustum) -> Vec<&'a Item> {
+/// Items whose bounding sphere touches the frustum, in input order, with the view depth (the
+/// sort key) filled in.
+pub(crate) fn cull(items: &[Option<Item>], f: &Frustum, view: &Mat4) -> Vec<Item> {
+    let keep = |it: &Item| {
+        f.intersects_sphere(it.center, it.radius).then(|| {
+            let mut it = *it;
+            it.draw.depth = -view.transform_point3(it.center).z;
+            it
+        })
+    };
+    if items.len() >= PAR_MIN {
+        items
+            .par_iter()
+            .with_min_len(PAR_MIN)
+            .filter_map(|o| o.as_ref().and_then(keep))
+            .collect()
+    } else {
+        items
+            .iter()
+            .filter_map(|o| o.as_ref().and_then(keep))
+            .collect()
+    }
+}
+
+/// [`cull`] over a plain item list (the blended items).
+pub(crate) fn cull_list(items: &[Item], f: &Frustum, view: &Mat4) -> Vec<Item> {
     items
-        .par_iter()
-        .with_min_len(PAR_MIN)
+        .iter()
         .filter(|it| f.intersects_sphere(it.center, it.radius))
+        .map(|it| {
+            let mut it = *it;
+            it.draw.depth = -view.transform_point3(it.center).z;
+            it
+        })
         .collect()
 }
 
@@ -146,13 +227,21 @@ pub(crate) fn sort_camera(opaque: &mut [Draw], blended: &mut [Draw]) {
 }
 
 /// Shadow casters (everything but blended objects) inside `f`, grouped by variant.
-pub(crate) fn shadow_draws(items: &[Item], f: &Frustum) -> Vec<Draw> {
-    let mut v: Vec<Draw> = items
-        .par_iter()
-        .with_min_len(PAR_MIN)
-        .filter(|it| !it.blend && f.intersects_sphere(it.center, it.radius))
-        .map(|it| it.draw)
-        .collect();
+pub(crate) fn shadow_draws(items: &[Option<Item>], f: &Frustum) -> Vec<Draw> {
+    let keep =
+        |it: &Item| (!it.blend && f.intersects_sphere(it.center, it.radius)).then_some(it.draw);
+    let mut v: Vec<Draw> = if items.len() >= PAR_MIN {
+        items
+            .par_iter()
+            .with_min_len(PAR_MIN)
+            .filter_map(|o| o.as_ref().and_then(keep))
+            .collect()
+    } else {
+        items
+            .iter()
+            .filter_map(|o| o.as_ref().and_then(keep))
+            .collect()
+    };
     if v.len() < PAR_MIN {
         v.sort_by_key(|d| d.variant);
     } else {
@@ -197,9 +286,10 @@ mod tests {
     fn resolve(inst: &MeshInstance) -> Option<Resolved> {
         let k = (inst.transform.w_axis.x * 3.0) as i32;
         (k % 7 != 0).then_some(Resolved {
-            vertex_address: 1,
-            index_buffer: rhi::BufferHandle::NULL,
+            mesh: 3,
+            first_index: 12,
             index_count: 36,
+            vertex_offset: 5,
             center: Vec3::ZERO,
             radius: 0.8,
             material: k.unsigned_abs(),
@@ -232,54 +322,63 @@ mod tests {
     #[test]
     fn parallel_matches_serial() {
         let (meshes, view, frustum) = setup();
-        let mut scratch = Scratch::default();
-        pack(&mut scratch, &meshes, &view, resolve);
-        let (items, instances) = (&scratch.items, &scratch.instances);
+        let mut cache = SceneCache::default();
+        cache.update(&meshes, resolve);
+        let items = &cache.items;
+        assert_eq!((cache.len(), items.len()), (meshes.len(), meshes.len()));
+        assert_eq!(
+            cache.changed.len(),
+            meshes.len(),
+            "first frame: all changed"
+        );
 
-        // Serial pack.
-        let mut serial_items = Vec::new();
-        for inst in &meshes {
-            if let Some(r) = resolve(inst) {
-                let (c, rad) = transform_sphere(&inst.transform, r.center, r.radius);
-                serial_items.push((
-                    c,
-                    rad,
-                    -view.transform_point3(c).z,
-                    r.variant,
-                    r.blend,
-                    r.material,
-                ));
+        // Serial pack against the cache, slot by slot (unresolvable slots stay empty).
+        let mut drawable = 0;
+        for (slot, inst) in meshes.iter().enumerate() {
+            let (g, it) = (&cache.gpu[slot], &items[slot]);
+            match resolve(inst) {
+                None => assert!(it.is_none() && g.flags & FLAG_VALID == 0),
+                Some(r) => {
+                    drawable += 1;
+                    let it = it.as_ref().expect("resolved");
+                    let (c, rad) = transform_sphere(&inst.transform, r.center, r.radius);
+                    assert_eq!(
+                        (it.center, it.radius, it.draw.variant, it.blend),
+                        (c, rad, r.variant, r.blend)
+                    );
+                    assert_eq!(it.draw.instance, slot as u32);
+                    assert_eq!(g.sphere, [c.x, c.y, c.z, rad]);
+                    assert_eq!(
+                        (g.material, g.mesh, g.flags & 3),
+                        (r.material, 3, r.variant as u32)
+                    );
+                    assert_eq!(g.flags & FLAG_BLEND != 0, r.blend);
+                    assert_eq!(g.model, inst.transform);
+                }
             }
         }
-        assert_eq!(items.len(), serial_items.len());
-        assert!(items.len() < meshes.len());
-        for (i, (it, s)) in items.iter().zip(&serial_items).enumerate() {
-            assert_eq!(it.draw.instance, i as u32);
-            assert_eq!(
-                (
-                    it.center,
-                    it.radius,
-                    it.draw.depth,
-                    it.draw.variant,
-                    it.blend
-                ),
-                (s.0, s.1, s.2, s.3, s.4)
-            );
-            assert_eq!(instances[i].material, s.5);
-        }
+        assert!(drawable > 0 && drawable < meshes.len());
+        let opaque_total: u32 = cache.variant_counts.iter().sum();
+        assert_eq!(opaque_total as usize + cache.blended.len(), drawable);
 
         // Cull, partition and sort against plain iterators.
-        let kept = cull(items, &frustum);
-        let serial_kept: Vec<&Item> = items
+        let kept = cull(items, &frustum, &view);
+        let serial_kept: Vec<Item> = items
             .iter()
+            .flatten()
             .filter(|it| frustum.intersects_sphere(it.center, it.radius))
+            .copied()
             .collect();
-        assert!(!kept.is_empty() && kept.len() < items.len());
+        assert!(!kept.is_empty() && kept.len() < drawable);
+        assert_eq!(kept.len(), serial_kept.len());
         assert!(
             kept.iter()
                 .zip(&serial_kept)
-                .all(|(a, b)| std::ptr::eq(*a, *b))
-                && kept.len() == serial_kept.len()
+                .all(|(a, b)| a.draw.instance == b.draw.instance)
+        );
+        assert!(
+            kept.iter()
+                .all(|it| it.draw.depth == -view.transform_point3(it.center).z)
         );
 
         let (mut opaque, mut blended): (Vec<Draw>, Vec<Draw>) = (Vec::new(), Vec::new());
@@ -296,17 +395,63 @@ mod tests {
         sb.sort_by(|a, b| b.depth.total_cmp(&a.depth));
         assert!(opaque.iter().zip(&so).all(|(a, b)| same(a, b)));
         assert!(blended.iter().zip(&sb).all(|(a, b)| same(a, b)));
+        // The blended list culls like the full one.
+        let from_list = cull_list(&cache.blended, &frustum, &view);
+        assert_eq!(from_list.len(), blended.len());
 
         // Shadow lists.
         let sh = shadow_draws(items, &frustum);
         let mut ssh: Vec<Draw> = items
             .iter()
+            .flatten()
             .filter(|it| !it.blend && frustum.intersects_sphere(it.center, it.radius))
             .map(|it| it.draw)
             .collect();
         ssh.sort_by_key(|d| d.variant);
         assert_eq!(sh.len(), ssh.len());
         assert!(sh.iter().zip(&ssh).all(|(a, b)| same(a, b)));
+    }
+
+    #[test]
+    fn only_changed_instances_are_repacked() {
+        let mut meshes = scene(5000);
+        let mut cache = SceneCache::default();
+        let resolved = std::sync::atomic::AtomicUsize::new(0);
+        let counting = |i: &MeshInstance| {
+            resolved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            resolve(i)
+        };
+        cache.update(&meshes, counting);
+        assert_eq!(resolved.swap(0, std::sync::atomic::Ordering::Relaxed), 5000);
+        // Same scene: nothing to do.
+        cache.update(&meshes, counting);
+        assert!(cache.changed.is_empty());
+        assert_eq!(resolved.load(std::sync::atomic::Ordering::Relaxed), 0);
+        // Move two instances, one of them also gets a new previous transform.
+        let moved = Mat4::from_translation(Vec3::new(1.0, 2.0, 3.0)) * meshes[10].transform;
+        meshes[10] = MeshInstance {
+            transform: moved,
+            ..meshes[10]
+        };
+        meshes[4000].prev_transform = moved;
+        cache.update(&meshes, counting);
+        assert_eq!(cache.changed, [10, 4000]);
+        assert_eq!(resolved.swap(0, std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(cache.gpu[10].model, moved);
+        assert_eq!(cache.gpu[4000].prev_model, moved);
+        // Growing appends the new slots, shrinking drops them without touching the rest.
+        meshes.extend(scene(3));
+        cache.update(&meshes, counting);
+        assert_eq!(cache.changed, [5000, 5001, 5002]);
+        assert_eq!(cache.len(), 5003);
+        meshes.truncate(4990);
+        cache.update(&meshes, counting);
+        assert!(cache.changed.is_empty());
+        assert_eq!((cache.len(), cache.items.len()), (4990, 4990));
+        // Invalidation (a mesh was destroyed) re-resolves everything.
+        cache.invalidate();
+        cache.update(&meshes, counting);
+        assert_eq!(cache.changed.len(), 4990);
     }
 
     #[test]
@@ -318,15 +463,20 @@ mod tests {
                 .build()
                 .unwrap()
                 .install(|| {
-                    let mut scratch = Scratch::default();
-                    pack(&mut scratch, &meshes, &view, resolve);
-                    let mut v = shadow_draws(&scratch.items, &frustum);
+                    let mut cache = SceneCache::default();
+                    cache.update(&meshes, resolve);
+                    let mut v = shadow_draws(&cache.items, &frustum);
                     let (mut o, mut b) = (v.split_off(v.len() / 2), v.clone());
                     sort_camera(&mut o, &mut b);
-                    o.iter()
-                        .chain(&b)
-                        .map(|d| (d.instance, d.depth.to_bits()))
-                        .collect::<Vec<_>>()
+                    let kept = cull(&cache.items, &frustum, &view);
+                    (
+                        o.iter()
+                            .chain(&b)
+                            .map(|d| (d.instance, d.depth.to_bits()))
+                            .collect::<Vec<_>>(),
+                        cache.changed.clone(),
+                        kept.iter().map(|k| k.draw.instance).collect::<Vec<_>>(),
+                    )
                 })
         };
         assert_eq!(run(1), run(8));

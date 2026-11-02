@@ -88,3 +88,12 @@ Still open (M5): sparse/virtual textures and texture streaming interfaces.
 ## 16. Related modules
 
 MODULE-005-buffer-allocator, MODULE-006-texture-registry.
+
+## 17. M5b: the mesh arena (ADR-0013 §6)
+
+All meshes of a renderer live in one shared vertex buffer and one shared index buffer (`crates/renderer/src/arena.rs`), suballocated, so one `bind_index_buffer` and one vertex buffer address (a push constant) serve every draw of every pass, and the indirect commands of GPU culling can address any mesh.
+
+- **Layout.** `Arena` owns two `GpuOnly` buffers (`arena.vertices`: `STORAGE`, read through BDA; `arena.indices`: `INDEX`), capacity 256 Ki vertices (12 MiB) and 1 Mi 32-bit indices (4 MiB), and two `RangeAlloc`s (first fit over a sorted free list, neighbours coalesce on free; unit-tested for fragmentation). A mesh gets one vertex range and one index range holding all its levels of detail back to back; its indices are mesh-local, so a draw adds the mesh's first vertex as the base vertex (`vertex_offset` of the indirect command; `gl_VertexIndex` includes it).
+- **Mesh record.** `Renderer::create_mesh` fills a `GpuMesh` (80 bytes: object-space bounding sphere, per-level `first_index` and `index_count`, per-level geometric error, `vertex_offset`, level count) and uploads vertices, indices and the record into a fixed `GpuOnly` mesh table (4096 records, indexed by the mesh handle index) with `Device::upload_buffer`, which orders them before the frame's commands. The CPU path and the transparent pass use level 0 of the same record. `destroy_mesh` returns the ranges to the arena and invalidates the scene cache (instances that still reference the mesh are skipped with a warning).
+- **Limits (shortcuts).** Fixed capacities: `create_mesh` fails with `InvalidDescriptor` when the arena or the table is full; growing means allocating a bigger pair and re-uploading (M6 asset streaming). Meshes are never moved or compacted. Vertex format and index width are fixed (48-byte vertices, `u32`).
+- **Levels of detail.** `MeshData::lods` (finest first, up to `MAX_LODS - 1` = 3 coarser levels, each with an object-space error) is used when given; otherwise `generate_lods` (`meshopt::simplify`, absolute error, halving the triangle count per level, stop when a level saves less than 10 %, none below 64 triangles) fills it. Test `generated_lods_shrink_with_growing_error`.

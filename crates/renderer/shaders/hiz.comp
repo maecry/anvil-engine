@@ -1,0 +1,24 @@
+#version 460
+// Depth pyramid reduction (reverse-Z: the farthest depth is the MINIMUM). One dispatch per mip:
+// mip 0 reads the depth buffer, mip k reads mip k-1 (both through bindless sampled slots),
+// every mip is written through its own storage image slot.
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(set = 0, binding = 0) uniform texture2D textures[];
+layout(set = 0, binding = 2, r32f) uniform writeonly image2D storage_images[];
+layout(push_constant, std430) uniform Push { uint src; uint dst; uvec2 src_size; uvec2 dst_size; } pc;
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 d = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(d, ivec2(pc.dst_size)))) return;
+    ivec2 s = ivec2(pc.src_size);
+    // An odd source size leaves one row/column that no 2x2 block covers: the last texel takes it.
+    ivec2 n = ivec2(2) + ivec2(equal(d, ivec2(pc.dst_size) - 1)) * (s & 1);
+    float m = 1.0;
+    for (int y = 0; y < n.y; ++y)
+        for (int x = 0; x < n.x; ++x)
+            m = min(m, texelFetch(textures[nonuniformEXT(pc.src)], min(d * 2 + ivec2(x, y), s - 1), 0).x);
+    imageStore(storage_images[nonuniformEXT(pc.dst)], d, vec4(m));
+}
