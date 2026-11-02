@@ -25,6 +25,8 @@ pub(crate) struct ForwardInputs<'a> {
     /// BDA of frame, instance, light and material data.
     pub addresses: [u64; 4],
     pub draws: &'a [Draw],
+    /// Drawn after the opaques in the same scope (reverse-Z far plane, no depth write).
+    pub skybox: PipelineHandle,
 }
 
 /// Inputs of [`shadow_pass`].
@@ -36,6 +38,16 @@ pub(crate) struct ShadowInputs<'a> {
     pub initialized: bool,
     pub addresses: [u64; 4],
     pub draws: &'a [Draw],
+}
+
+/// Inputs of [`bake_pass`]: one fullscreen fragment pass into an environment texture.
+pub(crate) struct BakeInputs<'a> {
+    pub pipeline: PipelineHandle,
+    pub target: TextureHandle,
+    pub extent: (u32, u32),
+    /// False on the first bake of this texture (still `Undefined`).
+    pub initialized: bool,
+    pub push: &'a [u8],
 }
 
 /// Inputs of [`tonemap_pass`].
@@ -115,6 +127,42 @@ pub(crate) fn shadow_pass<C: CommandEncoder>(cmd: &mut C, i: &ShadowInputs) {
     cmd.end_label();
 }
 
+/// Renders a fullscreen triangle with `pipeline` into `target` (sky, irradiance, one prefilter
+/// level or the BRDF LUT; no depth) and leaves it in `ShaderRead`.
+pub(crate) fn bake_pass<C: CommandEncoder>(cmd: &mut C, b: &BakeInputs) {
+    cmd.begin_label("bake", [0.8, 0.8, 0.3, 1.0]);
+    let from = if b.initialized {
+        TextureState::ShaderRead
+    } else {
+        TextureState::Undefined
+    };
+    cmd.texture_barrier(b.target, from, TextureState::ColorAttachment);
+    cmd.begin_rendering(&RenderingDesc {
+        color: &[ColorAttachment {
+            texture: b.target,
+            load: LoadOp::DontCare,
+            store: StoreOp::Store,
+            clear: [0.0; 4],
+        }],
+        depth: None,
+        width: b.extent.0,
+        height: b.extent.1,
+    });
+    full_viewport(cmd, b.extent);
+    cmd.bind_pipeline(b.pipeline);
+    if !b.push.is_empty() {
+        cmd.push_constants(0, b.push);
+    }
+    cmd.draw(3, 1, 0, 0);
+    cmd.end_rendering();
+    cmd.texture_barrier(
+        b.target,
+        TextureState::ColorAttachment,
+        TextureState::ShaderRead,
+    );
+    cmd.end_label();
+}
+
 /// Forward opaque pass into the HDR target with reverse-Z depth; leaves HDR in `ShaderRead`.
 pub(crate) fn forward_pass<C: CommandEncoder>(cmd: &mut C, i: &ForwardInputs) {
     cmd.begin_label("forward", [0.3, 0.7, 0.3, 1.0]);
@@ -146,6 +194,13 @@ pub(crate) fn forward_pass<C: CommandEncoder>(cmd: &mut C, i: &ForwardInputs) {
     for d in i.draws {
         record_draw(cmd, &i.addresses, d);
     }
+    cmd.bind_pipeline(i.skybox);
+    let mut pc = [0u8; 40];
+    for (chunk, a) in pc.chunks_mut(8).zip(&i.addresses) {
+        chunk.copy_from_slice(&a.to_le_bytes());
+    }
+    cmd.push_constants(0, &pc);
+    cmd.draw(3, 1, 0, 0);
     cmd.end_rendering();
     cmd.texture_barrier(
         i.hdr,

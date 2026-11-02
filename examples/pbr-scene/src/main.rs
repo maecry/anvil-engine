@@ -14,7 +14,9 @@ use std::time::Instant;
 use anyhow::Context;
 use foundation::math::{Mat4, Quat, Vec3};
 use platform::{App, AppError, Control, Event, KeyCode, MouseButton, Window, WindowConfig};
-use renderer::{Camera, Light, MaterialDesc, MeshInstance, RenderScene, Renderer, mesh};
+use renderer::{
+    Camera, Environment, Light, MaterialDesc, MeshInstance, RenderScene, Renderer, mesh,
+};
 use rhi::{
     Acquire, Backend, BufferDesc, BufferUsage, CommandEncoder, Device, DeviceDesc,
     HasDisplayHandle, Instance, InstanceDesc, Memory, PresentStatus, SwapchainDesc,
@@ -45,9 +47,13 @@ fn checker(size: u32, cell: u32) -> Vec<u8> {
 const SUN_START: f32 = 0.35;
 
 /// Directional light pointing down, azimuth `a`.
+fn sun_direction(a: f32) -> Vec3 {
+    Vec3::new(a.cos() * 0.7, -0.6, a.sin() * 0.6)
+}
+
 fn sun(a: f32) -> Light {
     Light::Directional {
-        direction: Vec3::new(a.cos() * 0.7, -0.6, a.sin() * 0.6),
+        direction: sun_direction(a),
         color: Vec3::new(1.0, 0.96, 0.9),
         intensity: 2.5,
         cast_shadows: true,
@@ -115,7 +121,7 @@ impl PbrScene {
 
         let sphere = r.create_mesh(&device, "sphere", &mesh::uv_sphere(48, 24))?;
         let cube = r.create_mesh(&device, "cube", &mesh::cube())?;
-        let plane = r.create_mesh(&device, "plane", &mesh::plane(40.0))?;
+        let plane = r.create_mesh(&device, "plane", &mesh::plane(400.0))?;
         let checker_tex = r.create_texture(&device, "checker", &checker(64, 8), 64, 64, true)?;
 
         let ground = r.create_material(&MaterialDesc {
@@ -256,6 +262,11 @@ impl PbrScene {
             camera: scene_camera,
             meshes: g.instances.clone(),
             lights: g.lights.clone(),
+            // The sky's sun follows the shadow-casting directional light.
+            environment: Environment {
+                sun_direction: sun_direction(sun_angle),
+                ..Environment::default()
+            },
         };
         let readback = match &screenshot {
             Some(_) => Some(g.device.create_buffer(&BufferDesc {
@@ -430,9 +441,9 @@ fn main() -> anyhow::Result<()> {
         PbrScene {
             gfx: None,
             camera: FlyCamera {
-                position: Vec3::new(0.0, 3.0, 9.0),
+                position: Vec3::new(0.0, 2.2, 9.0),
                 yaw: 0.0,
-                pitch: -0.3,
+                pitch: -0.12,
             },
             keys: Vec::new(),
             looking: false,

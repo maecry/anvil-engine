@@ -95,3 +95,14 @@ Open: CI never run (no remote); headless swapchain test; wait_idle shortcuts on 
 | Visual check | Pending (manual) | `cargo run -p textured-quad` should show a checkerboard quad |
 
 Open: lavapipe/CI unverified; no staging ring (per-call staging); swapchain recreate still wait_idle.
+
+### M3 Core Renderer (2026-11-02)
+| Exit criterion | Status | Evidence |
+|---|---|---|
+| Complete PBR scene rendering | Done | `examples/pbr-scene`: glTF metallic-roughness materials (Cook-Torrance GGX), directional/point/spot lights, 2048 directional shadow map with PCF, procedural-sky IBL (irradiance, 6 prefiltered roughness levels, BRDF LUT), skybox, ACES tonemap, fly camera; renderer crate with extraction types (ADR-0011) |
+| No validation errors | Done | `pbr-scene`, `textured-quad`, `triangle`, 120 frames, sync validation: 0 errors / 0 warnings; `ANVIL_GPU_AV=1` run: 0 errors (4 layer-settings notices) |
+| Visual check | Done | `ANVIL_SCREENSHOT=path.png ANVIL_EXIT_AFTER_FRAMES=60 cargo run -p pbr-scene` writes a PNG: sky with horizon, soft shadows, coloured point/spot pools, metals reflecting the sky, blurrier reflections as roughness rises, no seam at the equirect wrap |
+
+Shortcuts / deferred (all documented in LAYER-005 §12a and the code as `shortcut:`): one shadow map, no cascades (M4); no point/spot shadows (M4); opaque materials only, no alpha blend/mask (M4); no clustered/Forward+ lighting, light count capped at 64 (M4); no visibility culling or sorting (M4, with the render graph); fixed 4 MiB upload ring; BRDF LUT baked on the first render rather than in `Renderer::new`; analytic sky only, HDR file loading and glTF import wait for the asset system (LAYER-009); sun disk clamped out of the IBL bakes (the sun is a directional light); material texture indices are not refcounted.
+
+Open: golden-image test (NFR-TEST-003) not yet automated; renderer is not yet built against a mock backend; render graph replaces the hand-written barriers in M4.

@@ -90,6 +90,37 @@ pub enum Light {
     },
 }
 
+/// Analytic sky used for the visible background and image-based lighting. The renderer re-bakes
+/// the environment textures only when this value changes (compared with `==`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Environment {
+    /// Direction the sunlight travels; keep equal to the shadow-casting directional light.
+    pub sun_direction: Vec3,
+    /// Linear sky color straight up.
+    pub zenith: Vec3,
+    /// Linear sky color at the horizon.
+    pub horizon: Vec3,
+    /// Linear color below the horizon.
+    pub ground: Vec3,
+    /// Linear color of the sun disk and glow.
+    pub sun_color: Vec3,
+    /// Multiplier on everything the environment contributes (background and lighting).
+    pub intensity: f32,
+}
+
+impl Default for Environment {
+    fn default() -> Self {
+        Self {
+            sun_direction: Vec3::new(0.4, -0.6, 0.3),
+            zenith: Vec3::new(0.12, 0.3, 0.75),
+            horizon: Vec3::new(0.7, 0.8, 0.95),
+            ground: Vec3::new(0.18, 0.17, 0.16),
+            sun_color: Vec3::new(1.0, 0.92, 0.8),
+            intensity: 1.0,
+        }
+    }
+}
+
 /// Maximum lights shaded per frame; extra lights are ignored (with a warning).
 pub const MAX_LIGHTS: usize = 64;
 
@@ -102,6 +133,8 @@ pub struct RenderScene {
     pub meshes: Vec<MeshInstance>,
     /// Lights, at most [`MAX_LIGHTS`] are shaded.
     pub lights: Vec<Light>,
+    /// Sky and image-based lighting.
+    pub environment: Environment,
 }
 
 #[cfg(test)]

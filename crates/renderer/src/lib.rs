@@ -6,6 +6,7 @@
 //! [`rhi::Device`] (ADR-0005), no Vulkan types are exposed.
 
 mod gpu;
+mod ibl;
 pub mod mesh;
 mod passes;
 mod renderer;
@@ -16,4 +17,4 @@ pub use mesh::{MeshData, Vertex};
 pub use renderer::{
     Material, MaterialDesc, MaterialId, Mesh, MeshId, Renderer, RendererStats, Texture, TextureId,
 };
-pub use scene::{Camera, Light, MAX_LIGHTS, MeshInstance, RenderScene};
+pub use scene::{Camera, Environment, Light, MAX_LIGHTS, MeshInstance, RenderScene};

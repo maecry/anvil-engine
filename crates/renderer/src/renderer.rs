@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use foundation::Handle;
 use foundation::Pool;
-use foundation::math::Mat4;
+use foundation::math::{Mat4, Vec3};
 use rhi::{
     AddressMode, BlendState, BufferDesc, BufferHandle, BufferUsage, CompareOp, CullMode, DepthBias,
     DepthState, Device, Filter, Format, FrontFace, GraphicsPipelineDesc, Memory, PipelineHandle,
@@ -14,6 +14,7 @@ use rhi::{
 };
 
 use crate::gpu::{GpuFrame, GpuInstance, GpuLight, GpuMaterial};
+use crate::ibl::Ibl;
 use crate::passes::{
     Draw, ForwardInputs, ShadowInputs, TonemapInputs, forward_pass, shadow_pass, tonemap_pass,
 };
@@ -24,7 +25,8 @@ static FORWARD_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forward.v
 static FORWARD_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/forward.frag.spv"));
 static SHADOW_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.spv"));
 static SHADOW_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.frag.spv"));
-static TONEMAP_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.vert.spv"));
+pub(crate) static TONEMAP_VERT: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.vert.spv"));
 static TONEMAP_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.frag.spv"));
 
 /// Size of each per-frame-in-flight upload ring.
@@ -34,7 +36,7 @@ const RING_BYTES: u64 = 4 << 20;
 const SHADOW_SIZE: u32 = 2048;
 /// The shadow volume covers the camera frustum up to this distance (meters).
 const SHADOW_DISTANCE: f32 = 50.0;
-const HDR_FORMAT: Format = Format::Rgba16Float;
+pub(crate) const HDR_FORMAT: Format = Format::Rgba16Float;
 const DEPTH_FORMAT: Format = Format::D32Sfloat;
 
 /// A GPU mesh (vertex buffer read through BDA, index buffer). Handle: [`MeshId`].
@@ -143,6 +145,7 @@ pub struct Renderer {
     shadow_initialized: bool,
     shadow_sampler: SamplerHandle,
     shadow_sampler_index: u32,
+    ibl: Ibl,
     targets: Targets,
     encode_srgb: bool,
     linear_repeat: SamplerHandle,
@@ -195,7 +198,7 @@ fn create_targets<D: Device>(d: &D, extent: (u32, u32)) -> Result<Targets, RhiEr
     })
 }
 
-fn make_pipeline<D: Device>(
+pub(crate) fn make_pipeline<D: Device>(
     d: &D,
     label: &str,
     vert: &[u8],
@@ -363,6 +366,7 @@ impl Renderer {
             shadow_initialized: false,
             shadow_sampler_index: device.sampler_index(shadow_sampler)?,
             shadow_sampler,
+            ibl: Ibl::new(device)?,
             targets,
             encode_srgb: !swapchain_format.is_srgb(),
             linear_repeat,
@@ -591,6 +595,12 @@ impl Renderer {
         let view = scene.camera.view();
         let proj = scene.camera.projection(w as f32 / h as f32);
         let cam = scene.camera.position;
+        self.ibl.bake(cmd, &scene.environment);
+        let ibl = self.ibl.indices();
+        let aspect = w as f32 / h as f32;
+        let tan_y = (scene.camera.fov_y * 0.5).tan();
+        let rot = scene.camera.rotation;
+        let (right, up, forward) = (rot * Vec3::X, rot * Vec3::Y, rot * Vec3::NEG_Z);
         if scene.lights.len() > MAX_LIGHTS {
             tracing::warn!(
                 lights = scene.lights.len(),
@@ -641,6 +651,16 @@ impl Renderer {
             },
             shadow_texel_world: fit.as_ref().map_or(0.0, |f| f.texel_world),
             pad: 0.0,
+            sky_index: ibl.sky,
+            irradiance_index: ibl.irradiance,
+            brdf_lut_index: ibl.lut,
+            ibl_sampler: ibl.sampler,
+            prefilter: ibl.prefilter,
+            env_intensity: scene.environment.intensity,
+            pad0: 0,
+            cam_right: [right.x, right.y, right.z, tan_y * aspect],
+            cam_up: [up.x, up.y, up.z, tan_y],
+            cam_forward: [forward.x, forward.y, forward.z, 0.0],
         };
 
         let mut instances = Vec::with_capacity(scene.meshes.len());
@@ -711,6 +731,7 @@ impl Renderer {
                 targets_initialized: self.targets.initialized,
                 addresses,
                 draws: &draws,
+                skybox: self.ibl.skybox,
             },
         );
         self.targets.initialized = true;
@@ -757,6 +778,7 @@ impl Renderer {
         device.destroy_texture(self.targets.depth);
         device.destroy_sampler(self.linear_repeat);
         device.destroy_sampler(self.linear_clamp);
+        self.ibl.destroy(device);
         device.destroy_texture(self.shadow);
         device.destroy_sampler(self.shadow_sampler);
         device.destroy_pipeline(self.shadow_pipeline);

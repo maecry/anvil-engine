@@ -753,6 +753,111 @@ fn sampled_depth_and_compare_sampler() {
 }
 
 #[test]
+fn depth_only_pipeline_renders_into_sampled_depth() {
+    let Some((inst, mut dev)) = setup() else {
+        return;
+    };
+    let q = Quad::new(&dev);
+    let vs = module(&dev, FLAT_VERT, "depth_only.vert");
+    let fs = module(&dev, EMPTY_FRAG, "depth_only.frag");
+    let pipeline = dev
+        .create_graphics_pipeline(&rhi::GraphicsPipelineDesc {
+            label: Some("depth_only"),
+            vertex: rhi::ShaderStageDesc {
+                module: vs,
+                entry: "main",
+            },
+            fragment: rhi::ShaderStageDesc {
+                module: fs,
+                entry: "main",
+            },
+            color_formats: &[],
+            depth: Some(rhi::DepthState {
+                format: Format::D32Sfloat,
+                compare: rhi::CompareOp::LessOrEqual,
+                write: true,
+                bias: Some(rhi::DepthBias {
+                    constant: 1.0,
+                    slope: 1.0,
+                    clamp: 0.0,
+                }),
+            }),
+            topology: rhi::PrimitiveTopology::TriangleList,
+            cull: rhi::CullMode::Front,
+            front_face: rhi::FrontFace::CounterClockwise,
+            blend: &[],
+        })
+        .unwrap();
+    let depth = dev
+        .create_texture(&tex_desc(
+            8,
+            8,
+            Format::D32Sfloat,
+            TextureUsage::DEPTH_ATTACHMENT | TextureUsage::SAMPLED,
+        ))
+        .unwrap();
+    frame(&mut dev, |c| {
+        c.texture_barrier(
+            depth,
+            TextureState::Undefined,
+            TextureState::DepthAttachment,
+        );
+        c.begin_rendering(&rhi::RenderingDesc {
+            color: &[],
+            depth: Some(rhi::DepthAttachment {
+                texture: depth,
+                load: rhi::LoadOp::Clear,
+                store: rhi::StoreOp::Store,
+                clear: 1.0,
+            }),
+            width: 8,
+            height: 8,
+        });
+        c.set_viewport(rhi::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 8.0,
+            height: 8.0,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        });
+        c.set_scissor(rhi::Rect2D {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        });
+        c.bind_pipeline(pipeline);
+        c.push_constants(0, &flat_push(&q, [0.0; 4], 0.5));
+        q.draw(c);
+        c.end_rendering();
+        c.texture_barrier(
+            depth,
+            TextureState::DepthAttachment,
+            TextureState::ShaderRead,
+        );
+    });
+    dev.wait_idle().unwrap();
+    // A scope with neither color nor depth is rejected at finish().
+    let t = dev.begin_frame().unwrap();
+    let mut c = dev.begin_commands(&t).unwrap();
+    c.begin_rendering(&rhi::RenderingDesc {
+        color: &[],
+        depth: None,
+        width: 8,
+        height: 8,
+    });
+    assert!(matches!(c.finish(), Err(RhiError::InvalidDescriptor(_))));
+    dev.destroy_pipeline(pipeline);
+    dev.destroy_shader_module(vs);
+    dev.destroy_shader_module(fs);
+    dev.destroy_texture(depth);
+    q.destroy(&dev);
+    retire_all(&mut dev);
+    assert_clean(&inst);
+}
+
+#[test]
 fn draw_format_mismatch_rejected() {
     let Some((inst, mut dev)) = setup() else {
         return;

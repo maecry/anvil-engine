@@ -18,6 +18,8 @@ pub static SAMPLE_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sample
 pub static FLAT_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/flat.vert.spv"));
 pub static FLAT_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/flat.frag.spv"));
 
+pub static EMPTY_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/empty.frag.spv"));
+
 pub fn enabled() -> bool {
     let on = std::env::var("ANVIL_GPU_TESTS").as_deref() == Ok("1");
     if !on {

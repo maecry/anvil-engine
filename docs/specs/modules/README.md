@@ -23,7 +23,7 @@ Module specs refine one LAYER spec and must not contradict it, MASTER-000 or an 
 | [MODULE-007](MODULE-007-pipeline-cache.md) | Pipeline cache and global bindings | rhi-vulkan (+ shader cache keys) | LAYER-008 / LAYER-007 | M2 global bindings + layout + depth; M5 cache/dedupe | Accepted (M2 scope) |
 | [MODULE-008](MODULE-008-shader-compiler.md) | Shader compiler | shader | LAYER-008 | M1 (SPIR-V only) / M2 | Draft (blocked on ADR-0003) |
 | [MODULE-009](MODULE-009-render-graph-compiler.md) | Render graph compiler | render-graph | LAYER-006 | M4 | Accepted |
-| [MODULE-010](MODULE-010-render-world.md) | Render world (M3a: `Renderer`, `RenderScene`, upload ring, forward + tonemap) | renderer | LAYER-005 | M3 (M3a, M3b implemented; M3c IBL pending) | Accepted (ADR-0011) |
+| [MODULE-010](MODULE-010-render-world.md) | Render world (M3a: `Renderer`, `RenderScene`, upload ring, forward + tonemap) | renderer | LAYER-005 | M3 (complete: M3a-M3c) | Accepted (ADR-0011) |
 
 Dependency order for M1 implementation: MODULE-001 -> 002 -> 003 and 004 (003 and 004 are developed together; the frame loop needs both). MODULE-004 also contains the minimal M1 shader-module and graphics-pipeline objects, which MODULE-007 absorbs in M2.
 

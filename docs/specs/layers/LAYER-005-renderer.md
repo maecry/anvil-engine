@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Status | Accepted (ADR-0011) |
-| Milestone | M3 (forward, PBR; M3a, M3b implemented); M4 (graph, post) |
+| Milestone | M3 (forward, PBR, shadows, IBL: complete); M4 (graph, post); M4 (graph, post) |
 | Crates | renderer (M3: mesh, camera and material live inside it as modules) |
 | Traces to | MASTER-000 §4.1, §5.2 rules 4-5, §8.5, §9, §11 |
 | Last updated | 2026-11-02 |
@@ -56,7 +56,8 @@ Extraction boundary (ADR-0011 §2): the renderer crate defines the plain-data `R
 Implemented in M3a (`crates/renderer`). `Renderer` is not generic itself; its methods are generic over `D: rhi::Device` (static dispatch, ADR-0005) and take the device explicitly, so the app keeps ownership of `Device` and `SwapchainHandle`.
 
 ```rust
-pub struct RenderScene { pub camera: Camera, pub meshes: Vec<MeshInstance>, pub lights: Vec<Light> } // environment arrives in M3c
+pub struct RenderScene { pub camera: Camera, pub meshes: Vec<MeshInstance>, pub lights: Vec<Light>, pub environment: Environment }
+pub struct Environment { pub sun_direction, pub zenith, pub horizon, pub ground, pub sun_color, pub intensity } // PartialEq: re-baked only on change
 pub struct Camera { pub position: Vec3, pub rotation: Quat, pub fov_y: f32, pub near: f32, pub exposure: f32 }
 impl Camera { pub fn view(&self) -> Mat4; pub fn projection(&self, aspect: f32) -> Mat4 /* reverse-Z, infinite far, Y flip */ }
 pub struct MeshInstance { pub mesh: MeshId, pub material: MaterialId, pub transform: Mat4 }
@@ -109,7 +110,17 @@ Per frame the renderer fills one persistently mapped `Upload` ring per frame in 
 - The shadow pass needs a depth-only pipeline and rendering scope: the RHI now accepts zero color formats / attachments (LAYER-003 §18.5).
 - shortcut: a single shadow map without cascades and fixed 2048 resolution; cascades and point/spot shadows are M4. Alpha-tested casters are M4.
 
-M3c adds IBL.
+### M3c: environment and IBL
+
+- `Environment` is an analytic sky (zenith/horizon/ground gradient plus sun glow and disk). `sun_direction` is the direction the light travels and should equal the shadow-casting directional light. The environment is baked only when it differs (`==`) from the last baked one; the first render bakes everything.
+- Bakes are fullscreen-triangle fragment passes (`bake_pass`, no compute), recorded into the frame's command buffer before the shadow pass: sky 512x256 `Rgba16Float` equirect; diffuse irradiance 64x32 (cosine convolution on a 48x16 hemisphere grid, stored as E/pi); six GGX-prefiltered equirects for roughness 0, 0.2 ... 1 (256x128, 128x64, 64x32, 64x32, 32x16, 32x16; 192 importance samples each, no mips or cubemaps); split-sum BRDF LUT 256x256 `Rg16Float` (256 samples). Every bake leaves its texture in `ShaderRead` (`Undefined` the first time, `ShaderRead` afterwards). Sample counts are small enough that recording is ~0.3 ms and the GPU work is far below 100 ms.
+- Equirect mapping: u = atan2(z, x)/2pi + 0.5 wraps (sampler `Repeat` in U, `ClampToEdge` in V), v = acos(y)/pi; sampling uses `textureLod(.., 0)` so the atan discontinuity cannot select a wrong mip, and screenshots at the seam direction show none.
+- Forward shading: diffuse = irradiance x albedo x (1-metallic); specular = lerp of the two nearest prefiltered levels (`level = roughness x 5`) x (F0 x LUT.x + LUT.y); both multiplied by occlusion and `Environment.intensity`. The hemisphere ambient placeholder is gone.
+- Skybox: drawn after the opaques in the forward rendering scope with a fullscreen triangle at reverse-Z depth 0, compare `GreaterOrEqual`, depth write off; the ray comes from camera right/up/forward and the half-fov tangents in the frame data.
+- Observability: each bake logs at `info` ("environment baked", command recording time in ms, `first`). shortcut: only recording time is measured (no wait); the BRDF LUT is baked on the first render, not in `Renderer::new`, because the RHI records only into a frame's encoder. shortcut: texels brighter than 4 (the sun disk) are clamped in the irradiance/prefilter bakes since the sun is a directional light; the prefilter has no filtered importance sampling, so very bright narrow sky features would be noisy.
+
+### Deferred beyond M3
+Cascaded shadows and point/spot shadows, alpha blend/mask materials, clustered or Forward+ lighting, visibility culling and sorting, the render graph (M4); HDR environment files and glTF import (asset system, LAYER-009).
 
 ## 13. Testing strategy
 
@@ -126,8 +137,10 @@ M3a (implemented):
 M3b (implemented):
 - [x] Full PBR metallic-roughness over directional, point and spot lights; 2048 directional shadow map with PCF; zero validation errors/warnings (also with `ANVIL_GPU_AV=1`, apart from the layer's own settings notices).
 
-M3c (pending):
-- [ ] IBL (procedural sky, per-roughness prefiltered equirect textures, irradiance, BRDF LUT).
+M3c (implemented):
+- [x] IBL (procedural sky, per-roughness prefiltered equirect textures, irradiance, BRDF LUT), skybox, re-bake on change.
+
+Open (not blocking M3 exit):
 - [ ] Renderer builds against a mock backend (the `NullBackend` of earlier drafts is the mock in `rhi` tests).
 
 ## 15. Open questions

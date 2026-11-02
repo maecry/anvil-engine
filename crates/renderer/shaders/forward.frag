@@ -1,6 +1,7 @@
 #version 460
 #extension GL_EXT_samplerless_texture_functions : require
 #include "common.glsl"
+#include "ibl.glsl"
 
 // Global bindless set 0 (ADR-0010): sampled images at binding 0, samplers at binding 1. The
 // comparison samplers alias the same binding as `samplerShadow`.
@@ -14,8 +15,6 @@ layout(location = 2) in vec2 v_uv;
 layout(location = 3) in vec4 v_tangent;
 layout(location = 4) flat in uint v_material;
 layout(location = 0) out vec4 out_color;
-
-const float PI = 3.14159265;
 
 vec4 sample_tex(uint tex, uint smp, vec2 uv) {
     return texture(sampler2D(textures[nonuniformEXT(tex)], samplers[nonuniformEXT(smp)]), uv);
@@ -83,12 +82,24 @@ void main() {
     float a = roughness * roughness;
     float a2 = a * a;
 
-    // shortcut: hemisphere ambient placeholder (diffuse + tinted specular) until IBL in M3c.
-    vec3 sky = vec3(0.35, 0.45, 0.6);
-    vec3 ground = vec3(0.12, 0.1, 0.09);
+    // Image-based lighting: irradiance for diffuse, two nearest prefiltered roughness levels
+    // and the split-sum BRDF LUT for specular.
     vec3 r = reflect(-v, n);
-    vec3 color = mix(ground, sky, n.y * 0.5 + 0.5) * 0.4 * base.rgb * (1.0 - metallic) * ao;
-    color += mix(ground, sky, r.y * 0.5 + 0.5) * 0.4 * f_schlick(n_o_v, f0) * (1.0 - 0.6 * roughness) * ao;
+    vec3 irradiance = textureLod(sampler2D(textures[nonuniformEXT(f.irradiance_index)],
+                                           samplers[nonuniformEXT(f.ibl_sampler)]), dir_to_uv(n), 0.0).rgb;
+    float level = roughness * 5.0;
+    uint l0 = uint(floor(level));
+    uint l1 = min(l0 + 1u, 5u);
+    vec2 r_uv = dir_to_uv(r);
+    vec3 pre = mix(textureLod(sampler2D(textures[nonuniformEXT(f.prefilter[l0])],
+                                        samplers[nonuniformEXT(f.ibl_sampler)]), r_uv, 0.0).rgb,
+                   textureLod(sampler2D(textures[nonuniformEXT(f.prefilter[l1])],
+                                        samplers[nonuniformEXT(f.ibl_sampler)]), r_uv, 0.0).rgb,
+                   level - float(l0));
+    vec2 brdf = texture(sampler2D(textures[nonuniformEXT(f.brdf_lut_index)],
+                                  samplers[nonuniformEXT(f.ibl_sampler)]),
+                                  vec2(clamp(n_o_v, 0.5 / 256.0, 1.0 - 0.5 / 256.0), roughness)).rg; // U wraps: keep off the edge
+    vec3 color = (irradiance * base.rgb * (1.0 - metallic) + pre * (f0 * brdf.x + brdf.y)) * ao * f.env_intensity;
 
     for (uint i = 0; i < f.light_count; ++i) {
         Light l = pc.lights.l[i];

@@ -25,6 +25,12 @@ fn main() {
         ("forward.frag", shaderc::ShaderKind::Fragment),
         ("shadow.vert", shaderc::ShaderKind::Vertex),
         ("shadow.frag", shaderc::ShaderKind::Fragment),
+        ("sky.frag", shaderc::ShaderKind::Fragment),
+        ("irradiance.frag", shaderc::ShaderKind::Fragment),
+        ("prefilter.frag", shaderc::ShaderKind::Fragment),
+        ("brdf_lut.frag", shaderc::ShaderKind::Fragment),
+        ("skybox.vert", shaderc::ShaderKind::Vertex),
+        ("skybox.frag", shaderc::ShaderKind::Fragment),
         ("tonemap.vert", shaderc::ShaderKind::Vertex),
         ("tonemap.frag", shaderc::ShaderKind::Fragment),
     ] {
@@ -37,5 +43,6 @@ fn main() {
         fs::write(out.join(format!("{file}.spv")), spv.as_binary_u8()).expect("write spv");
     }
     println!("cargo:rerun-if-changed=shaders/common.glsl");
+    println!("cargo:rerun-if-changed=shaders/ibl.glsl");
     println!("cargo:rerun-if-changed=build.rs");
 }

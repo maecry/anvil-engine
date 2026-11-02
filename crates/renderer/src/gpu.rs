@@ -22,6 +22,16 @@ pub(crate) struct GpuFrame {
     pub shadow_light: u32,
     pub shadow_texel_world: f32,
     pub pad: f32,
+    pub sky_index: u32,
+    pub irradiance_index: u32,
+    pub brdf_lut_index: u32,
+    pub ibl_sampler: u32,
+    pub prefilter: [u32; 6],
+    pub env_intensity: f32,
+    pub pad0: u32,
+    pub cam_right: [f32; 4],
+    pub cam_up: [f32; 4],
+    pub cam_forward: [f32; 4],
 }
 
 /// Per-instance data.
@@ -126,7 +136,7 @@ mod tests {
 
     #[test]
     fn layouts_match_std430() {
-        assert_eq!(size_of::<GpuFrame>(), 304);
+        assert_eq!(size_of::<GpuFrame>(), 400);
         assert_eq!(size_of::<GpuInstance>(), 144);
         assert_eq!(size_of::<GpuLight>(), 64);
         assert_eq!(size_of::<GpuMaterial>(), 80);

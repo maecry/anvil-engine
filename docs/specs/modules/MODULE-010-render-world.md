@@ -13,7 +13,7 @@
 
 The renderer-owned copy of the scene: it receives immutable extracted data each frame, updates renderer-side state, and produces visibility results and draw lists that the passes consume. It is the boundary that keeps scene types and Vulkan types out of the renderer's hot data (MASTER-000 §5.2 rule 5, §11).
 
-**M3 resolution (ADR-0011).** M3 has no persistent `RenderWorld`: the app rebuilds `RenderScene` (the former `ExtractedFrame`) every frame and `Renderer::render` consumes it directly. The responsibilities below that need persistent state (diff updates, culling, sorting) are deferred; M3a implements the extraction types, per-frame data upload and the fixed pass sequence (M3b adds the shadow pass, full PBR and the whole light array; see LAYER-005 §12a) described in LAYER-005 §8 and §12a.
+**M3 resolution (ADR-0011).** M3 has no persistent `RenderWorld`: the app rebuilds `RenderScene` (the former `ExtractedFrame`) every frame and `Renderer::render` consumes it directly. The responsibilities below that need persistent state (diff updates, culling, sorting) are deferred; M3a implements the extraction types, per-frame data upload and the fixed pass sequence (M3b adds the shadow pass, full PBR and the whole light array; M3c adds `Environment` in `RenderScene`, the IBL bakes and the skybox; see LAYER-005 §12a) described in LAYER-005 §8 and §12a.
 
 ## 2. Responsibilities
 
@@ -61,7 +61,7 @@ As built in M3a (the concept above is superseded): `RenderScene { camera: Camera
 
 ## 6. Data structures
 
-As built: `MeshInstance { mesh: MeshId, material: MaterialId, transform: Mat4 }` (no flags yet); GPU side, `GpuInstance { model, normal_matrix, material }` (world matrices stored pre-multiplied, AoS, ADR-0011 §4), `GpuLight`, `GpuMaterial`, `GpuFrame` (M3b: plus the light view-projection, shadow texture/sampler slots and shadow light index) in `crates/renderer/src/gpu.rs`, std430, mirrored by `shaders/common.glsl` and checked by a size test. Originally:
+As built: `MeshInstance { mesh: MeshId, material: MaterialId, transform: Mat4 }` (no flags yet); GPU side, `GpuInstance { model, normal_matrix, material }` (world matrices stored pre-multiplied, AoS, ADR-0011 §4), `GpuLight`, `GpuMaterial`, `GpuFrame` (M3b: plus the light view-projection, shadow texture/sampler slots and shadow light index; M3c: plus the IBL texture slots, environment intensity and camera basis for the skybox; 400 bytes) in `crates/renderer/src/gpu.rs`, std430, mirrored by `shaders/common.glsl` and checked by a size test. Originally:
 
 `MeshInstance { mesh: MeshId, material: MaterialId, transform: Mat4, flags }`; `RenderMesh { vertex/index buffer handles, ranges, bounds }`; `RenderMaterial { pipeline handle(s), binding data }`; `VisibleSet { indices }`; `DrawList { sort_key: u64, instance, mesh, material }`. Struct-of-arrays versus array-of-structs is a data-layout decision to make with measurements. Stable ids are generational where entries can be removed (reuse of `Handle<T>`/`Pool<T>` is the default).
 

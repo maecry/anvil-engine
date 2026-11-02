@@ -20,6 +20,16 @@ struct FrameData {
     uint shadow_light;          // index of the shadow-casting light, ~0u = none
     float shadow_texel_world;   // world size of one shadow texel (normal offset scale)
     float pad;
+    uint sky_index;             // equirect environment textures (bindless slots)
+    uint irradiance_index;
+    uint brdf_lut_index;
+    uint ibl_sampler;           // linear, wrap U, clamp V
+    uint prefilter[6];          // one equirect per roughness level 0, 0.2, ... 1
+    float env_intensity;
+    uint pad0;
+    vec4 cam_right;             // xyz = camera right, w = tan(fov_x / 2)
+    vec4 cam_up;                // xyz = camera up, w = tan(fov_y / 2)
+    vec4 cam_forward;           // xyz = camera forward
 };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Frame { FrameData d; };
 

@@ -17,6 +17,7 @@ fn main() {
         ("sample.frag", shaderc::ShaderKind::Fragment),
         ("flat.vert", shaderc::ShaderKind::Vertex),
         ("flat.frag", shaderc::ShaderKind::Fragment),
+        ("empty.frag", shaderc::ShaderKind::Fragment),
     ] {
         let path = format!("tests/shaders/{file}");
         println!("cargo:rerun-if-changed={path}");
