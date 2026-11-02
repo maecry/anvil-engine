@@ -337,7 +337,8 @@ fn build(
         .image_color_space(cfg.surface_format.color_space)
         .image_extent(cfg.extent)
         .image_array_layers(1)
-        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+        // shortcut: TRANSFER_SRC (screenshots) assumed supported by the surface, check caps if a driver lacks it
+        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
         .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
         .pre_transform(cfg.pre_transform)
         .composite_alpha(cfg.composite_alpha)
@@ -395,7 +396,7 @@ fn build(
             format: cfg.format,
             width: cfg.extent.width,
             height: cfg.extent.height,
-            usage: TextureUsage::COLOR_ATTACHMENT,
+            usage: TextureUsage::COLOR_ATTACHMENT | TextureUsage::TRANSFER_SRC,
             owner: TextureOwner::Swapchain,
             allocation: None,
             state: TextureState::Undefined,

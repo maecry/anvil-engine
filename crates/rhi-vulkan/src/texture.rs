@@ -52,6 +52,7 @@ pub(crate) fn rhi_to_vk_format(f: Format) -> vk::Format {
         Format::R8Unorm => vk::Format::R8_UNORM,
         Format::Rg8Unorm => vk::Format::R8G8_UNORM,
         Format::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
+        Format::Rg16Float => vk::Format::R16G16_SFLOAT,
         Format::D32Sfloat => vk::Format::D32_SFLOAT,
     }
 }
@@ -65,6 +66,7 @@ pub(crate) fn vk_to_rhi_format(f: vk::Format) -> Option<Format> {
         vk::Format::R8_UNORM => Format::R8Unorm,
         vk::Format::R8G8_UNORM => Format::Rg8Unorm,
         vk::Format::R16G16B16A16_SFLOAT => Format::Rgba16Float,
+        vk::Format::R16G16_SFLOAT => Format::Rg16Float,
         vk::Format::D32_SFLOAT => Format::D32Sfloat,
         _ => return None,
     })
@@ -175,11 +177,6 @@ pub(crate) fn validate_texture_desc(
             desc.format
         )));
     }
-    if depth && desc.usage.contains(TextureUsage::SAMPLED) {
-        return Err(RhiError::Unsupported {
-            what: "sampled depth textures (M2)".to_owned(),
-        });
-    }
     for (bit, name, feature) in required_features() {
         if desc.usage.contains(bit) && !facts.optimal_features.contains(feature) {
             return Err(RhiError::Unsupported {
@@ -236,6 +233,19 @@ pub(crate) fn address_to_vk(a: AddressMode) -> vk::SamplerAddressMode {
     }
 }
 
+pub(crate) fn compare_to_vk(c: rhi::CompareOp) -> vk::CompareOp {
+    use rhi::CompareOp as C;
+    match c {
+        C::Never => vk::CompareOp::NEVER,
+        C::Less => vk::CompareOp::LESS,
+        C::Equal => vk::CompareOp::EQUAL,
+        C::LessOrEqual => vk::CompareOp::LESS_OR_EQUAL,
+        C::Greater => vk::CompareOp::GREATER,
+        C::GreaterOrEqual => vk::CompareOp::GREATER_OR_EQUAL,
+        C::Always => vk::CompareOp::ALWAYS,
+    }
+}
+
 pub(crate) fn sampler_info(d: &SamplerDesc) -> vk::SamplerCreateInfo<'static> {
     vk::SamplerCreateInfo::default()
         .mag_filter(filter_to_vk(d.mag_filter))
@@ -245,7 +255,8 @@ pub(crate) fn sampler_info(d: &SamplerDesc) -> vk::SamplerCreateInfo<'static> {
         .address_mode_v(address_to_vk(d.address_v))
         .address_mode_w(address_to_vk(d.address_w))
         .anisotropy_enable(false)
-        .compare_enable(false)
+        .compare_enable(d.compare.is_some())
+        .compare_op(d.compare.map_or(vk::CompareOp::ALWAYS, compare_to_vk))
         .min_lod(0.0)
         .max_lod(0.0)
         .border_color(vk::BorderColor::FLOAT_OPAQUE_BLACK)
@@ -700,10 +711,7 @@ mod tests {
             );
         }
         let sampled_depth = desc(4, 4, Format::D32Sfloat, TextureUsage::SAMPLED);
-        assert!(matches!(
-            validate_texture_desc(&sampled_depth, &f),
-            Err(RhiError::Unsupported { .. })
-        ));
+        assert!(validate_texture_desc(&sampled_depth, &f).is_ok());
         let no_sampled = facts(vk::FormatFeatureFlags::COLOR_ATTACHMENT);
         assert!(matches!(
             validate_texture_desc(&ok, &no_sampled),
@@ -746,8 +754,11 @@ mod tests {
             address_u: AddressMode::Repeat,
             address_v: AddressMode::ClampToEdge,
             address_w: AddressMode::MirroredRepeat,
+            compare: Some(rhi::CompareOp::GreaterOrEqual),
         };
         let i = sampler_info(&d);
+        assert_eq!(i.compare_enable, vk::TRUE);
+        assert_eq!(i.compare_op, vk::CompareOp::GREATER_OR_EQUAL);
         assert_eq!(i.mag_filter, vk::Filter::LINEAR);
         assert_eq!(i.min_filter, vk::Filter::NEAREST);
         assert_eq!(i.address_mode_u, vk::SamplerAddressMode::REPEAT);

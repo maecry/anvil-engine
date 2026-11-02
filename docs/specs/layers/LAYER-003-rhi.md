@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Status | Accepted |
-| Milestone | M1 (minimal surface); M2 API in §17 |
+| Milestone | M1 (minimal surface); M2 API in §17; M3 additions in §18 |
 | Crates | rhi |
 | Traces to | MASTER-000 §4.2, §5.2 rules 2, 3, 5, 7, §8.3, §10, §22.4, §22.5; ADR-0004, ADR-0005; ADR-0006 |
 | Last updated | 2026-11-02 |
@@ -476,7 +476,7 @@ All are infallible; misuse is recorded and returned from `finish()` (§8). `bind
 Fields already exist (`GraphicsPipelineDesc.depth_format`, `RenderingDesc.depth`, `DepthAttachment`). M2 behavior:
 - `depth_format: Some(Format::D32Sfloat)` (the only M2 depth format) enables depth test and depth write with compare `LESS`; no stencil. A non-depth format is `InvalidDescriptor`. Finer control (`DepthState`) is added when a pass needs it (M3), not now, so the triangle example keeps compiling unchanged.
 - `RenderingDesc.depth` requires a texture with `DEPTH_ATTACHMENT` usage in state `DepthAttachment` (recorded error otherwise). The pipeline's `depth_format` must equal the rendering's depth format (also `None` == `None`), checked at draw like color formats; mismatch is `InvalidDescriptor` at `finish()`.
-- Vulkan: `depth_attachment_format` in `PipelineRenderingCreateInfo`; layout `DEPTH_ATTACHMENT_OPTIMAL`; the `texture_barrier` image aspect comes from the texture's format (depth -> `DEPTH`), no longer fixed to `COLOR`. State pair mapping (backend, with sync2 masks): `Undefined -> DepthAttachment` (src NONE, dst `EARLY|LATE_FRAGMENT_TESTS`, `DEPTH_STENCIL_ATTACHMENT_READ|WRITE`); `DepthAttachment -> ShaderRead` is `Unsupported` in M2 (sampled depth is not supported).
+- Vulkan: `depth_attachment_format` in `PipelineRenderingCreateInfo`; layout `DEPTH_ATTACHMENT_OPTIMAL`; the `texture_barrier` image aspect comes from the texture's format (depth -> `DEPTH`), no longer fixed to `COLOR`. State pair mapping (backend, with sync2 masks): `Undefined -> DepthAttachment` (src NONE, dst `EARLY|LATE_FRAGMENT_TESTS`, `DEPTH_STENCIL_ATTACHMENT_READ|WRITE`); `DepthAttachment <-> ShaderRead` was `Unsupported` in M2 and is allowed from M3 (§18). Note: `depth_format` and "depth means LESS" in this subsection are superseded by `DepthState` (§18.1).
 - The M1 "depth attachments (M2)" `Unsupported` in `begin_rendering` is removed.
 - `GraphicsPipelineDesc` doc "no descriptor sets, no push constants" is replaced by: every pipeline uses the global layout (set 0 bindless + 128 B push constants, MODULE-007), no vertex input state.
 
@@ -538,6 +538,32 @@ pub struct BindlessDiagnostics {
 - `IndexFormat::size()`; `rhi_vulkan::VulkanDevice::submit_unwindowed` is public for headless tests.
 - Transfer-only textures have no default view (VUID-VkImageViewCreateInfo-image-04441).
 - `bind_index_buffer` is valid only inside rendering; bound state resets at begin/end rendering.
+
+## 18. M3 additions (ADR-0011 §9)
+
+Minimum RHI changes so the M3 renderer can use reverse-Z, HDR targets and (M3b) shadow maps.
+
+### 18.1 Depth state
+`GraphicsPipelineDesc.depth_format: Option<Format>` is replaced by `depth: Option<DepthState>` (the M2 "depth means LESS" rule is gone):
+
+```rust
+pub struct DepthState { pub format: Format, pub compare: CompareOp, pub write: bool, pub bias: Option<DepthBias> }
+pub struct DepthBias { pub constant: f32, pub slope: f32, pub clamp: f32 }   // rasterizer depth bias
+pub enum CompareOp { Never, Less, Equal, LessOrEqual, Greater, GreaterOrEqual, Always }
+```
+`format` must still be `D32Sfloat` (else `InvalidDescriptor`); `None` disables test and write. The pipeline's depth format must equal the rendering's depth format, as in §17.4. The renderer uses `GreaterOrEqual` with a depth clear of 0 (reverse-Z, ADR-0011 §1).
+
+### 18.2 Sampled depth and comparison samplers
+- `SamplerDesc.compare: Option<CompareOp>` enables a comparison sampler (shadow PCF, M3b). Existing callers pass `None`.
+- `D32Sfloat` textures may now carry `TextureUsage::SAMPLED`; they get a bindless slot with a depth-aspect view (the M2 `Unsupported` is removed).
+- `texture_barrier` allows `DepthAttachment <-> ShaderRead` (layouts `DEPTH_ATTACHMENT_OPTIMAL` <-> `SHADER_READ_ONLY_OPTIMAL`; the aspect comes from the texture format). Shaders declare a `samplerShadow` over the same binding-1 sampler array.
+
+### 18.3 Formats and swapchain
+- `Format::Rg16Float` (`R16G16_SFLOAT`, 4 bytes per texel) for the BRDF LUT (M3c).
+- Swapchain images always get `TRANSFER_SRC` usage, and `copy_texture_to_buffer` accepts swapchain textures, for `ANVIL_SCREENSHOT` (ADR-0011 §11). shortcut: surface support for `TRANSFER_SRC` is assumed, not checked against the surface capabilities.
+
+### 18.4 Tests
+Unit: `depth_state_mapping`, `sampler_info_mapping` (compare), depth/shader barrier pair, `Rg16Float` mapping. GPU (`resources.rs`): `sampled_depth_and_compare_sampler` (sampled depth texture, compare sampler, `DepthAttachment <-> ShaderRead` barriers, zero validation messages).
 
 ## Observability (ADR-0009)
 - `Device::diagnostics() -> DeviceDiagnostics` (plain data: `DeviceInfo`, frame / GPU-completed frame, `LiveObjects`, pending destroys, `SwapchainDiagnostics` per swapchain, `ValidationCounts`). Backends must keep it accurate; integration tests assert `validation.errors == 0`.

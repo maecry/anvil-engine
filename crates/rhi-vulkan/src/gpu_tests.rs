@@ -203,6 +203,7 @@ fn bindless_capacity_exceeded() {
         address_u: AddressMode::Repeat,
         address_v: AddressMode::Repeat,
         address_w: AddressMode::Repeat,
+        compare: None,
     };
     let s1 = dev.create_sampler(&s).unwrap();
     let s2 = dev.create_sampler(&s).unwrap();

@@ -1,0 +1,18 @@
+[package]
+name = "renderer"
+description = "Forward PBR renderer over the Anvil RHI (ADR-0011)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+foundation = { path = "../foundation" }
+rhi = { path = "../rhi" }
+tracing.workspace = true
+bytemuck.workspace = true
+
+[build-dependencies]
+shaderc = "0.10.1"

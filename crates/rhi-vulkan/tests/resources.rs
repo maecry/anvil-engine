@@ -33,6 +33,7 @@ fn sampler(dev: &impl Device) -> rhi::SamplerHandle {
         address_u: AddressMode::ClampToEdge,
         address_v: AddressMode::ClampToEdge,
         address_w: AddressMode::ClampToEdge,
+        compare: None,
     })
     .unwrap()
 }
@@ -705,6 +706,53 @@ fn depth_pipeline_draw() {
 }
 
 #[test]
+fn sampled_depth_and_compare_sampler() {
+    let Some((inst, mut dev)) = setup() else {
+        return;
+    };
+    let depth = dev
+        .create_texture(&tex_desc(
+            8,
+            8,
+            Format::D32Sfloat,
+            TextureUsage::DEPTH_ATTACHMENT | TextureUsage::SAMPLED,
+        ))
+        .unwrap();
+    assert!(dev.texture_index(depth).is_ok());
+    let cmp = dev
+        .create_sampler(&SamplerDesc {
+            label: Some("test.shadow"),
+            mag_filter: Filter::Linear,
+            min_filter: Filter::Linear,
+            address_u: AddressMode::ClampToEdge,
+            address_v: AddressMode::ClampToEdge,
+            address_w: AddressMode::ClampToEdge,
+            compare: Some(rhi::CompareOp::GreaterOrEqual),
+        })
+        .unwrap();
+    assert!(dev.sampler_index(cmp).is_ok());
+    let target = offscreen_target(&dev, 8, 8);
+    render_offscreen(&mut dev, target, Some(depth), (8, 8), |_| {});
+    frame(&mut dev, |c| {
+        c.texture_barrier(
+            depth,
+            TextureState::DepthAttachment,
+            TextureState::ShaderRead,
+        );
+        c.texture_barrier(
+            depth,
+            TextureState::ShaderRead,
+            TextureState::DepthAttachment,
+        );
+    });
+    dev.destroy_sampler(cmp);
+    dev.destroy_texture(target);
+    dev.destroy_texture(depth);
+    retire_all(&mut dev);
+    assert_clean(&inst);
+}
+
+#[test]
 fn draw_format_mismatch_rejected() {
     let Some((inst, mut dev)) = setup() else {
         return;
@@ -811,8 +859,6 @@ fn bindless_stale_index_rejected() {
 #[test]
 fn texture_unsupported_combo() {
     let Some((inst, dev)) = setup() else { return };
-    let r = dev.create_texture(&tex_desc(4, 4, Format::D32Sfloat, TextureUsage::SAMPLED));
-    assert!(matches!(r, Err(RhiError::Unsupported { .. })), "{r:?}");
     for d in [
         tex_desc(0, 4, Format::Rgba8Unorm, TextureUsage::SAMPLED),
         tex_desc(4, 4, Format::Rgba8Unorm, TextureUsage::NONE),

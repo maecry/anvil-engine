@@ -1,0 +1,138 @@
+//! Render passes as free functions over explicit inputs, so M4 can turn them into graph nodes.
+
+use rhi::{
+    BufferHandle, ColorAttachment, CommandEncoder, DepthAttachment, IndexFormat, LoadOp,
+    PipelineHandle, Rect2D, RenderingDesc, StoreOp, TextureHandle, TextureState, Viewport,
+};
+
+/// One indexed draw.
+pub(crate) struct Draw {
+    pub vertex_address: u64,
+    pub index_buffer: BufferHandle,
+    pub index_count: u32,
+    /// Index into the instance array.
+    pub instance: u32,
+}
+
+/// Inputs of [`forward_pass`].
+pub(crate) struct ForwardInputs<'a> {
+    pub pipeline: PipelineHandle,
+    pub hdr: TextureHandle,
+    pub depth: TextureHandle,
+    pub extent: (u32, u32),
+    /// False on the first frame after the targets were (re)created.
+    pub targets_initialized: bool,
+    /// BDA of frame, instance, light and material data.
+    pub addresses: [u64; 4],
+    pub draws: &'a [Draw],
+}
+
+/// Inputs of [`tonemap_pass`].
+pub(crate) struct TonemapInputs {
+    pub pipeline: PipelineHandle,
+    pub hdr_index: u32,
+    pub sampler_index: u32,
+    pub exposure: f32,
+    pub encode_srgb: bool,
+    pub target: TextureHandle,
+    pub extent: (u32, u32),
+}
+
+fn full_viewport<C: CommandEncoder>(cmd: &mut C, (w, h): (u32, u32)) {
+    cmd.set_viewport(Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: w as f32,
+        height: h as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    });
+    cmd.set_scissor(Rect2D {
+        x: 0,
+        y: 0,
+        width: w,
+        height: h,
+    });
+}
+
+/// Forward opaque pass into the HDR target with reverse-Z depth; leaves HDR in `ShaderRead`.
+pub(crate) fn forward_pass<C: CommandEncoder>(cmd: &mut C, i: &ForwardInputs) {
+    cmd.begin_label("forward", [0.3, 0.7, 0.3, 1.0]);
+    let (hdr_from, depth_from) = if i.targets_initialized {
+        (TextureState::ShaderRead, TextureState::DepthAttachment)
+    } else {
+        (TextureState::Undefined, TextureState::Undefined)
+    };
+    cmd.texture_barrier(i.hdr, hdr_from, TextureState::ColorAttachment);
+    cmd.texture_barrier(i.depth, depth_from, TextureState::DepthAttachment);
+    cmd.begin_rendering(&RenderingDesc {
+        color: &[ColorAttachment {
+            texture: i.hdr,
+            load: LoadOp::Clear,
+            store: StoreOp::Store,
+            clear: [0.02, 0.03, 0.05, 1.0],
+        }],
+        depth: Some(DepthAttachment {
+            texture: i.depth,
+            load: LoadOp::Clear,
+            store: StoreOp::DontCare,
+            clear: 0.0, // reverse-Z: far = 0
+        }),
+        width: i.extent.0,
+        height: i.extent.1,
+    });
+    full_viewport(cmd, i.extent);
+    cmd.bind_pipeline(i.pipeline);
+    for d in i.draws {
+        let mut pc = [0u8; 40];
+        for (chunk, a) in pc
+            .chunks_mut(8)
+            .zip(i.addresses.iter().chain([&d.vertex_address]))
+        {
+            chunk.copy_from_slice(&a.to_le_bytes());
+        }
+        cmd.push_constants(0, &pc);
+        cmd.bind_index_buffer(d.index_buffer, 0, IndexFormat::U32);
+        // first_instance doubles as the instance array index (gl_InstanceIndex).
+        cmd.draw_indexed(d.index_count, 1, 0, 0, d.instance);
+    }
+    cmd.end_rendering();
+    cmd.texture_barrier(
+        i.hdr,
+        TextureState::ColorAttachment,
+        TextureState::ShaderRead,
+    );
+    cmd.end_label();
+}
+
+/// Tonemaps the HDR target into `target`; leaves `target` in `ColorAttachment`.
+pub(crate) fn tonemap_pass<C: CommandEncoder>(cmd: &mut C, t: &TonemapInputs) {
+    cmd.begin_label("tonemap", [0.7, 0.5, 0.2, 1.0]);
+    cmd.texture_barrier(
+        t.target,
+        TextureState::Undefined,
+        TextureState::ColorAttachment,
+    );
+    cmd.begin_rendering(&RenderingDesc {
+        color: &[ColorAttachment {
+            texture: t.target,
+            load: LoadOp::DontCare,
+            store: StoreOp::Store,
+            clear: [0.0; 4],
+        }],
+        depth: None,
+        width: t.extent.0,
+        height: t.extent.1,
+    });
+    full_viewport(cmd, t.extent);
+    cmd.bind_pipeline(t.pipeline);
+    let mut pc = [0u8; 16];
+    pc[0..4].copy_from_slice(&t.hdr_index.to_le_bytes());
+    pc[4..8].copy_from_slice(&t.sampler_index.to_le_bytes());
+    pc[8..12].copy_from_slice(&t.exposure.to_le_bytes());
+    pc[12..16].copy_from_slice(&u32::from(t.encode_srgb).to_le_bytes());
+    cmd.push_constants(0, &pc);
+    cmd.draw(3, 1, 0, 0);
+    cmd.end_rendering();
+    cmd.end_label();
+}

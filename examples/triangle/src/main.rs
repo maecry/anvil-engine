@@ -87,7 +87,7 @@ impl Triangle {
                 entry: "main",
             },
             color_formats: &[format],
-            depth_format: None,
+            depth: None,
             topology: PrimitiveTopology::TriangleList,
             cull: CullMode::None,
             front_face: FrontFace::CounterClockwise,

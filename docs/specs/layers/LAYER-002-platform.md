@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Status | Accepted |
-| Milestone | M1 |
+| Milestone | M1; input additions M3 (ADR-0011 §10) |
 | Crates | platform |
 | Traces to | MASTER-000 §5.1 (Layer 1), §5.2 rules 1 and 5, §8.2, §14 M1 |
 | Last updated | 2026-11-02 |
@@ -82,9 +82,10 @@ pub enum Event {
     Resized { width: u32, height: u32 },       // physical pixels
     ScaleFactorChanged { scale: f64 },
     CloseRequested,
-    Key { code: KeyCode, pressed: bool },      // KeyCode: engine enum; M1 may expose only a few keys (Escape)
+    Key { code: KeyCode, pressed: bool },      // KeyCode: engine enum (see Input additions)
     MouseButton { button: MouseButton, pressed: bool },
     CursorMoved { x: f64, y: f64 },
+    MouseMotion { dx: f64, dy: f64 },          // M3: raw device motion
 }
 
 #[derive(Clone)]
@@ -106,6 +107,12 @@ Notes:
 - winit 0.30.13 `Window: Send + Sync + HasWindowHandle + HasDisplayHandle + 'static` with default features (verified 2026-11-02), by compile check.
 - `EventLoop::run_app(&mut A: ApplicationHandler)`, `ActiveEventLoop::create_window(WindowAttributes)`, `ControlFlow::Poll`, `WindowEvent::KeyboardInput { device_id, event: KeyEvent, is_synthetic }` (verified 2026-11-02).
 - Wayland: no extra handling expected beyond display handle; verify with a Wayland session and an X11 session.
+
+### Input additions (M3, ADR-0011 §10, FR-PLAT-005)
+
+- `KeyCode` gains the letters `A`..`Z`, digits `Num0`..`Num9`, `ArrowUp/Down/Left/Right`, `Space`, `Shift`, `Ctrl` and `Tab` (physical key positions; `Shift`/`Ctrl` cover both sides). `Escape` and `Other` are kept.
+- `Event::MouseMotion { dx, dy }` is raw device motion (winit `DeviceEvent::MouseMotion`, delivered through `ApplicationHandler::device_event`), independent of the cursor position, for mouse-look.
+- `Event::MouseButton` already existed; the examples track the right button for look mode. Held-key state is kept by the app (a `Key` press/release list), not by the platform.
 
 ## 9. Ownership and lifetime
 
@@ -143,7 +150,7 @@ Event loop and all callbacks run on the main thread (platform requirement; macOS
 
 1. Continuous redraw (`Poll`) vs redraw on request: default continuous for M1; battery/CPU use acceptable?
 2. Render thread separate from the main thread: M1 says no. Decide at M5.
-3. Input representation: own `KeyCode` enum now or re-export winit's? Default: own minimal enum (keeps the winit dependency private).
+3. Input representation: resolved, own `KeyCode` enum (M3 extends it to the keys the fly camera needs; winit stays private).
 4. Do we put `Window` + `App` in platform and the `run` helper in the same crate, or let the editor supply its own loop? Default: same crate.
 5. xvfb or Wayland-headless smoke test in CI.
 

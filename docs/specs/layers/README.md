@@ -18,9 +18,9 @@ Spec file numbers are a reading order and do not equal architecture layer number
 |---|---|---|---|---|---|
 | [LAYER-001](LAYER-001-foundation.md) | Foundation | 1 | foundation (math, task deferred) | M1 | Accepted |
 | [LAYER-002](LAYER-002-platform.md) | Platform | 1 | platform | M1 | Accepted |
-| [LAYER-003](LAYER-003-rhi.md) | RHI | 2 | rhi | M1 (grows M2) | Accepted |
+| [LAYER-003](LAYER-003-rhi.md) | RHI | 2 | rhi | M1 (grows M2, M3) | Accepted |
 | [LAYER-004](LAYER-004-vulkan-backend.md) | Vulkan backend | 2 | rhi-vulkan | M1 | Accepted |
-| [LAYER-005](LAYER-005-renderer.md) | Renderer | 3 | renderer, mesh, camera | M3 | Draft |
+| [LAYER-005](LAYER-005-renderer.md) | Renderer | 3 | renderer | M3 | Accepted |
 | [LAYER-006](LAYER-006-render-graph.md) | Render graph | 3 | render-graph | M4 | Draft |
 | [LAYER-007](LAYER-007-resource-management.md) | Resource management | 2-3 | cross-cutting (rhi, rhi-vulkan, material) | M2 | Draft |
 | [LAYER-008](LAYER-008-shader-system.md) | Shader system | 3 | shader | M2-M5 | Draft |

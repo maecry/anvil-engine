@@ -6,10 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ash::vk;
 use rhi::{
-    BlendFactor, BlendOp, BlendState, BufferHandle, BufferUsage, CommandEncoder, CullMode, Format,
-    FrameToken, FrontFace, GraphicsPipelineDesc, IndexFormat, LoadOp, Memory, PipelineHandle,
-    PrimitiveTopology, Rect2D, RenderingDesc, RhiError, ShaderModuleDesc, ShaderModuleHandle,
-    StoreOp, TextureHandle, TextureState, TextureUsage, Viewport,
+    BlendFactor, BlendOp, BlendState, BufferHandle, BufferUsage, CommandEncoder, CullMode,
+    DepthState, Format, FrameToken, FrontFace, GraphicsPipelineDesc, IndexFormat, LoadOp, Memory,
+    PipelineHandle, PrimitiveTopology, Rect2D, RenderingDesc, RhiError, ShaderModuleDesc,
+    ShaderModuleHandle, StoreOp, TextureHandle, TextureState, TextureUsage, Viewport,
 };
 
 use crate::bindings::check_push_constants;
@@ -18,7 +18,9 @@ use crate::destroy::{Doomed, destroy_doomed};
 use crate::device::DeviceShared;
 use crate::error::{invalid, map_vk, stale};
 use crate::registry::generated_name;
-use crate::texture::{StateCheck, TextureOwner, aspect_of, check_tracked_state, rhi_to_vk_format};
+use crate::texture::{
+    StateCheck, TextureOwner, aspect_of, check_tracked_state, compare_to_vk, rhi_to_vk_format,
+};
 use crate::upload::{self, PendingUpload};
 use crate::{lock, read, write};
 
@@ -105,15 +107,6 @@ pub(crate) fn image_barrier(
     from: TextureState,
     to: TextureState,
 ) -> Result<vk::ImageMemoryBarrier2<'static>, RhiError> {
-    use TextureState::{DepthAttachment, ShaderRead};
-    if matches!(
-        (from, to),
-        (DepthAttachment, ShaderRead) | (ShaderRead, DepthAttachment)
-    ) {
-        return Err(RhiError::Unsupported {
-            what: format!("texture state transition {from:?} -> {to:?}"),
-        });
-    }
     let (mut src, dst) = (state_as_source(from), state_as_destination(to)?);
     if from == TextureState::Undefined && aspect.contains(vk::ImageAspectFlags::DEPTH) {
         // A depth image re-transitioned from `Undefined` every frame must be ordered after the
@@ -1069,18 +1062,25 @@ impl CommandEncoder for VulkanCommands {
                 drop(pool);
                 return self.st.record(stale("texture", t));
             };
-            if tex.owner != TextureOwner::Device
-                || !tex.usage.contains(TextureUsage::TRANSFER_SRC)
-                || tex.format.is_depth()
-            {
+            if !tex.usage.contains(TextureUsage::TRANSFER_SRC) || tex.format.is_depth() {
                 return self.st.record(invalid(
-                    "copy_texture_to_buffer needs a device-owned color texture with TextureUsage::TRANSFER_SRC",
+                    "copy_texture_to_buffer needs a color texture with TextureUsage::TRANSFER_SRC",
                 ));
             }
             let bytes = u64::from(tex.width)
                 * u64::from(tex.height)
                 * u64::from(tex.format.bytes_per_texel());
-            (tex.image, (tex.width, tex.height), bytes, tex.state)
+            (
+                tex.image,
+                (tex.width, tex.height),
+                bytes,
+                // swapchain textures are not state-tracked
+                if tex.owner == TextureOwner::Device {
+                    tex.state
+                } else {
+                    TextureState::TransferSrc
+                },
+            )
         };
         let (draw, host_read) = {
             let pool = read(&self.shared.pools.buffers);
@@ -1196,16 +1196,14 @@ pub(crate) struct VkPipeline {
     pub depth_format: Option<Format>,
 }
 
-/// Depth/stencil state for a pipeline (MODULE-007 §6.4): off without a depth format, otherwise
-/// test + write with `LESS`.
+/// Depth/stencil state for a pipeline (MODULE-007 §6.4): test off without a depth state.
 pub(crate) fn depth_state(
-    depth_format: Option<Format>,
+    depth: Option<DepthState>,
 ) -> vk::PipelineDepthStencilStateCreateInfo<'static> {
-    let on = depth_format.is_some();
     vk::PipelineDepthStencilStateCreateInfo::default()
-        .depth_test_enable(on)
-        .depth_write_enable(on)
-        .depth_compare_op(vk::CompareOp::LESS)
+        .depth_test_enable(depth.is_some())
+        .depth_write_enable(depth.is_some_and(|d| d.write))
+        .depth_compare_op(depth.map_or(vk::CompareOp::ALWAYS, |d| compare_to_vk(d.compare)))
 }
 
 pub(crate) fn check_spirv(words: &[u32]) -> Result<(), RhiError> {
@@ -1219,11 +1217,12 @@ pub(crate) fn check_spirv(words: &[u32]) -> Result<(), RhiError> {
 pub(crate) fn validate_pipeline_desc(
     desc: &GraphicsPipelineDesc,
 ) -> Result<(CString, CString), RhiError> {
-    if let Some(f) = desc.depth_format
-        && f != Format::D32Sfloat
+    if let Some(d) = desc.depth
+        && d.format != Format::D32Sfloat
     {
         return Err(invalid(format!(
-            "pipeline depth format must be D32Sfloat, got {f:?}"
+            "pipeline depth format must be D32Sfloat, got {:?}",
+            d.format
         )));
     }
     if desc.color_formats.iter().any(|f| f.is_depth()) {
@@ -1342,7 +1341,12 @@ pub(crate) fn create_graphics_pipeline(
     let viewport = vk::PipelineViewportStateCreateInfo::default()
         .viewport_count(1)
         .scissor_count(1);
+    let bias = desc.depth.and_then(|d| d.bias);
     let raster = vk::PipelineRasterizationStateCreateInfo::default()
+        .depth_bias_enable(bias.is_some())
+        .depth_bias_constant_factor(bias.map_or(0.0, |b| b.constant))
+        .depth_bias_slope_factor(bias.map_or(0.0, |b| b.slope))
+        .depth_bias_clamp(bias.map_or(0.0, |b| b.clamp))
         .polygon_mode(vk::PolygonMode::FILL)
         .cull_mode(cull)
         .front_face(front)
@@ -1352,11 +1356,11 @@ pub(crate) fn create_graphics_pipeline(
     let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blends);
     let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
-    let depth_stencil = depth_state(desc.depth_format);
+    let depth_stencil = depth_state(desc.depth);
     let mut rendering =
         vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&vk_formats);
-    if let Some(d) = desc.depth_format {
-        rendering = rendering.depth_attachment_format(rhi_to_vk_format(d));
+    if let Some(d) = desc.depth {
+        rendering = rendering.depth_attachment_format(rhi_to_vk_format(d.format));
     }
     let layout = s.bindings.pipeline_layout;
     let ci = vk::GraphicsPipelineCreateInfo::default()
@@ -1395,13 +1399,13 @@ pub(crate) fn create_graphics_pipeline(
     let h = write(&s.pools.pipelines).insert(VkPipeline {
         pipeline,
         color_formats,
-        depth_format: desc.depth_format,
+        depth_format: desc.depth.map(|d| d.format),
     });
     let name = desc
         .label
         .map_or_else(|| generated_name("pipeline", h), str::to_owned);
     s.set_name(pipeline, &name);
-    tracing::debug!(handle = ?h, label = %name, color_formats = ?desc.color_formats, depth_format = ?desc.depth_format, topology = ?desc.topology, "pipeline created");
+    tracing::debug!(handle = ?h, label = %name, color_formats = ?desc.color_formats, depth = ?desc.depth, topology = ?desc.topology, "pipeline created");
     Ok(h)
 }
 
@@ -1466,14 +1470,6 @@ mod tests {
         assert_eq!(t.next_value(), 3);
     }
 
-    fn is_depth_shader_pair(a: TextureState, b: TextureState) -> bool {
-        use TextureState::{DepthAttachment, ShaderRead};
-        matches!(
-            (a, b),
-            (DepthAttachment, ShaderRead) | (ShaderRead, DepthAttachment)
-        )
-    }
-
     #[test]
     fn state_pair_mapping() {
         let b = image_barrier(
@@ -1497,10 +1493,7 @@ mod tests {
             (TextureState::DepthAttachment, TextureState::ShaderRead),
             (TextureState::ShaderRead, TextureState::DepthAttachment),
         ] {
-            assert!(matches!(
-                image_barrier(vk::Image::null(), vk::ImageAspectFlags::DEPTH, a, c),
-                Err(RhiError::Unsupported { .. })
-            ));
+            assert!(image_barrier(vk::Image::null(), vk::ImageAspectFlags::DEPTH, a, c).is_ok());
         }
         let up = image_barrier(
             vk::Image::null(),
@@ -1530,12 +1523,20 @@ mod tests {
             (off.depth_test_enable, off.depth_write_enable),
             (vk::FALSE, vk::FALSE)
         );
-        let on = depth_state(Some(Format::D32Sfloat));
+        let mut st = DepthState {
+            format: Format::D32Sfloat,
+            compare: rhi::CompareOp::GreaterOrEqual,
+            write: true,
+            bias: None,
+        };
+        let on = depth_state(Some(st));
         assert_eq!(
             (on.depth_test_enable, on.depth_write_enable),
             (vk::TRUE, vk::TRUE)
         );
-        assert_eq!(on.depth_compare_op, vk::CompareOp::LESS);
+        assert_eq!(on.depth_compare_op, vk::CompareOp::GREATER_OR_EQUAL);
+        st.write = false;
+        assert_eq!(depth_state(Some(st)).depth_write_enable, vk::FALSE);
         assert_eq!(on.stencil_test_enable, vk::FALSE);
     }
 
@@ -1577,8 +1578,7 @@ mod tests {
                 let Ok(b) =
                     image_barrier(vk::Image::null(), vk::ImageAspectFlags::COLOR, from, *to)
                 else {
-                    assert!(is_depth_shader_pair(from, *to));
-                    continue;
+                    panic!("{from:?} -> {to:?} must be a valid transition");
                 };
                 assert_eq!(b.old_layout, state_as_source(from).layout);
                 assert_eq!(b.new_layout, state_as_destination(*to).unwrap().layout);
@@ -1731,7 +1731,7 @@ mod tests {
             vertex: mk("main"),
             fragment: mk("main"),
             color_formats: &formats,
-            depth_format: None,
+            depth: None,
             topology: PrimitiveTopology::TriangleList,
             cull: CullMode::None,
             front_face: FrontFace::CounterClockwise,
@@ -1745,14 +1745,22 @@ mod tests {
             Err(RhiError::InvalidDescriptor(_))
         ));
         d.blend = &[];
-        d.depth_format = Some(Format::D32Sfloat);
+        let ds = |format| {
+            Some(DepthState {
+                format,
+                compare: rhi::CompareOp::Less,
+                write: true,
+                bias: None,
+            })
+        };
+        d.depth = ds(Format::D32Sfloat);
         assert!(validate_pipeline_desc(&d).is_ok());
-        d.depth_format = Some(Format::Rgba8Unorm);
+        d.depth = ds(Format::Rgba8Unorm);
         assert!(matches!(
             validate_pipeline_desc(&d),
             Err(RhiError::InvalidDescriptor(_))
         ));
-        d.depth_format = None;
+        d.depth = None;
         d.vertex = mk("ma\0in");
         assert!(matches!(
             validate_pipeline_desc(&d),

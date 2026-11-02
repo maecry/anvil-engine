@@ -1,0 +1,20 @@
+#version 460
+#include "common.glsl"
+
+layout(location = 0) out vec3 v_world_pos;
+layout(location = 1) out vec3 v_normal;
+layout(location = 2) out vec2 v_uv;
+layout(location = 3) out vec4 v_tangent;
+layout(location = 4) flat out uint v_material;
+
+void main() {
+    Vertex v = pc.vertices.v[gl_VertexIndex];
+    Instance inst = pc.instances.i[gl_InstanceIndex];
+    vec4 world = inst.model * vec4(v.pos[0], v.pos[1], v.pos[2], 1.0);
+    v_world_pos = world.xyz;
+    v_normal = mat3(inst.normal_matrix) * vec3(v.normal[0], v.normal[1], v.normal[2]);
+    v_uv = vec2(v.uv[0], v.uv[1]);
+    v_tangent = vec4(mat3(inst.model) * vec3(v.tangent[0], v.tangent[1], v.tangent[2]), v.tangent[3]);
+    v_material = inst.material;
+    gl_Position = pc.frame.d.view_proj * world;
+}

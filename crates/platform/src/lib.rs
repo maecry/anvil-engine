@@ -9,7 +9,7 @@ use raw_window_handle::{
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, MouseButton as WMouse, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton as WMouse, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode as WKey, PhysicalKey};
 use winit::window::WindowId;
@@ -64,11 +64,100 @@ pub enum Control {
     Exit,
 }
 
-/// Engine keyboard keys (M1: only the keys the engine uses).
+/// Engine keyboard keys: the keys the engine and examples use (physical positions; `Shift` and
+/// `Ctrl` cover both sides).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyCode {
     /// The Escape key.
     Escape,
+    /// The A key.
+    A,
+    /// The B key.
+    B,
+    /// The C key.
+    C,
+    /// The D key.
+    D,
+    /// The E key.
+    E,
+    /// The F key.
+    F,
+    /// The G key.
+    G,
+    /// The H key.
+    H,
+    /// The I key.
+    I,
+    /// The J key.
+    J,
+    /// The K key.
+    K,
+    /// The L key.
+    L,
+    /// The M key.
+    M,
+    /// The N key.
+    N,
+    /// The O key.
+    O,
+    /// The P key.
+    P,
+    /// The Q key.
+    Q,
+    /// The R key.
+    R,
+    /// The S key.
+    S,
+    /// The T key.
+    T,
+    /// The U key.
+    U,
+    /// The V key.
+    V,
+    /// The W key.
+    W,
+    /// The X key.
+    X,
+    /// The Y key.
+    Y,
+    /// The Z key.
+    Z,
+    /// The 0 key (top row).
+    Num0,
+    /// The 1 key (top row).
+    Num1,
+    /// The 2 key (top row).
+    Num2,
+    /// The 3 key (top row).
+    Num3,
+    /// The 4 key (top row).
+    Num4,
+    /// The 5 key (top row).
+    Num5,
+    /// The 6 key (top row).
+    Num6,
+    /// The 7 key (top row).
+    Num7,
+    /// The 8 key (top row).
+    Num8,
+    /// The 9 key (top row).
+    Num9,
+    /// The ArrowUp key.
+    ArrowUp,
+    /// The ArrowDown key.
+    ArrowDown,
+    /// The ArrowLeft key.
+    ArrowLeft,
+    /// The ArrowRight key.
+    ArrowRight,
+    /// The Space key.
+    Space,
+    /// The Shift key.
+    Shift,
+    /// The Ctrl key.
+    Ctrl,
+    /// The Tab key.
+    Tab,
     /// Any key not yet mapped.
     Other,
 }
@@ -128,6 +217,13 @@ pub enum Event {
         x: f64,
         /// Y position.
         y: f64,
+    },
+    /// Raw (unaccelerated) mouse motion since the last event, in device units.
+    MouseMotion {
+        /// Horizontal motion.
+        dx: f64,
+        /// Vertical motion.
+        dy: f64,
     },
 }
 
@@ -196,6 +292,50 @@ fn is_zero_size((w, h): (u32, u32)) -> bool {
 fn map_key(key: PhysicalKey) -> KeyCode {
     match key {
         PhysicalKey::Code(WKey::Escape) => KeyCode::Escape,
+        PhysicalKey::Code(WKey::KeyA) => KeyCode::A,
+        PhysicalKey::Code(WKey::KeyB) => KeyCode::B,
+        PhysicalKey::Code(WKey::KeyC) => KeyCode::C,
+        PhysicalKey::Code(WKey::KeyD) => KeyCode::D,
+        PhysicalKey::Code(WKey::KeyE) => KeyCode::E,
+        PhysicalKey::Code(WKey::KeyF) => KeyCode::F,
+        PhysicalKey::Code(WKey::KeyG) => KeyCode::G,
+        PhysicalKey::Code(WKey::KeyH) => KeyCode::H,
+        PhysicalKey::Code(WKey::KeyI) => KeyCode::I,
+        PhysicalKey::Code(WKey::KeyJ) => KeyCode::J,
+        PhysicalKey::Code(WKey::KeyK) => KeyCode::K,
+        PhysicalKey::Code(WKey::KeyL) => KeyCode::L,
+        PhysicalKey::Code(WKey::KeyM) => KeyCode::M,
+        PhysicalKey::Code(WKey::KeyN) => KeyCode::N,
+        PhysicalKey::Code(WKey::KeyO) => KeyCode::O,
+        PhysicalKey::Code(WKey::KeyP) => KeyCode::P,
+        PhysicalKey::Code(WKey::KeyQ) => KeyCode::Q,
+        PhysicalKey::Code(WKey::KeyR) => KeyCode::R,
+        PhysicalKey::Code(WKey::KeyS) => KeyCode::S,
+        PhysicalKey::Code(WKey::KeyT) => KeyCode::T,
+        PhysicalKey::Code(WKey::KeyU) => KeyCode::U,
+        PhysicalKey::Code(WKey::KeyV) => KeyCode::V,
+        PhysicalKey::Code(WKey::KeyW) => KeyCode::W,
+        PhysicalKey::Code(WKey::KeyX) => KeyCode::X,
+        PhysicalKey::Code(WKey::KeyY) => KeyCode::Y,
+        PhysicalKey::Code(WKey::KeyZ) => KeyCode::Z,
+        PhysicalKey::Code(WKey::Digit0) => KeyCode::Num0,
+        PhysicalKey::Code(WKey::Digit1) => KeyCode::Num1,
+        PhysicalKey::Code(WKey::Digit2) => KeyCode::Num2,
+        PhysicalKey::Code(WKey::Digit3) => KeyCode::Num3,
+        PhysicalKey::Code(WKey::Digit4) => KeyCode::Num4,
+        PhysicalKey::Code(WKey::Digit5) => KeyCode::Num5,
+        PhysicalKey::Code(WKey::Digit6) => KeyCode::Num6,
+        PhysicalKey::Code(WKey::Digit7) => KeyCode::Num7,
+        PhysicalKey::Code(WKey::Digit8) => KeyCode::Num8,
+        PhysicalKey::Code(WKey::Digit9) => KeyCode::Num9,
+        PhysicalKey::Code(WKey::ArrowUp) => KeyCode::ArrowUp,
+        PhysicalKey::Code(WKey::ArrowDown) => KeyCode::ArrowDown,
+        PhysicalKey::Code(WKey::ArrowLeft) => KeyCode::ArrowLeft,
+        PhysicalKey::Code(WKey::ArrowRight) => KeyCode::ArrowRight,
+        PhysicalKey::Code(WKey::Space) => KeyCode::Space,
+        PhysicalKey::Code(WKey::ShiftLeft | WKey::ShiftRight) => KeyCode::Shift,
+        PhysicalKey::Code(WKey::ControlLeft | WKey::ControlRight) => KeyCode::Ctrl,
+        PhysicalKey::Code(WKey::Tab) => KeyCode::Tab,
         _ => KeyCode::Other,
     }
 }
@@ -299,6 +439,15 @@ impl<A: App> ApplicationHandler for Handler<A> {
         }
     }
 
+    fn device_event(&mut self, el: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        if let (Some(window), DeviceEvent::MouseMotion { delta: (dx, dy) }) =
+            (self.window.clone(), event)
+            && self.app.on_event(&window, &Event::MouseMotion { dx, dy }) == Control::Exit
+        {
+            el.exit();
+        }
+    }
+
     fn about_to_wait(&mut self, _: &ActiveEventLoop) {
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -391,7 +540,10 @@ mod tests {
     #[test]
     fn key_and_button_mapping() {
         assert_eq!(map_key(PhysicalKey::Code(WKey::Escape)), KeyCode::Escape);
-        assert_eq!(map_key(PhysicalKey::Code(WKey::KeyA)), KeyCode::Other);
+        assert_eq!(map_key(PhysicalKey::Code(WKey::KeyA)), KeyCode::A);
+        assert_eq!(map_key(PhysicalKey::Code(WKey::Digit7)), KeyCode::Num7);
+        assert_eq!(map_key(PhysicalKey::Code(WKey::ShiftRight)), KeyCode::Shift);
+        assert_eq!(map_key(PhysicalKey::Code(WKey::F5)), KeyCode::Other);
         assert_eq!(map_button(WMouse::Left), MouseButton::Left);
         assert_eq!(map_button(WMouse::Back), MouseButton::Other);
     }

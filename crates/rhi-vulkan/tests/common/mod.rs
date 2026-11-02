@@ -117,7 +117,12 @@ impl Pipe {
                     entry: "main",
                 },
                 color_formats: &[color],
-                depth_format: depth,
+                depth: depth.map(|format| rhi::DepthState {
+                    format,
+                    compare: rhi::CompareOp::Less,
+                    write: true,
+                    bias: None,
+                }),
                 topology: PrimitiveTopology::TriangleList,
                 cull: CullMode::None,
                 front_face: FrontFace::CounterClockwise,

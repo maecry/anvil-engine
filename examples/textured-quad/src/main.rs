@@ -144,7 +144,7 @@ impl TexturedQuad {
                 entry: "main",
             },
             color_formats: &[format],
-            depth_format: None,
+            depth: None,
             topology: PrimitiveTopology::TriangleList,
             cull: CullMode::None,
             front_face: FrontFace::CounterClockwise,
@@ -181,6 +181,7 @@ impl TexturedQuad {
             address_u: AddressMode::ClampToEdge,
             address_v: AddressMode::ClampToEdge,
             address_w: AddressMode::ClampToEdge,
+            compare: None,
         })?;
         let vertex_address = device.buffer_address(vertices)?;
         let texture_index = device.texture_index(texture)?;

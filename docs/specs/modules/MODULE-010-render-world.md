@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft |
+| Status | Accepted (ADR-0011) |
 | Crate | renderer |
 | Layer | LAYER-005 |
 | Milestone | M3 |
@@ -13,9 +13,11 @@
 
 The renderer-owned copy of the scene: it receives immutable extracted data each frame, updates renderer-side state, and produces visibility results and draw lists that the passes consume. It is the boundary that keeps scene types and Vulkan types out of the renderer's hot data (MASTER-000 §5.2 rule 5, §11).
 
+**M3 resolution (ADR-0011).** M3 has no persistent `RenderWorld`: the app rebuilds `RenderScene` (the former `ExtractedFrame`) every frame and `Renderer::render` consumes it directly. The responsibilities below that need persistent state (diff updates, culling, sorting) are deferred; M3a implements the extraction types, per-frame data upload and the fixed pass sequence described in LAYER-005 §8 and §12a.
+
 ## 2. Responsibilities
 
-- Accept `ExtractedFrame` (camera, mesh instances, lights; plain data, `Send`).
+- Accept `RenderScene` (camera, mesh instances, lights; plain data, `Send`) (formerly `ExtractedFrame`).
 - `RenderWorld::update(&mut self, frame: &ExtractedFrame)`: add/update/remove render-side instances keyed by renderer-neutral ids (`MeshId`, `MaterialId`).
 - Visibility: frustum culling first (M3), later occlusion/LOD (M5).
 - Sorting and batching into draw lists (by pipeline/material/depth).
@@ -55,9 +57,11 @@ impl RenderWorld {
 }
 ```
 
-Where `ExtractedFrame` is defined (renderer vs a neutral crate) is undecided (LAYER-005 Q1).
+As built in M3a (the concept above is superseded): `RenderScene { camera: Camera, meshes: Vec<MeshInstance>, lights: Vec<Light> }` is defined in the renderer crate; `Renderer::render(&mut self, device, cmd, slot, &RenderScene, &SwapchainImage)` takes it by reference. There is no `RenderWorld` type yet; see LAYER-005 §8 for the full API.
 
 ## 6. Data structures
+
+As built: `MeshInstance { mesh: MeshId, material: MaterialId, transform: Mat4 }` (no flags yet); GPU side, `GpuInstance { model, normal_matrix, material }` (world matrices stored pre-multiplied, AoS, ADR-0011 §4), `GpuLight`, `GpuMaterial`, `GpuFrame` in `crates/renderer/src/gpu.rs`, std430, mirrored by `shaders/common.glsl` and checked by a size test. Originally:
 
 `MeshInstance { mesh: MeshId, material: MaterialId, transform: Mat4, flags }`; `RenderMesh { vertex/index buffer handles, ranges, bounds }`; `RenderMaterial { pipeline handle(s), binding data }`; `VisibleSet { indices }`; `DrawList { sort_key: u64, instance, mesh, material }`. Struct-of-arrays versus array-of-structs is a data-layout decision to make with measurements. Stable ids are generational where entries can be removed (reuse of `Handle<T>`/`Pool<T>` is the default).
 
@@ -67,7 +71,7 @@ The render world owns its copy of instance data. GPU resources it refers to (buf
 
 ## 8. Execution flow
 
-Per frame (MASTER-000 §9.1): app update -> scene update -> extract (`ExtractedFrame`) -> `RenderWorld::update` -> visibility -> sort/batch -> graph build/compile (M4; direct pass calls in M3) -> record -> submit -> present. `update` is a diff against the previous frame (add/remove/modify) or a full rebuild; the strategy is undecided and decided by measurement.
+Per frame (MASTER-000 §9.1): app update -> scene update -> extract (`ExtractedFrame`) -> `RenderWorld::update` -> visibility -> sort/batch -> graph build/compile (M4; direct pass calls in M3) -> record -> submit -> present. Decided (ADR-0011 §2): a full rebuild every frame, not a diff; revisit when the ECS arrives or profiling shows a bottleneck.
 
 ## 9. Threading model
 
@@ -85,12 +89,14 @@ Measure update time, visibility time, draw-call count, pipeline switches and ins
 
 Unit tests against `NullBackend` or no backend at all: add/update/remove semantics; id reuse safety; frustum culling against known boxes and edge cases (on-plane, behind, huge bounds); sort key ordering and batching; determinism (same input same draw list). Rendering tests (M3+): golden images for the first mesh/material scene with tolerance (NFR-TEST-003). Build check: `cargo tree -p renderer` shows no `ash`, no scene crate.
 
-## 13. Acceptance criteria (Draft, M3)
+## 13. Acceptance criteria (M3)
 
-- [ ] A mesh with a texture and basic lighting renders via `Renderer<VulkanDevice>` using the render world.
-- [ ] `renderer` builds against `NullBackend` and has no `ash` or scene dependency.
-- [ ] Culling and sorting unit tests pass; draw lists are deterministic.
-- [ ] Extracted data is immutable during `update` (type-level: `&ExtractedFrame`).
+- [x] A mesh with a texture and basic lighting renders via `Renderer` on `VulkanDevice` (`examples/pbr-scene`, M3a).
+- [x] `renderer` has no `ash` or scene dependency (`cargo tree -p renderer`).
+- [x] Extracted data is immutable during rendering (type-level: `&RenderScene`).
+- [x] Unit tests: mesh winding/tangents/counts, camera reverse-Z and Y flip, GPU layout sizes.
+- [ ] Culling and sorting unit tests, deterministic draw lists (deferred to M4, with visibility).
+- [ ] Builds against a mock backend (pending).
 
 ## 14. Traceability (FR/NFR IDs)
 
@@ -105,11 +111,11 @@ Unit tests against `NullBackend` or no backend at all: add/update/remove semanti
 
 ## 15. Open questions
 
-1. Who defines extraction types: renderer (scene depends on it) or a neutral crate; needs an ADR before M3 (LAYER-005 Q1).
+1. Resolved (ADR-0011 §2): the renderer crate defines the extraction types.
 2. ECS choice (own, `bevy_ecs`, `hecs`) affects extraction; deferred to LAYER-010.
-3. Does the renderer own the swapchain or does the app pass `SwapchainHandle` (leaning: app owns).
-4. Bindless vs descriptor-set-per-material (LAYER-007 Q1, MODULE-007 Q1).
-5. Math conventions (handedness, clip-space Y, depth range, reverse-Z): deferred to M3 (D3); M1 uses native Vulkan conventions with no flip. Decide before the camera/transform types are fixed, together with the `math` crate.
-6. Incremental diff vs full rebuild of render-side state.
-7. Data layout (SoA vs AoS) and whether transforms are stored pre-multiplied.
-8. How draw lists feed render-graph passes without the graph depending on renderer types (MODULE-009 Q7).
+3. Resolved (ADR-0011 §2): the app owns the swapchain and passes the acquired image.
+4. Resolved (ADR-0010): bindless.
+5. Resolved (ADR-0011 §1): `glam` re-exported as `foundation::math`; right-handed, Y-up, -Z forward, reverse-Z (clear 0, `GreaterOrEqual`, infinite far), Y flip folded into the projection.
+6. Resolved (ADR-0011 §2): full rebuild per frame.
+7. Resolved (ADR-0011 §4): AoS, world matrices pre-multiplied (plus a normal matrix).
+8. How draw lists feed render-graph passes without the graph depending on renderer types (MODULE-009 Q7); the M3 pass functions take explicit input structs for this reason.

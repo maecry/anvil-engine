@@ -123,6 +123,8 @@ pub enum Format {
     Rg8Unorm,
     /// 16-bit float RGBA.
     Rgba16Float,
+    /// 16-bit float two channel (e.g. a BRDF LUT).
+    Rg16Float,
     /// 32-bit float depth.
     D32Sfloat,
 }
@@ -147,6 +149,7 @@ impl Format {
             | Format::Bgra8Unorm
             | Format::Rgba8Srgb
             | Format::Rgba8Unorm
+            | Format::Rg16Float
             | Format::D32Sfloat => 4,
             Format::Rgba16Float => 8,
         }
@@ -331,6 +334,51 @@ pub struct SamplerDesc<'a> {
     pub address_v: AddressMode,
     /// Addressing along w.
     pub address_w: AddressMode,
+    /// Depth comparison for shadow sampling (`texture` returns the comparison result).
+    pub compare: Option<CompareOp>,
+}
+
+/// Comparison operator for depth tests and comparison samplers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CompareOp {
+    /// Never passes.
+    Never,
+    /// `a < b`.
+    Less,
+    /// `a == b`.
+    Equal,
+    /// `a <= b`.
+    LessOrEqual,
+    /// `a > b`.
+    Greater,
+    /// `a >= b`.
+    GreaterOrEqual,
+    /// Always passes.
+    Always,
+}
+
+/// Slope-scaled depth bias, applied in the pipeline.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DepthBias {
+    /// Constant factor.
+    pub constant: f32,
+    /// Slope factor.
+    pub slope: f32,
+    /// Maximum (or minimum) bias, 0 = unclamped.
+    pub clamp: f32,
+}
+
+/// Depth test/write state of a pipeline.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DepthState {
+    /// Depth target format (`D32Sfloat`).
+    pub format: Format,
+    /// Depth test comparison.
+    pub compare: CompareOp,
+    /// Whether passing fragments write depth.
+    pub write: bool,
+    /// Optional rasterizer depth bias.
+    pub bias: Option<DepthBias>,
 }
 
 /// Index element type for [`CommandEncoder::bind_index_buffer`].
@@ -566,7 +614,7 @@ impl Default for BlendState {
 ///
 /// No vertex input state: shaders pull vertices through buffer device addresses. Every pipeline
 /// uses the one global layout (bindless set 0 + [`PUSH_CONSTANT_BYTES`] of push constants).
-/// `depth_format` may be `None` or `Some(Format::D32Sfloat)` (test + write, `LESS`).
+/// `depth` may be `None` (no depth target) or a [`DepthState`] with format `D32Sfloat`.
 #[derive(Clone, Copy, Debug)]
 pub struct GraphicsPipelineDesc<'a> {
     /// Debug label.
@@ -577,8 +625,8 @@ pub struct GraphicsPipelineDesc<'a> {
     pub fragment: ShaderStageDesc<'a>,
     /// Formats of the color targets (dynamic rendering, no render pass object).
     pub color_formats: &'a [Format],
-    /// Depth target format, if any.
-    pub depth_format: Option<Format>,
+    /// Depth target and test state, if any.
+    pub depth: Option<DepthState>,
     /// Primitive topology.
     pub topology: PrimitiveTopology,
     /// Face culling.
