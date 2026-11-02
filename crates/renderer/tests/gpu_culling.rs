@@ -151,6 +151,10 @@ fn run(
         cmd.copy_texture_to_buffer(target, rb, 0);
         let fin = cmd.finish().unwrap();
         dev.submit_unwindowed(fin).unwrap();
+        // One shared target and readback buffer (no swapchain acquire semaphore), so frames
+        // must not overlap; this also keeps older sync-validation layers (CI) from flagging
+        // slot reuse they cannot see through the timeline host wait.
+        dev.wait_idle().unwrap();
         stats.push(r.stats());
     }
     dev.wait_idle().unwrap();
