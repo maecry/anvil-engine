@@ -1,0 +1,12 @@
+[package]
+name = "platform"
+description = "Windowing, input and surface integration."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+foundation = { path = "../foundation" }

@@ -1,0 +1,12 @@
+[package]
+name = "rhi"
+description = "Backend-agnostic Rendering Hardware Interface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+foundation = { path = "../foundation" }

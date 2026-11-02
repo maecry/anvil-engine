@@ -1,0 +1,15 @@
+[package]
+name = "triangle"
+description = "M1 vertical slice: window, Vulkan device, swapchain, one triangle."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+foundation = { path = "../../crates/foundation" }
+platform = { path = "../../crates/platform" }
+rhi = { path = "../../crates/rhi" }
+rhi-vulkan = { path = "../../crates/rhi-vulkan" }
