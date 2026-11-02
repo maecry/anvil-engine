@@ -11,3 +11,12 @@ workspace = true
 [dependencies]
 foundation = { path = "../foundation" }
 rhi = { path = "../rhi" }
+tracing.workspace = true
+thiserror.workspace = true
+raw-window-handle.workspace = true
+ash = "0.38.0"
+ash-window = "0.13.0"
+gpu-allocator = { version = "0.28.0", default-features = false, features = ["vulkan", "std"] }
+
+[dev-dependencies]
+foundation = { path = "../foundation", features = ["log-init"] }

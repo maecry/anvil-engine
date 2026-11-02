@@ -9,7 +9,12 @@ publish = false
 workspace = true
 
 [dependencies]
-foundation = { path = "../../crates/foundation" }
+foundation = { path = "../../crates/foundation", features = ["log-init"] }
 platform = { path = "../../crates/platform" }
 rhi = { path = "../../crates/rhi" }
 rhi-vulkan = { path = "../../crates/rhi-vulkan" }
+tracing.workspace = true
+anyhow = "1"
+
+[build-dependencies]
+shaderc = "0.10.1"
