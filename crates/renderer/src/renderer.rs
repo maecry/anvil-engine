@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use foundation::Handle;
 use foundation::Pool;
 use foundation::math::{Mat4, Vec3};
-use render_graph::{GraphBuilder, GraphError, GraphStats, RenderGraph, TransientDesc};
+use rayon::prelude::*;
+use render_graph::{GpuTimings, GraphBuilder, GraphError, GraphStats, RenderGraph, TransientDesc};
 use rhi::{
     AddressMode, BlendFactor, BlendState, BufferDesc, BufferHandle, BufferUsage, CompareOp,
     CullMode, DepthBias, DepthState, Device, Filter, Format, FrameToken, FrontFace,
@@ -16,8 +17,8 @@ use rhi::{
 };
 
 use crate::cluster::{CLUSTER_FAR, ClusterGrid, GRID, LightSphere, spot_bounds};
-use crate::cull::{Frustum, bounding_sphere, transform_sphere};
-use crate::gpu::{GpuFrame, GpuInstance, GpuLight, GpuMaterial};
+use crate::cull::{Frustum, bounding_sphere};
+use crate::gpu::{GpuFrame, GpuLight, GpuMaterial};
 use crate::ibl::Ibl;
 use crate::passes::{
     Draw, GbufferInputs, GeometryInputs, LightingInputs, Pipes, PrepassInputs, ShadedInputs,
@@ -28,6 +29,7 @@ use crate::post::{
     BloomInputs, BloomTargets, DOWN_NAMES, TaaInputs, UP_NAMES, bloom_passes, jitter_pixels,
     jitter_projection, ssao_blur_pass, ssao_pass, taa_pass,
 };
+use crate::prep::{self, Resolved};
 use crate::shadow::{CASCADES, cascade_splits, fit_directional, fit_spot};
 use crate::{Light, MAX_LIGHTS, MAX_SPOT_SHADOWS, MeshData, RenderScene};
 
@@ -52,8 +54,8 @@ pub(crate) static TONEMAP_VERT: &[u8] = spv!("tonemap.vert");
 static TONEMAP_FRAG: &[u8] = spv!("tonemap.frag");
 
 /// Size of each per-frame-in-flight upload ring.
-// shortcut: fixed 8 MiB ring, render fails when a scene overflows it; grow or chain rings when scenes get bigger.
-const RING_BYTES: u64 = 8 << 20;
+// shortcut: fixed 16 MiB ring (208 B per instance: about 75 000 instances), render fails when a scene overflows it; GPU-driven rendering (M5b) replaces the per-frame instance upload.
+const RING_BYTES: u64 = 16 << 20;
 /// Resolution of each directional cascade (ADR-0012 §11).
 const SHADOW_SIZE: u32 = 2048;
 /// Resolution of each spot shadow map; mirrored by `SPOT_SHADOW_SIZE` in `lighting.glsl`.
@@ -231,8 +233,55 @@ impl Default for MaterialDesc<'_> {
     }
 }
 
-/// Per-frame counters (ADR-0011 §11), logged once per second at `debug`.
+/// CPU time of each preparation stage of one frame (ADR-0013 §2); each stage is also a
+/// `tracing` span named `renderer.<stage>`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageTimes {
+    /// Cluster light assignment.
+    pub clusters: Duration,
+    /// Per-instance world bounds and instance data packing.
+    pub pack: Duration,
+    /// Camera frustum culling.
+    pub cull: Duration,
+    /// Sorting the camera draw lists.
+    pub sort: Duration,
+    /// Culling and ordering the shadow-view draw lists.
+    pub shadow_lists: Duration,
+    /// Copying frame data into the upload ring.
+    pub upload: Duration,
+    /// Declaring the render graph (passes and bodies).
+    pub graph_build: Duration,
+    /// [`RenderGraph::compile`].
+    pub compile: Duration,
+    /// [`RenderGraph::execute`] (command recording).
+    pub execute: Duration,
+}
+
+/// Guard that times a stage and keeps its span entered until dropped.
+struct StageGuard<'a> {
+    start: Instant,
+    out: &'a mut Duration,
+    _span: tracing::span::EnteredSpan,
+}
+
+impl<'a> StageGuard<'a> {
+    fn new(span: tracing::Span, out: &'a mut Duration) -> Self {
+        Self {
+            start: Instant::now(),
+            out,
+            _span: span.entered(),
+        }
+    }
+}
+
+impl Drop for StageGuard<'_> {
+    fn drop(&mut self) {
+        *self.out += self.start.elapsed();
+    }
+}
+
+/// Per-frame counters (ADR-0011 §11), logged once per second at `debug`.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RendererStats {
     /// Draw calls issued.
     pub draws: u32,
@@ -248,8 +297,11 @@ pub struct RendererStats {
     pub culled: u32,
     /// Draws recorded into all shadow maps.
     pub shadow_draws: u32,
-    /// CPU time of the cluster light assignment.
-    pub cluster_time: Duration,
+    /// CPU time of each preparation stage.
+    pub stages: StageTimes,
+    /// Per-pass GPU times of an earlier frame (`frames_in_flight` old, see
+    /// [`GpuTimings::frame`]); empty until the first one retires or without timestamp support.
+    pub gpu: GpuTimings,
 }
 
 /// Why [`Renderer::render`] failed.
@@ -308,6 +360,10 @@ pub struct Renderer {
     rings: Vec<(BufferHandle, u64)>,
     ring_used: u64,
     stats: RendererStats,
+    /// Latest per-pass GPU timings read back.
+    gpu: GpuTimings,
+    /// Reused instance packing buffers.
+    prep: prep::Scratch,
     last_log: Instant,
 }
 
@@ -453,6 +509,8 @@ impl Renderer {
         swapchain_format: Format,
         extent: (u32, u32),
     ) -> Result<Self, RhiError> {
+        // Configure the worker pool (ANVIL_THREADS) before the first parallel frame.
+        foundation::init_thread_pool();
         let none = [BlendState::default()];
         let depth_state = |compare, write, bias| {
             Some(DepthState {
@@ -658,6 +716,8 @@ impl Renderer {
             rings,
             ring_used: 0,
             stats: RendererStats::default(),
+            gpu: GpuTimings::default(),
+            prep: prep::Scratch::default(),
             last_log: Instant::now(),
         };
         r.white_srgb = r.create_texture(device, "default.white_srgb", &[255; 4], 1, 1, true)?;
@@ -849,7 +909,7 @@ impl Renderer {
 
     /// Counters of the last rendered frame.
     pub fn stats(&self) -> RendererStats {
-        self.stats
+        self.stats.clone()
     }
 
     /// Appends `data` to the frame's ring (16-byte aligned) and returns its device address.
@@ -893,6 +953,10 @@ impl Renderer {
     ) -> Result<(), RenderError> {
         let slot = frame.slot as usize;
         self.ring_used = 0;
+        let mut stages = StageTimes::default();
+        if let Some(t) = self.graph.gpu_timings(device, frame.slot)? {
+            self.gpu = t;
+        }
 
         let (w, h) = (target.extent.0.max(1), target.extent.1.max(1));
         let view = scene.camera.view();
@@ -1036,7 +1100,10 @@ impl Renderer {
         }
 
         // Clustered assignment.
-        let t_cluster = Instant::now();
+        let cluster_guard = StageGuard::new(
+            tracing::debug_span!("renderer.clusters"),
+            &mut stages.clusters,
+        );
         let tan = (tan_y * aspect, tan_y);
         if !self
             .cluster_grid
@@ -1050,107 +1117,83 @@ impl Renderer {
             .as_ref()
             .map(|g| g.assign(&spheres))
             .expect("grid built above");
-        let cluster_time = t_cluster.elapsed();
+        drop(cluster_guard);
 
         // Visible instances per view: camera (opaque sorted front to back, grouped by pipeline
-        // variant; blended sorted back to front) and each shadow map.
-        struct Item {
-            draw: Draw,
-            center: Vec3,
-            radius: f32,
-            blend: bool,
-        }
-        let mut instances = Vec::with_capacity(scene.meshes.len());
-        let mut items = Vec::with_capacity(scene.meshes.len());
-        for inst in &scene.meshes {
+        // variant; blended sorted back to front) and each shadow map. Packing, culling and
+        // sorting run on the worker pool (ADR-0013 §3).
+        let pack_guard = StageGuard::new(tracing::debug_span!("renderer.pack"), &mut stages.pack);
+        let mut scratch = std::mem::take(&mut self.prep);
+        prep::pack(&mut scratch, &scene.meshes, &view, |inst| {
             let Some(mesh) = self.meshes.get(inst.mesh) else {
                 tracing::warn!(mesh = ?inst.mesh, "scene references a destroyed mesh, skipped");
-                continue;
+                return None;
             };
             let material_id = if self.materials.get(inst.material).is_some() {
                 inst.material
             } else {
                 self.default_material
             };
-            let Some(material) = self.materials.get(material_id) else {
-                continue;
-            };
-            let (center, radius) = transform_sphere(&inst.transform, mesh.center, mesh.radius);
+            let material = self.materials.get(material_id)?;
             let double = usize::from(material.double_sided);
             let (variant, blend) = match material.alpha_mode {
                 AlphaMode::Opaque => (double, false),
                 AlphaMode::Mask(_) => (2 + double, false),
                 AlphaMode::Blend => (double, true),
             };
-            items.push(Item {
-                draw: Draw {
-                    vertex_address: mesh.vertex_address,
-                    index_buffer: mesh.indices,
-                    index_count: mesh.index_count,
-                    instance: instances.len() as u32,
-                    variant,
-                    depth: -view.transform_point3(center).z,
-                },
-                center,
-                radius,
-                blend,
-            });
-            instances.push(GpuInstance {
-                model: inst.transform,
-                normal_matrix: inst.transform.inverse().transpose(),
-                prev_model: inst.prev_transform,
+            Some(Resolved {
+                vertex_address: mesh.vertex_address,
+                index_buffer: mesh.indices,
+                index_count: mesh.index_count,
+                center: mesh.center,
+                radius: mesh.radius,
                 material: material_id.index(),
-                pad: [0; 3],
-            });
-        }
+                variant,
+                blend,
+            })
+        });
+        drop(pack_guard);
+        let (items, instances) = (&scratch.items, &scratch.instances);
+        let cull_guard = StageGuard::new(tracing::debug_span!("renderer.cull"), &mut stages.cull);
         let cam_frustum = Frustum::from_view_proj(view_proj_unjit);
         let (mut opaque, mut blended) = (Vec::new(), Vec::new());
-        let mut culled = 0;
+        let visible = prep::cull(items, &cam_frustum);
+        let culled = (items.len() - visible.len()) as u32;
         let mut triangles = 0u64;
-        for it in &items {
-            if !cam_frustum.intersects_sphere(it.center, it.radius) {
-                culled += 1;
-                continue;
-            }
+        for it in visible {
             triangles += u64::from(it.draw.index_count / 3);
             if it.blend { &mut blended } else { &mut opaque }.push(it.draw);
         }
-        opaque.sort_by(|a, b| a.variant.cmp(&b.variant).then(a.depth.total_cmp(&b.depth)));
-        blended.sort_by(|a, b| b.depth.total_cmp(&a.depth));
-        // Shadow casters: everything but blended objects, grouped by variant.
-        let shadow_draws = |vp: Mat4| -> Vec<Draw> {
-            let f = Frustum::from_view_proj(vp);
-            let mut v: Vec<Draw> = items
-                .iter()
-                .filter(|it| !it.blend && f.intersects_sphere(it.center, it.radius))
-                .map(|it| it.draw)
-                .collect();
-            v.sort_by_key(|d| d.variant);
-            v
-        };
-        let cascade_draws: Vec<Vec<Draw>> = (0..CASCADES)
-            .map(|c| {
-                if cascade_dir.is_some() {
-                    shadow_draws(cascade_vp[c])
+        drop(cull_guard);
+        let sort_guard = StageGuard::new(tracing::debug_span!("renderer.sort"), &mut stages.sort);
+        prep::sort_camera(&mut opaque, &mut blended);
+        drop(sort_guard);
+        let shadow_guard = StageGuard::new(
+            tracing::debug_span!("renderer.shadow_lists"),
+            &mut stages.shadow_lists,
+        );
+        // One list per view, the views in parallel once there are enough instances.
+        let view_lists =
+            |n: usize, used: &(dyn Fn(usize) -> Option<Mat4> + Sync)| -> Vec<Vec<Draw>> {
+                let one = |i| {
+                    used(i).map_or_else(Vec::new, |vp| {
+                        prep::shadow_draws(items, &Frustum::from_view_proj(vp))
+                    })
+                };
+                if items.len() >= prep::PAR_MIN {
+                    (0..n).into_par_iter().map(one).collect()
                 } else {
-                    Vec::new()
+                    (0..n).map(one).collect()
                 }
-            })
-            .collect();
-        let spot_draws: Vec<Vec<Draw>> = (0..MAX_SPOT_SHADOWS)
-            .map(|i| {
-                if i < spot_used {
-                    shadow_draws(spot_vp[i])
-                } else {
-                    Vec::new()
-                }
-            })
-            .collect();
+            };
+        let cascade_draws = view_lists(CASCADES, &|c| cascade_dir.map(|_| cascade_vp[c]));
+        let spot_draws = view_lists(MAX_SPOT_SHADOWS, &|i| (i < spot_used).then(|| spot_vp[i]));
         let shadow_draw_count = cascade_draws
             .iter()
             .chain(&spot_draws)
             .map(Vec::len)
             .sum::<usize>();
+        drop(shadow_guard);
 
         let dense = self
             .materials
@@ -1163,7 +1206,9 @@ impl Renderer {
             materials[h.index() as usize] = m.gpu;
         }
 
-        let instances_addr = self.ring_push(device, slot, bytemuck::cast_slice(&instances))?;
+        let upload_guard =
+            StageGuard::new(tracing::debug_span!("renderer.upload"), &mut stages.upload);
+        let instances_addr = self.ring_push(device, slot, bytemuck::cast_slice(instances))?;
         let lights_addr = self.ring_push(device, slot, bytemuck::cast_slice(&lights))?;
         let materials_addr = self.ring_push(device, slot, bytemuck::cast_slice(&materials))?;
         let ranges_addr = self.ring_push(device, slot, bytemuck::cast_slice(&assignment.ranges))?;
@@ -1218,7 +1263,12 @@ impl Renderer {
             lights_addr,
             materials_addr,
         ];
+        drop(upload_guard);
 
+        let build_guard = StageGuard::new(
+            tracing::debug_span!("renderer.graph_build"),
+            &mut stages.graph_build,
+        );
         let mut b = GraphBuilder::<D>::new();
         let cascade_ids: [_; CASCADES] = std::array::from_fn(|i| {
             b.import(
@@ -1467,13 +1517,25 @@ impl Renderer {
             },
         );
         b.export(swapchain, final_state);
+        drop(build_guard);
+        let compile_guard = StageGuard::new(
+            tracing::debug_span!("renderer.compile"),
+            &mut stages.compile,
+        );
         let compiled = self.graph.compile(b)?;
+        drop(compile_guard);
         let compile_time = compiled.stats().compile_time;
+        let execute_guard = StageGuard::new(
+            tracing::debug_span!("renderer.execute"),
+            &mut stages.execute,
+        );
         let mut graph_stats = self.graph.execute(compiled, device, cmd, frame)?;
+        drop(execute_guard);
         graph_stats.compile_time = compile_time;
         if rebake {
             self.ibl.mark_baked(&scene.environment);
         }
+        self.prep = scratch;
         self.prev_view_proj = view_proj_unjit;
         self.frame_index = self.frame_index.wrapping_add(1);
         if taa {
@@ -1489,7 +1551,8 @@ impl Renderer {
             graph: graph_stats,
             culled,
             shadow_draws: shadow_draw_count as u32,
-            cluster_time,
+            stages,
+            gpu: self.gpu.clone(),
         };
         if self.last_log.elapsed().as_secs() >= 1 {
             self.last_log = Instant::now();

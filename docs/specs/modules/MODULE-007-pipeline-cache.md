@@ -21,7 +21,7 @@ M2:
 - `bind_pipeline` binds set 0 on first use per command buffer; `push_constants` (encoder) uses the layout's range.
 - Destroy pipelines through the deferred queue (`Doomed::Pipeline { pipeline }`; the layout is no longer per pipeline).
 
-M5 (not now): dedupe by descriptor hash, `VkPipelineCache` persistence with blob validation, compute pipelines, parallel compile.
+M5a (done): `VkPipelineCache` persistence with header validation (section 8a). M5 (not now): dedupe by descriptor hash, compute pipelines (M5b), parallel compile.
 
 ## 3. Non-responsibilities
 
@@ -31,10 +31,10 @@ M5 (not now): dedupe by descriptor hash, `VkPipelineCache` persistence with blob
 | Compiling GLSL/Slang | examples' `build.rs` in M2 (shaderc, ADR-0003); MODULE-008 later |
 | Per-material layouts, bind groups, push descriptors | rejected (ADR-0010) |
 | Hot reload | M6 |
-| Pipeline cache file path policy | M5 (open) |
+| Pipeline cache file path policy | decided in M5a (section 8a): `DeviceDesc::pipeline_cache`, else `ANVIL_PIPELINE_CACHE`, else `target/anvil-pipeline-cache.bin` |
 | `VK_EXT_graphics_pipeline_library` | out of scope (not in ADR-0004 baseline) |
 
-**Pipeline cache object in M2:** the M1 empty `VkPipelineCache` in `DeviceShared.pipeline_cache` stays as is and is passed to `create_graphics_pipelines`; nothing is loaded or saved. Making it a managed cache is not trivial (blob validation, atomic file write, path policy), so it is M5.
+**Pipeline cache object in M2:** the M1 empty `VkPipelineCache` in `DeviceShared.pipeline_cache` was passed to `create_graphics_pipelines`; nothing was loaded or saved. M5a makes it persistent (section 8a).
 
 ## 4. Dependencies
 
@@ -120,6 +120,17 @@ Encoder: first `bind_pipeline` in a command buffer also records `cmd_bind_descri
 
 Bindless writes (called by MODULE-006): lock `update`; one `WriteDescriptorSet` (`dst_set = set`, `dst_binding` 0/1, `dst_array_element = slot`, `descriptor_count 1`); `update_descriptor_sets`; update high-water.
 
+## 8a. Persistent pipeline cache (M5a, FR-VK-011, ADR-0013 §4)
+
+`DeviceShared.pipeline_cache` is the one `VkPipelineCache` every `create_graphics_pipelines` call uses (and every compute pipeline in M5b). Implementation: `crates/rhi-vulkan/src/pipeline_cache.rs`.
+
+- **Path:** `DeviceDesc::pipeline_cache` (`Option<PathBuf>`), else env `ANVIL_PIPELINE_CACHE`, else `target/anvil-pipeline-cache.bin` relative to the working directory.
+- **Load (device creation):** read the file; validate the `VkPipelineCacheHeaderVersionOne` header (32 bytes: header size, version 1, vendor ID, device ID, 16-byte `pipelineCacheUUID`) against the selected physical device. A missing file starts empty silently. A short, unreadable, corrupt or mismatched file (other GPU, other driver version) is ignored with a `warn!` naming the reason, and the cache starts empty. The blob is passed as `pInitialData`. Logs `info!` `pipeline cache loaded path bytes`.
+- **Save (device destruction, `DeviceShared::drop`):** `vkGetPipelineCacheData`, then write to `<path>.<pid>.<n>.tmp` and rename over the file, so concurrent processes or devices never leave a torn file. Nothing is written when the cache holds only the header (no pipeline was compiled). The directory is not created: a missing directory logs at `debug` and skips the save (tests running in a crate directory therefore never litter `crates/*/target`). Logs `info!` `pipeline cache saved path bytes`; failures are `warn!`, never errors.
+- **Trust:** the header check guards against another device or driver; it does not authenticate the blob. The Vulkan driver still validates its own data. shortcut: no content hash or size limit on the file, add a checksum if the file ever comes from an untrusted place.
+- **Tests:** unit `header_validation`, `save_then_load_and_corrupt` (pure, no GPU); GPU `pipeline_cache_saved_and_reloaded` (`tests/profiling.rs`: create device, compile a pipeline, drop, file exists; second device loads it; a corrupt file is ignored and replaced).
+- Effect: the second run of pbr-scene logs `pipeline cache loaded` (173 888 bytes on RADV). Whole-process start (1 frame) was 53-56 ms with and without it (one 28 ms outlier), because Mesa keeps its own on-disk shader cache; the application-level cache is for drivers without one and for the larger M5b pipeline set. Not part of the BENCH-001 frame metrics.
+
 ## 9. Threading model
 
 `bindings` is read-only after creation except the `update` mutex and atomics. `vkUpdateDescriptorSets` on the same set must be externally synchronized (hence `update`); `UPDATE_AFTER_BIND` permits updates while pending command buffers have the set bound, only for slots they do not dynamically use. Pipeline creation takes `&self` with the pool lock (M1). `VkPipelineCache` is internally synchronized by the driver (M2 does not set `EXTERNALLY_SYNCHRONIZED`; verify against the spec text).
@@ -182,7 +193,7 @@ Integration (`ANVIL_GPU_TESTS=1`, lavapipe, validation `On`, sync validation on,
 |---|---|
 | FR-RHI-007, FR-RHI-008 | graphics pipeline + the global layout (M2); compute M5 |
 | FR-RHI-009 | pipeline layout derived from the binding model (ADR-0010) |
-| FR-VK-011 | empty `VkPipelineCache` passed in M2; persistence M5 |
+| FR-VK-011 | empty `VkPipelineCache` passed in M2; persisted and validated in M5a (section 8a) |
 | FR-SHD-004 | reflection/layout compatibility with MODULE-008 (later) |
 | FR-SHD-005 | shared hashing with shader cache (M5) |
 | NFR-PERF-009 | compile-time measurement (M5) |

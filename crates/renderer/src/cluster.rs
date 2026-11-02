@@ -2,6 +2,7 @@
 //! slices; light bounding spheres are tested against each froxel's view-space AABB.
 
 use foundation::math::Vec3;
+use rayon::prelude::*;
 
 /// Froxels along x, y and z (depth slices).
 pub(crate) const GRID: (u32, u32, u32) = (16, 9, 24);
@@ -11,6 +12,9 @@ pub(crate) const CLUSTER_COUNT: usize = (GRID.0 * GRID.1 * GRID.2) as usize;
 pub(crate) const CLUSTER_FAR: f32 = 100.0;
 /// Stand-in for infinity as the outer edge of the last slice.
 const BEYOND: f32 = 1.0e5;
+
+/// Light count from which [`ClusterGrid::assign`] uses the worker pool.
+const PAR_LIGHTS: usize = 16;
 
 /// A light's bounding sphere in view space (camera looks down -Z).
 #[derive(Clone, Copy, Debug)]
@@ -90,37 +94,56 @@ impl ClusterGrid {
         (s.max(0.0) as u32).min(GRID.2 - 1)
     }
 
-    /// Assigns every light to the clusters its sphere touches.
-    pub fn assign(&self, lights: &[LightSphere]) -> Assignment {
-        let mut pairs: Vec<(u32, u32)> = Vec::new(); // (cluster, light)
-        for l in lights {
-            let d = -l.center.z;
-            if d + l.radius < self.near {
-                continue; // entirely in front of the near plane's far side: behind the camera
-            }
-            let (s0, s1) = if l.radius.is_finite() {
-                // Padded a little so a sphere touching a slice boundary still reaches the slice.
-                (
-                    self.slice_of((d - l.radius) * 0.999),
-                    self.slice_of((d + l.radius) * 1.001),
-                )
-            } else {
-                (0, GRID.2 - 1)
-            };
-            let r2 = l.radius * l.radius;
-            for slice in s0..=s1 {
-                for y in 0..GRID.1 {
-                    for x in 0..GRID.0 {
-                        let c = cluster_id(x, y, slice);
-                        let (lo, hi) = self.aabbs[c];
-                        let q = l.center.clamp(lo, hi);
-                        if q.distance_squared(l.center) <= r2 {
-                            pairs.push((c as u32, l.index));
-                        }
+    /// Calls `f` with every cluster (ascending slice, y, x) whose AABB the light's sphere touches.
+    fn for_each_cluster(&self, l: LightSphere, mut f: impl FnMut(usize)) {
+        let d = -l.center.z;
+        if d + l.radius < self.near {
+            return; // entirely in front of the near plane's far side: behind the camera
+        }
+        let (s0, s1) = if l.radius.is_finite() {
+            // Padded a little so a sphere touching a slice boundary still reaches the slice.
+            (
+                self.slice_of((d - l.radius) * 0.999),
+                self.slice_of((d + l.radius) * 1.001),
+            )
+        } else {
+            (0, GRID.2 - 1)
+        };
+        let r2 = l.radius * l.radius;
+        for slice in s0..=s1 {
+            for y in 0..GRID.1 {
+                for x in 0..GRID.0 {
+                    let c = cluster_id(x, y, slice);
+                    let (lo, hi) = self.aabbs[c];
+                    if l.center.clamp(lo, hi).distance_squared(l.center) <= r2 {
+                        f(c);
                     }
                 }
             }
         }
+    }
+
+    /// Assigns every light to the clusters its sphere touches.
+    pub fn assign(&self, lights: &[LightSphere]) -> Assignment {
+        // (cluster, light) pairs, lights in order; on the worker pool when there are enough
+        // lights (each one tests hundreds of froxels).
+        let pairs: Vec<(u32, u32)> = if lights.len() < PAR_LIGHTS {
+            let mut v = Vec::new();
+            for l in lights {
+                self.for_each_cluster(*l, |c| v.push((c as u32, l.index)));
+            }
+            v
+        } else {
+            // `fold` makes one vector per chunk of lights; the chunks come back in order.
+            lights
+                .par_iter()
+                .fold(Vec::new, |mut v, l| {
+                    self.for_each_cluster(*l, |c| v.push((c as u32, l.index)));
+                    v
+                })
+                .collect::<Vec<_>>()
+                .concat()
+        };
         let mut ranges = vec![[0u32; 2]; CLUSTER_COUNT];
         for &(c, _) in &pairs {
             ranges[c as usize][1] += 1;
@@ -268,6 +291,44 @@ mod tests {
                 let rim = base + dir * 10.0 * half.sin();
                 assert!(rim.distance(c) <= r + 1e-3, "rim, half {half}");
             }
+        }
+    }
+
+    #[test]
+    fn parallel_assignment_matches_serial() {
+        let g = ClusterGrid::new(0.1, TAN);
+        let r = |n: u32| (n.wrapping_mul(2_654_435_761) >> 8) as f32 / (1u32 << 24) as f32;
+        let mut lights: Vec<LightSphere> = (0..300)
+            .map(|i| {
+                sphere(
+                    Vec3::new(
+                        r(i * 3) * 40.0 - 20.0,
+                        r(i * 3 + 1) * 10.0 - 5.0,
+                        -r(i * 3 + 2) * 60.0 + 5.0,
+                    ),
+                    0.5 + r(i * 7) * 6.0,
+                    i,
+                )
+            })
+            .collect();
+        lights.push(sphere(Vec3::new(0.0, 0.0, -5.0), f32::INFINITY, 300));
+        let run = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| g.assign(&lights))
+        };
+        let (a, b) = (run(8), run(1));
+        assert_eq!((&a.ranges, &a.indices), (&b.ranges, &b.indices));
+        // Serial reference: per cluster, the lights touching it in light order.
+        let mut expect = vec![Vec::new(); CLUSTER_COUNT];
+        for l in &lights {
+            g.for_each_cluster(*l, |c| expect[c].push(l.index));
+        }
+        assert!(expect.iter().any(|e| e.len() > 1));
+        for (c, e) in expect.iter().enumerate() {
+            assert_eq!(lights_of(&a, c), &e[..], "cluster {c}");
         }
     }
 }

@@ -572,6 +572,21 @@ Unit: `depth_state_mapping`, `sampler_info_mapping` (compare), depth/shader barr
 
 The only RHI-side change of M4b: `rhi-vulkan` enables the Vulkan 1.3 feature `shaderDemoteToHelperInvocation` when creating the device. Fragment-shader `discard` (alpha-tested materials) compiles to `OpDemoteToHelperInvocation` for SPIR-V 1.6, and validation rejects the module without the feature. It is mandatory in Vulkan 1.3, so no capability check was added. No public RHI API changed: `Rg16Float`, multiple color attachments of different formats, depth compare ops and premultiplied blend factors were already expressible.
 
+## 20. M5a additions (ADR-0013 §2, §4)
+
+### 20.1 Timestamp queries
+- `Device::timestamp_info() -> Option<TimestampInfo { period_ns, valid_bits }>`: `None` when the graphics queue family reports `timestampValidBits == 0`, `timestampComputeAndGraphics` is false, or the period is zero. `period_ns` is `VkPhysicalDeviceLimits::timestampPeriod`.
+- `CommandEncoder::write_timestamp(index)`: writes the GPU timestamp (after all previous commands) into query `index` of the frame slot's pool. `index < MAX_TIMESTAMPS` (128); index 0 starts a frame's sequence, further indices ascend with no gaps. No-op without support. Out of range records an `InvalidDescriptor` error returned from `finish`.
+- `Device::read_timestamps(slot) -> Result<Vec<u64>>`: ticks (masked to `valid_bits`) of the last submitted frame that used frame slot `slot`, indices `0..n`. Valid after `begin_frame` returned that slot and before the new frame is submitted, i.e. `frames_in_flight` frames after the frames were recorded. Empty when none were written, the frame was never submitted or timestamps are unsupported. Convert with `delta_ticks * period_ns` (`TimestampInfo`); subtract with wrapping arithmetic when `valid_bits < 64`.
+- One query pool per frame slot (so a frame in flight never overwrites results being read); the encoder resets the whole pool at `begin_commands`. The render graph uses these (LAYER-006 section 8a); other users must not mix indices with a graph in the same frame.
+- Backend: LAYER-004 (Timestamps and pipeline cache, M5a). Tests: GPU `timestamps_round_trip`, graph `passes_barriers_and_pool_reuse_are_validation_clean`.
+
+### 20.2 Pipeline cache
+`DeviceDesc::pipeline_cache: Option<PathBuf>` selects the cache file (default: env `ANVIL_PIPELINE_CACHE`, else `target/anvil-pipeline-cache.bin`). The backend loads it at device creation and saves it at destruction; mismatches are ignored with a warning. See MODULE-007 section 8a.
+
+### 20.3 Still to come in M5b
+Compute pipelines and dispatch, storage images, mips/layers, `draw_indexed_indirect_count`, buffer barriers (ADR-0013 §4).
+
 ## Observability (ADR-0009)
 - `Device::diagnostics() -> DeviceDiagnostics` (plain data: `DeviceInfo`, frame / GPU-completed frame, `LiveObjects`, pending destroys, `SwapchainDiagnostics` per swapchain, `ValidationCounts`). Backends must keep it accurate; integration tests assert `validation.errors == 0`.
 - `RhiError::StaleHandle` carries `kind`, `index`, `generation`; `Backend` carries `op` and the raw code.

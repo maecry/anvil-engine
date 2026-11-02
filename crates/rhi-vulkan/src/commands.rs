@@ -482,6 +482,18 @@ impl CommandManager {
         unsafe { self.shared.raw.begin_command_buffer(sl.cb, &bi) }
             .map_err(|r| map_vk("vkBeginCommandBuffer", r))?;
         sl.open = true;
+        if let Some(ts) = &self.shared.timestamps {
+            // SAFETY: open command buffer outside rendering; the slot's last frame retired, and
+            // its results stay readable on the host until this reset executes at submit.
+            unsafe {
+                self.shared.raw.cmd_reset_query_pool(
+                    sl.cb,
+                    ts.pools[t.slot as usize],
+                    0,
+                    rhi::MAX_TIMESTAMPS,
+                );
+            }
+        }
         Ok(VulkanCommands {
             shared: self.shared.clone(),
             cb: sl.cb,
@@ -1133,6 +1145,36 @@ impl CommandEncoder for VulkanCommands {
         };
         if host_read {
             self.host_read_barrier();
+        }
+    }
+
+    fn write_timestamp(&mut self, index: u32) {
+        let Some(ts) = &self.shared.timestamps else {
+            return;
+        };
+        if self.st.failed() {
+            return;
+        }
+        if index >= rhi::MAX_TIMESTAMPS {
+            self.st
+                .record(invalid(format!("timestamp index {index} out of range")));
+            return;
+        }
+        // SAFETY: open command buffer; the pool belongs to this slot and was reset at
+        // `begin_commands`; each index is written once per frame.
+        unsafe {
+            self.shared.raw.cmd_write_timestamp2(
+                self.cb,
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                ts.pools[self.slot],
+                index,
+            );
+        }
+        // Index 0 starts a new frame's count; until then the slot still holds the last frame's.
+        if index == 0 {
+            ts.written[self.slot].store(1, Ordering::Release);
+        } else {
+            ts.written[self.slot].fetch_max(index + 1, Ordering::AcqRel);
         }
     }
 

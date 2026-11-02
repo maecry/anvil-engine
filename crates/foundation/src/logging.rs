@@ -43,12 +43,32 @@ fn parse_file(raw: Option<&str>) -> Option<&str> {
     raw.filter(|p| !p.is_empty())
 }
 
+/// Sets `s` as the global subscriber, adding the Tracy layer with feature `profile-tracy`.
+/// False if one was already installed.
+fn install<S>(s: S) -> bool
+where
+    S: tracing::Subscriber
+        + for<'a> tracing_subscriber::registry::LookupSpan<'a>
+        + Send
+        + Sync
+        + 'static,
+{
+    #[cfg(feature = "profile-tracy")]
+    let s = {
+        use tracing_subscriber::layer::SubscriberExt;
+        s.with(tracing_tracy::TracyLayer::default())
+    };
+    tracing::subscriber::set_global_default(s).is_ok()
+}
+
 /// Installs the global `tracing` subscriber.
 ///
 /// Environment (ADR-0009 §1):
 /// - `ANVIL_LOG`: filter directives (default: engine crates at `debug` in debug builds, else `info`).
 /// - `ANVIL_LOG_FORMAT`: `pretty` (default) or `json` (one JSON event per line, with span list).
 /// - `ANVIL_LOG_FILE`: path to create/truncate and log to, instead of stderr.
+///
+/// With cargo feature `profile-tracy` spans are also streamed to Tracy (ADR-0013 §2).
 ///
 /// Idempotent: if a global subscriber already exists this is a no-op returning `Ok`.
 ///
@@ -82,14 +102,15 @@ pub fn init_logging() -> Result<(), CoreError> {
         .with_writer(writer);
     // Err means a subscriber is already installed, which is fine.
     let installed = match format {
-        Format::Pretty => b.try_init(),
-        Format::Json => b
-            .json()
-            .with_current_span(true)
-            .with_span_list(true)
-            .try_init(),
+        Format::Pretty => install(b.finish()),
+        Format::Json => install(
+            b.json()
+                .with_current_span(true)
+                .with_span_list(true)
+                .finish(),
+        ),
     };
-    if installed.is_ok() {
+    if installed {
         tracing::info!(
             filter = %filter_str,
             format = format.as_str(),

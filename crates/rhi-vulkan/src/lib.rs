@@ -16,9 +16,11 @@ mod destroy;
 mod device;
 mod error;
 mod instance;
+mod pipeline_cache;
 mod registry;
 mod swapchain;
 mod texture;
+mod timestamps;
 mod upload;
 
 #[cfg(test)]

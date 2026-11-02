@@ -1,0 +1,24 @@
+[package]
+name = "many-draws"
+description = "M5 benchmark workload: about 50 000 instances of 3 procedural meshes in a large field, with a deterministic camera fly path."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+# Streams tracing spans to Tracy (ADR-0013 §2).
+profile-tracy = ["foundation/profile-tracy"]
+
+[dependencies]
+foundation = { path = "../../crates/foundation", features = ["log-init"] }
+platform = { path = "../../crates/platform" }
+rhi = { path = "../../crates/rhi" }
+rhi-vulkan = { path = "../../crates/rhi-vulkan" }
+renderer = { path = "../../crates/renderer" }
+tracing.workspace = true
+anyhow = "1"
+# Only for ANVIL_SCREENSHOT.
+png = "0.18"

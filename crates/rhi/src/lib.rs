@@ -446,6 +446,9 @@ pub struct DeviceDesc {
     pub preferred_gpu: Option<String>,
     /// Frames in flight, valid 1..=3.
     pub frames_in_flight: u32,
+    /// Pipeline cache file, loaded at creation and saved at destruction. `None`: env
+    /// `ANVIL_PIPELINE_CACHE`, else `target/anvil-pipeline-cache.bin`.
+    pub pipeline_cache: Option<std::path::PathBuf>,
 }
 
 impl Default for DeviceDesc {
@@ -453,6 +456,7 @@ impl Default for DeviceDesc {
         Self {
             preferred_gpu: None,
             frames_in_flight: DEFAULT_FRAMES_IN_FLIGHT,
+            pipeline_cache: None,
         }
     }
 }
@@ -486,6 +490,19 @@ pub struct DeviceInfo {
     /// Driver description.
     pub driver: String,
 }
+
+/// Timestamp query capability of the graphics queue (ADR-0013 §2).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TimestampInfo {
+    /// Nanoseconds per timestamp tick (`timestampPeriod`).
+    pub period_ns: f32,
+    /// Number of meaningful low bits of a timestamp (`timestampValidBits`).
+    pub valid_bits: u32,
+}
+
+/// Timestamp queries available per frame slot; [`CommandEncoder::write_timestamp`] indices
+/// are below this.
+pub const MAX_TIMESTAMPS: u32 = 128;
 
 /// Parameters for [`Device::create_swapchain`].
 #[derive(Clone, Copy, Debug)]
@@ -917,6 +934,15 @@ pub trait Device: Sized + Send {
     fn info(&self) -> &DeviceInfo;
     /// Snapshot of device state (ADR-0009). Cheap enough to call every frame.
     fn diagnostics(&self) -> DeviceDiagnostics;
+    /// Timestamp support, or `None` when the queue cannot write timestamps.
+    fn timestamp_info(&self) -> Option<TimestampInfo>;
+    /// Timestamps (ticks, masked to the valid bits) written by the last submitted frame that
+    /// used frame slot `slot`, in index order. Call after [`Device::begin_frame`] returned that
+    /// slot (its previous work is then complete) and before submitting the new frame. Empty if none were written or unsupported.
+    ///
+    /// # Errors
+    /// [`RhiError`] if the query readback fails.
+    fn read_timestamps(&self, slot: u32) -> Result<Vec<u64>, RhiError>;
 
     /// Creates a swapchain for `surface`. Each swapchain keeps its surface alive.
     fn create_swapchain(
@@ -1060,6 +1086,11 @@ pub trait CommandEncoder {
     /// Copies a whole texture (mip 0) into a buffer (outside rendering). The texture must be
     /// in [`TextureState::TransferSrc`].
     fn copy_texture_to_buffer(&mut self, t: TextureHandle, dst: BufferHandle, dst_offset: u64);
+    /// Writes the GPU timestamp (after all previous commands) into query `index` of this
+    /// frame's pool (`index < MAX_TIMESTAMPS`); a no-op without timestamp support. Read back
+    /// with [`Device::read_timestamps`] once the frame slot has retired. Index 0 must be written first,
+    /// then increasing indices with no gaps.
+    fn write_timestamp(&mut self, index: u32);
     /// Opens a debug label (no-op if unsupported).
     fn begin_label(&mut self, name: &str, color: [f32; 4]);
     /// Closes the innermost debug label.
@@ -1223,6 +1254,12 @@ mod tests {
         fn info(&self) -> &DeviceInfo {
             &self.0
         }
+        fn timestamp_info(&self) -> Option<TimestampInfo> {
+            None
+        }
+        fn read_timestamps(&self, _: u32) -> Result<Vec<u64>, RhiError> {
+            Ok(Vec::new())
+        }
         fn diagnostics(&self) -> DeviceDiagnostics {
             DeviceDiagnostics {
                 info: self.0.clone(),
@@ -1347,6 +1384,7 @@ mod tests {
         ) {
         }
         fn copy_texture_to_buffer(&mut self, _: TextureHandle, _: BufferHandle, _: u64) {}
+        fn write_timestamp(&mut self, _: u32) {}
         fn begin_label(&mut self, _: &str, _: [f32; 4]) {}
         fn end_label(&mut self) {}
         fn finish(self) -> Result<u32, RhiError> {

@@ -122,6 +122,8 @@ Notes:
 
 ## 10. Threading model
 
+`WindowConfig::with_env_size()` applies `ANVIL_WINDOW=WxH` (logical pixels) to the initial window size; benchmarks use it with `resizable = false` so tiling compositors keep 1920x1080 (ADR-0013 §1).
+
 Event loop and all callbacks run on the main thread (platform requirement; macOS mandates it). M1 renders on the same thread inside `on_frame`. A dedicated render thread is a later decision (Open question 2); it would require the swapchain-owning thread to receive resize events through a channel.
 
 ## 11. Error handling

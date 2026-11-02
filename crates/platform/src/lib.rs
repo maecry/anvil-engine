@@ -55,6 +55,27 @@ impl Default for WindowConfig {
     }
 }
 
+impl WindowConfig {
+    /// Applies env `ANVIL_WINDOW=WxH` (e.g. `1920x1080`) to the initial size; anything
+    /// unparsable is ignored with a warning.
+    pub fn with_env_size(mut self) -> Self {
+        let Ok(v) = std::env::var("ANVIL_WINDOW") else {
+            return self;
+        };
+        match parse_size(&v) {
+            Some((w, h)) => (self.width, self.height) = (w, h),
+            None => tracing::warn!(value = %v, "ANVIL_WINDOW must look like 1920x1080, ignored"),
+        }
+        self
+    }
+}
+
+fn parse_size(v: &str) -> Option<(u32, u32)> {
+    let (w, h) = v.split_once(['x', 'X'])?;
+    let (w, h) = (w.parse().ok()?, h.parse().ok()?);
+    (w > 0 && h > 0).then_some((w, h))
+}
+
 /// What the application wants the loop to do after an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
@@ -491,6 +512,13 @@ mod tests {
 
     fn _assert_bounds<T: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static>() {}
     const _: fn() = _assert_bounds::<Window>;
+
+    #[test]
+    fn window_size_parsing() {
+        assert_eq!(parse_size("1920x1080"), Some((1920, 1080)));
+        assert_eq!(parse_size("0x5"), None);
+        assert_eq!(parse_size("big"), None);
+    }
 
     #[test]
     fn config_defaults() {

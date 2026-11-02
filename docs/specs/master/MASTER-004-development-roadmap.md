@@ -58,7 +58,7 @@ Specs and modules above are the plan; this document does not create them. Spec o
 Month 1 acceptance (§20) = M1 exit plus: builds, runs on Linux, window, swapchain, triangle, validation enabled, logs accessible, docs match implementation.
 
 ## 5. Benchmark baseline (to define before any target)
-MASTER-000 §4.3 and §22 p3 forbid performance targets before this section is completed in a benchmark spec (docs/benchmarks/). All items below are currently undefined.
+MASTER-000 §4.3 and §22 p3 forbid performance targets before this section is completed in a benchmark spec (docs/benchmarks/). **Every item below is defined in [`docs/benchmarks/BENCH-001-baseline.md`](../../benchmarks/BENCH-001-baseline.md)** (M5a, 2026-11-02), which also records the M4 baseline and the first before/after. The Notes column is the original question; BENCH-001 sections 1-9 answer it (hardware 1, Vulkan environment 2, build 3, workloads 4, resolution and present mode 5, protocol 6, metrics 7, variance 8, storage and comparison 9). Items still open: the CI runner, the asset-load and streaming workloads, CPU memory, pipeline-switch count, shader compile and asset-load timing.
 | Item to define | Notes |
 |---|---|
 | Reference hardware | GPU model(s), driver version, CPU, RAM, OS/kernel; at least one dedicated CI runner (§17 item 7). |
@@ -70,7 +70,7 @@ MASTER-000 §4.3 and §22 p3 forbid performance targets before this section is c
 | Metrics | The 11 items of §4.3 (NFR-PERF-001..011). |
 | Storage and comparison | Where baselines live, regression threshold method (threshold TBD). |
 | Variance control | Clocks, thermal state, background load. |
-Target: TBD after benchmark hardware/workload is defined.
+Target: still none. The hardware and workloads are now defined and a baseline exists (BENCH-001 section 10); a target needs the remaining workloads and a second machine, and is set by a later benchmark revision, not by M5a.
 
 ## 6. Change control
 Roadmap changes follow MASTER-000 §13.5. Milestone exit requires: exit criteria met, tests for the milestone's deliverables (NFR-TEST-007), specs matching code, and ADRs recorded.
@@ -120,3 +120,14 @@ RHI changes: only the Vulkan 1.3 feature `shaderDemoteToHelperInvocation` is ena
 Shortcuts / deferred (all documented in LAYER-005, LAYER-006, MODULE-009 and as `shortcut:` in the code): point-light shadows (need cube/layered textures, M5); no transient memory aliasing (pool and lifetime reuse only, M5); buffers are not tracked by the graph (M5 with compute); CPU light assignment and frustum culling only, no GPU culling (M5); one graphics queue, no async compute (M5); blended objects do not cast shadows and are sorted per object; TAA uses bilinear history sampling, no depth rejection for moving objects and no material mip bias or sharpening; SSAO noise is only blurred, not temporally filtered beyond TAA; bloom strength is a constant (0.025); fixed 8 MiB upload ring and 100 m cluster far plane; BRDF LUT still baked on the first render.
 
 Open: golden-image test (NFR-TEST-003) not automated (screenshots are inspected by hand and pixel-diffed ad hoc); renderer not built against a mock backend; runtime window resize with TAA only exercised by the history-reset code path (the toggle test), not by a scripted resize; GPU frame cost not measured (CPU wall time ~0.7 ms per frame on RADV, vsync off).
+
+### M5a Baseline, Profiling, Threads, Pipeline Cache (2026-11-02)
+| Deliverable | Status | Evidence |
+|---|---|---|
+| Benchmark baseline (§5, ADR-0013 §1) | Done | `docs/benchmarks/BENCH-001-baseline.md`; `ANVIL_BENCH=path.json` in `pbr-scene` and the new `many-draws` (about 50 000 instances); results `docs/benchmarks/results/2026-11-02-*-{baseline,m5a}.json`, 3 runs each (`docs/benchmarks/run.sh`) |
+| Profiling (ADR-0013 §2) | Done | RHI timestamp queries (LAYER-003 §20), per-pass GPU times in `RendererStats::gpu` and the bench JSON, CPU stage spans `renderer.*`, optional `profile-tracy` feature |
+| Threads (ADR-0013 §3) | Done | `rayon` pool in `foundation` (`ANVIL_THREADS`); parallel packing, culling, sorting, shadow lists and cluster assignment, identical to the serial path (3 unit tests); many-draws CPU frame 9.27 to 7.18 ms (-22.5 %), pbr-scene-deferred-stress 0.381 to 0.311 ms (-18.5 %) |
+| Pipeline cache (FR-VK-011) | Done | persisted `VkPipelineCache` with header validation (MODULE-007 §8a); GPU test saves and reloads |
+| No validation errors | Done | the 4 examples, 120 frames, debug build, sync validation: 0 errors / 0 warnings |
+
+Shortcuts: one fixed parallel threshold (`PAR_MIN` 2048 instances, `PAR_LIGHTS` 16); command recording and the ring upload still single-threaded; only 126 passes per graph are timed; per-instance upload ring still fixed (now 16 MiB); the pipeline cache file has no checksum. Open: default thread count (20) is not the best on the reference CPU (4-8 is); CPU memory, pipeline switches and frame-pacing worst case are not measured.

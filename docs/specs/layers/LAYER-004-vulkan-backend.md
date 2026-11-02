@@ -184,6 +184,10 @@ Mapping table (`error.rs`):
 - `info!` at startup: instance version, layers enabled, chosen GPU, driver, queue family, swapchain format/mode/count.
 - Counters (frame number, pending deferred items) available for `MemorySnapshot` later.
 
+### M5a: timestamps and pipeline cache (ADR-0013)
+- `timestamps.rs`: at device creation `VkQueryPool`s of type `TIMESTAMP` (128 queries) are created per frame slot when `timestampValidBits > 0` of the chosen queue family, `timestampComputeAndGraphics` is true and `timestampPeriod > 0`; otherwise `timestamp_info()` is `None` and everything is a no-op (`info!` logs which). `begin_commands` records `vkCmdResetQueryPool` for the slot's pool; `write_timestamp` records `vkCmdWriteTimestamp2` at `ALL_COMMANDS` (each timestamp therefore waits for all earlier work, which slightly serializes passes that would otherwise overlap) and tracks the highest index written per slot; `read_timestamps` calls `vkGetQueryPoolResults` (64-bit, no wait; `NOT_READY` means the frame was never submitted and yields an empty result) and masks to the valid bits. Pools are destroyed with the device.
+- `pipeline_cache.rs`: persistent `VkPipelineCache` (MODULE-007 section 8a): loaded and validated against vendor ID, device ID and `pipelineCacheUUID` at creation, saved atomically in `DeviceShared::drop`.
+
 ## 13. Testing strategy
 
 | Level | What | Where |

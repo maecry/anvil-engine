@@ -48,6 +48,18 @@ pub struct GraphStats {
     pub pool_size: u32,
 }
 
+/// Per-pass GPU times of one frame, from timestamps (ADR-0013 §2). A pass's time includes the
+/// barriers planned before it; the frame total ends after the last export barrier.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GpuTimings {
+    /// Frame counter of the measured frame.
+    pub frame: u64,
+    /// Live passes in execution order with their GPU milliseconds.
+    pub passes: Vec<(Cow<'static, str>, f64)>,
+    /// First to last timestamp, in milliseconds.
+    pub total_ms: f64,
+}
+
 /// Body of a pass: binds and draws. Errors are attributed to the pass.
 type Body<'a, D> = Box<dyn FnOnce(&mut PassContext<'_, D>) -> Result<(), RhiError> + 'a>;
 
@@ -158,6 +170,8 @@ impl<D: Device> CompiledGraph<'_, D> {
 pub struct RenderGraph {
     states: HashMap<TextureHandle, TextureState>,
     pool: TransientPool,
+    /// Per frame slot: the frame number and pass names its timestamps belong to.
+    timed: Vec<Option<(u64, Vec<Cow<'static, str>>)>>,
 }
 
 /// Writes the first compiled graph to `ANVIL_GRAPH_DUMP` (`.json`, otherwise DOT).
@@ -186,6 +200,7 @@ impl RenderGraph {
         Self {
             states: HashMap::new(),
             pool: TransientPool::new(frames_in_flight),
+            timed: vec![None; frames_in_flight as usize],
         }
     }
 
@@ -297,6 +312,11 @@ impl RenderGraph {
             })
             .collect();
 
+        let timed = device.timestamp_info().is_some();
+        let mut names = Vec::new();
+        if timed {
+            cmd.write_timestamp(0);
+        }
         let mut next_barrier = 0;
         let mut emit = |cmd: &mut D::Commands, pool: &TransientPool, upto: usize| {
             while let Some(b) = plan.barriers.get(next_barrier).filter(|b| b.before <= upto) {
@@ -367,8 +387,19 @@ impl RenderGraph {
                 cmd.end_rendering();
             }
             cmd.end_label();
+            // shortcut: passes past the query pool size (MAX_TIMESTAMPS) are not timed, raise
+            // the pool when a graph needs more than 127 live passes.
+            if timed && k + 1 < rhi::MAX_TIMESTAMPS as usize - 1 {
+                cmd.write_timestamp(k as u32 + 1);
+                names.push(pass.name.clone());
+            }
         }
         emit(cmd, &self.pool, usize::MAX);
+        if timed {
+            cmd.write_timestamp(names.len() as u32 + 1);
+            names.push(Cow::Borrowed("export barriers"));
+            self.timed[frame.slot as usize] = Some((frame.frame, names));
+        }
 
         for (s, &e) in slot_entry.iter().enumerate() {
             self.pool.entries[e].state = plan.slot_final[s];
@@ -389,6 +420,39 @@ impl RenderGraph {
         self.pool.evict(frame.frame, |t| device.destroy_texture(t));
         stats.pool_size = self.pool.entries.len() as u32;
         Ok(stats)
+    }
+
+    /// GPU times of the last frame executed in frame slot `slot`. Call after
+    /// [`Device::begin_frame`] returned that slot, before submitting the new frame; the result is
+    /// `frames_in_flight` frames old. `None` without timestamp support or before the slot's
+    /// first frame.
+    ///
+    /// # Errors
+    /// [`RhiError`] from the query readback.
+    pub fn gpu_timings<D: Device>(
+        &self,
+        device: &D,
+        slot: u32,
+    ) -> Result<Option<GpuTimings>, RhiError> {
+        let (Some(info), Some(Some((frame, names)))) =
+            (device.timestamp_info(), self.timed.get(slot as usize))
+        else {
+            return Ok(None);
+        };
+        let ticks = device.read_timestamps(slot)?;
+        if ticks.len() != names.len() + 1 {
+            return Ok(None);
+        }
+        let ms = |a: u64, b: u64| b.wrapping_sub(a) as f64 * f64::from(info.period_ns) * 1e-6;
+        Ok(Some(GpuTimings {
+            frame: *frame,
+            passes: names
+                .iter()
+                .zip(ticks.windows(2))
+                .map(|(n, w)| (n.clone(), ms(w[0], w[1])))
+                .collect(),
+            total_ms: ms(ticks[0], ticks[ticks.len() - 1]),
+        }))
     }
 
     /// Destroys the pooled textures. Imported textures belong to the caller.

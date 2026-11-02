@@ -45,6 +45,17 @@ fn passes_barriers_and_pool_reuse_are_validation_clean() {
     let mut created = Vec::new();
     for i in 0..8u32 {
         let frame = dev.begin_frame().unwrap();
+        // The slot's previous frame retired: its per-pass GPU times are readable (ADR-0013 §2).
+        if dev.timestamp_info().is_some() && i >= fif {
+            let t = graph
+                .gpu_timings(&dev, frame.slot)
+                .unwrap()
+                .expect("timings");
+            let names: Vec<_> = t.passes.iter().map(|(n, _)| n.as_ref()).collect();
+            assert_eq!(names, ["a", "b", "c", "export barriers"]);
+            assert!(t.passes.iter().all(|(_, ms)| *ms >= 0.0) && t.total_ms >= 0.0);
+            assert_eq!(t.frame, frame.frame - u64::from(fif));
+        }
         let mut cmd = dev.begin_commands(&frame).unwrap();
         let mut b = GraphBuilder::<rhi_vulkan::VulkanDevice>::new();
         let hist = b.import("history", history, (32, 32), None);

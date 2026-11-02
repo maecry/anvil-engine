@@ -12,6 +12,9 @@
 //! `ANVIL_DEBUG_VIEW=clusters|cascades|ssao`, `ANVIL_SSAO=0|1`, `ANVIL_TAA=0|1`,
 //! `ANVIL_BLOOM=0|1` (default 1), `ANVIL_TOGGLE_POST=n` (cycle all combinations every n frames) select the initial state headlessly; `ANVIL_CAMERA_ORBIT=1`
 //! slowly orbits the camera (a function of the frame number, to inspect TAA in motion).
+//! `ANVIL_BENCH=path.json` runs the benchmark protocol (ADR-0013 §1): the camera orbits, vsync
+//! is off, the window defaults to 1920x1080 (`ANVIL_WINDOW=WxH`), `ANVIL_BENCH_WARMUP` (120) plus
+//! `ANVIL_BENCH_FRAMES` (1000) frames are rendered, results go to the JSON file.
 //! See ADR-0009 §7, ADR-0011 §11 and ADR-0012 §11.
 
 use std::sync::Arc;
@@ -23,7 +26,7 @@ use foundation::math::{Mat4, Quat, Vec3};
 use platform::{App, AppError, Control, Event, KeyCode, MouseButton, Window, WindowConfig};
 use renderer::{
     AlphaMode, Camera, DebugView, Environment, Light, MaterialDesc, MeshInstance, PostSettings,
-    RenderPath, RenderScene, Renderer, mesh,
+    RenderPath, RenderScene, Renderer, bench::Bench, mesh,
 };
 use rhi::{
     Acquire, Backend, BufferDesc, BufferUsage, CommandEncoder, Device, DeviceDesc,
@@ -149,6 +152,7 @@ struct PbrScene {
     orbit: bool,
     /// `ANVIL_TOGGLE_POST=n`: step through all 8 SSAO/TAA/bloom combinations every n frames.
     toggle_post: Option<u64>,
+    bench: Option<Bench>,
     last: Instant,
     rendered: u64,
     exit_after: Option<u64>,
@@ -172,7 +176,9 @@ impl PbrScene {
             &SwapchainDesc {
                 width: w.max(1),
                 height: h.max(1),
-                vsync: std::env::var("ANVIL_VSYNC").as_deref() != Ok("0"),
+                // Benchmarks never wait for vblank.
+                vsync: std::env::var("ANVIL_VSYNC").as_deref() != Ok("0")
+                    && std::env::var_os("ANVIL_BENCH").is_none(),
                 preferred_format: rhi::Format::Bgra8Srgb,
             },
         )?;
@@ -348,6 +354,7 @@ impl PbrScene {
         if window.is_minimized() || self.gfx.is_none() {
             return Ok(false);
         }
+        let started = Instant::now();
         self.update();
         let last_frame = self.exit_after.is_some_and(|n| self.rendered + 1 >= n);
         let screenshot = self.screenshot.clone().filter(|_| last_frame);
@@ -363,8 +370,12 @@ impl PbrScene {
             return Ok(false);
         };
         let _span = tracing::info_span!("app_frame", frame = self.rendered).entered();
+        let wait = Instant::now();
         let frame = g.device.begin_frame()?;
-        let image = match g.device.acquire(g.swapchain)? {
+        let acquired = g.device.acquire(g.swapchain)?;
+        // Time blocked on the GPU is not CPU work; the bench reports CPU time without it.
+        let blocked = wait.elapsed();
+        let image = match acquired {
             Acquire::Image(i) => i,
             Acquire::OutOfDate => {
                 let (w, h) = window.inner_size();
@@ -436,6 +447,15 @@ impl PbrScene {
         let (extent, format) = (image.extent, image.format);
         g.device.submit(finished, &image)?;
         let status = g.device.present(g.swapchain, image)?;
+        if let Some(b) = self.bench.as_mut() {
+            b.record(
+                self.rendered,
+                started.elapsed().saturating_sub(blocked),
+                &g.renderer.stats(),
+                &g.device.diagnostics(),
+                extent,
+            );
+        }
         if let (Some(path), Some(rb)) = (screenshot, readback) {
             g.device.wait_idle()?;
             let mut pixels = vec![0u8; extent.0 as usize * extent.1 as usize * 4];
@@ -498,7 +518,13 @@ fn write_png(
 
 impl App for PbrScene {
     fn on_start(&mut self, window: &Window) -> Result<(), AppError> {
-        self.gfx = Some(Self::init(window)?);
+        let g = Self::init(window)?;
+        self.bench = Bench::from_env("pbr-scene", g.device.info());
+        if let Some(b) = &self.bench {
+            self.exit_after = Some(b.total_frames());
+            self.orbit = true;
+        }
+        self.gfx = Some(g);
         Ok(())
     }
 
@@ -625,11 +651,17 @@ fn main() -> anyhow::Result<()> {
     if screenshot.is_some() && exit_after.is_none() {
         tracing::warn!("ANVIL_SCREENSHOT needs ANVIL_EXIT_AFTER_FRAMES, ignoring");
     }
+    let mut window = WindowConfig {
+        title: "Anvil PBR scene".into(),
+        ..WindowConfig::default()
+    };
+    if std::env::var_os("ANVIL_BENCH").is_some() {
+        (window.width, window.height) = (1920, 1080);
+        // A fixed-size window keeps tiling compositors from resizing it.
+        window.resizable = false;
+    }
     platform::run(
-        WindowConfig {
-            title: "Anvil PBR scene".into(),
-            ..WindowConfig::default()
-        },
+        window.with_env_size(),
         PbrScene {
             gfx: None,
             camera: FlyCamera {
@@ -661,6 +693,7 @@ fn main() -> anyhow::Result<()> {
                 Ok("ssao") => DebugView::Ssao,
                 _ => DebugView::None,
             },
+            bench: None,
             last: Instant::now(),
             rendered: 0,
             exit_after,

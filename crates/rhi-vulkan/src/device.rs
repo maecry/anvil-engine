@@ -22,9 +22,11 @@ use crate::commands::{CommandManager, VkPipeline, VkShaderModule, VulkanCommands
 use crate::destroy::{DeferredQueue, Doomed, drain_all};
 use crate::error::{invalid, map_vk};
 use crate::instance::InstanceShared;
+use crate::pipeline_cache::{self, CacheIdentity};
 use crate::registry::Registry;
 use crate::swapchain::{self, VkSwapchain, VulkanSurface};
 use crate::texture::{self, VkSampler, VkTexture};
+use crate::timestamps::Timestamps;
 use crate::upload::PendingUpload;
 use crate::{lock, read, write};
 
@@ -318,6 +320,10 @@ pub(crate) struct DeviceShared {
     pub info: DeviceInfo,
     pub pools: Pools,
     pub pipeline_cache: vk::PipelineCache,
+    /// Where the pipeline cache is saved on drop, with the identity its header must carry.
+    pub cache_file: (std::path::PathBuf, CacheIdentity),
+    /// Timestamp query pools; `None` when the queue cannot write timestamps.
+    pub timestamps: Option<Timestamps>,
     pub sync: SyncShared,
     pub bindings: GlobalBindings,
     pub limits: DeviceLimits,
@@ -394,6 +400,15 @@ impl DeviceShared {
         }
     }
 
+    /// Writes the pipeline cache blob to its file (warns on failure).
+    fn save_pipeline_cache(&self) {
+        // SAFETY: the cache is alive and externally unused (device idle, being destroyed).
+        match unsafe { self.raw.get_pipeline_cache_data(self.pipeline_cache) } {
+            Ok(data) => pipeline_cache::save(&self.cache_file.0, &data),
+            Err(r) => tracing::warn!(result = ?r, "pipeline cache data unavailable"),
+        }
+    }
+
     pub(crate) fn wait_idle(&self) -> Result<(), RhiError> {
         let q = lock(&self.queue);
         // SAFETY: queue mutex held (vkDeviceWaitIdle needs all queues externally synchronized).
@@ -415,7 +430,11 @@ impl Drop for DeviceShared {
         // the device.
         unsafe {
             self.bindings.destroy(&self.raw);
+            if let Some(t) = &self.timestamps {
+                t.destroy(&self.raw);
+            }
             self.raw.destroy_semaphore(self.sync.timeline, None);
+            self.save_pipeline_cache();
             self.raw.destroy_pipeline_cache(self.pipeline_cache, None);
             self.raw.destroy_device(None);
         }
@@ -645,19 +664,50 @@ pub(crate) fn create_device_with(
         }
     };
     // SAFETY: as above.
-    let cache =
-        match unsafe { raw.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) } {
-            Ok(c) => c,
-            Err(r) => {
-                // SAFETY: only the timeline and bindings exist besides the device.
-                unsafe {
-                    bindings.destroy(&raw);
-                    raw.destroy_semaphore(timeline, None);
-                    raw.destroy_device(None);
-                }
-                return Err(map_vk("vkCreatePipelineCache", r));
+    let props = unsafe { inst.raw.get_physical_device_properties(pd) };
+    let cache_id = CacheIdentity {
+        vendor_id: props.vendor_id,
+        device_id: props.device_id,
+        uuid: props.pipeline_cache_uuid,
+    };
+    let cache_path = pipeline_cache::resolve_path(desc.pipeline_cache.as_deref());
+    let cache_data = pipeline_cache::load(&cache_path, &cache_id).unwrap_or_default();
+    let cache_ci = vk::PipelineCacheCreateInfo::default().initial_data(&cache_data);
+    // SAFETY: as above; `cache_data` outlives the call.
+    let cache = match unsafe { raw.create_pipeline_cache(&cache_ci, None) } {
+        Ok(c) => c,
+        Err(r) => {
+            // SAFETY: only the timeline and bindings exist besides the device.
+            unsafe {
+                bindings.destroy(&raw);
+                raw.destroy_semaphore(timeline, None);
+                raw.destroy_device(None);
             }
-        };
+            return Err(map_vk("vkCreatePipelineCache", r));
+        }
+    };
+    // SAFETY: as above.
+    let qprops = unsafe { inst.raw.get_physical_device_queue_family_properties(pd) };
+    let valid_bits = qprops[sel.queue_family as usize].timestamp_valid_bits;
+    let timestamps = match Timestamps::new(
+        &raw,
+        desc.frames_in_flight,
+        props.limits.timestamp_period,
+        valid_bits,
+        props.limits.timestamp_compute_and_graphics == vk::TRUE,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            // SAFETY: only the cache, timeline and bindings exist besides the device.
+            unsafe {
+                raw.destroy_pipeline_cache(cache, None);
+                bindings.destroy(&raw);
+                raw.destroy_semaphore(timeline, None);
+                raw.destroy_device(None);
+            }
+            return Err(e);
+        }
+    };
     // SAFETY: family/index 0 were requested in `queue_ci`.
     let queue = unsafe { raw.get_device_queue(sel.queue_family, 0) };
     let shared = Arc::new(DeviceShared {
@@ -681,6 +731,8 @@ pub(crate) fn create_device_with(
             samplers: Mutex::new(Registry::new(|| SamplerTag)),
         },
         pipeline_cache: cache,
+        cache_file: (cache_path, cache_id),
+        timestamps,
         bindings,
         limits: DeviceLimits {
             max_image_dimension_2d: f.max_image_dimension_2d,
@@ -969,6 +1021,17 @@ impl rhi::Device for VulkanDevice {
 
     fn destroy_pipeline(&self, h: PipelineHandle) {
         crate::commands::destroy_pipeline(&self.shared, h);
+    }
+
+    fn timestamp_info(&self) -> Option<rhi::TimestampInfo> {
+        self.shared.timestamps.as_ref().map(|t| t.info)
+    }
+
+    fn read_timestamps(&self, slot: u32) -> Result<Vec<u64>, RhiError> {
+        match &self.shared.timestamps {
+            Some(t) => t.read(&self.shared.raw, slot),
+            None => Ok(Vec::new()),
+        }
     }
 
     fn begin_frame(&mut self) -> Result<FrameToken, RhiError> {

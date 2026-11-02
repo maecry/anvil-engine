@@ -106,6 +106,8 @@ Handle tags are zero-sized marker types defined by the owning crate (e.g. `pub s
 
 Everything is `Send` (and `Sync` where `T` is). No internal locking. `init_logging` may be called from any thread once.
 
+**Worker pool (M5a, ADR-0013 §3, FR-PLAT-013).** `foundation::init_thread_pool()` configures the global `rayon` pool once (idempotent, returns the thread count) and names its threads `anvil-worker-N`. `ANVIL_THREADS=n` (n >= 1) overrides the default of one thread per logical CPU; an invalid value is ignored with a `warn!`. The pool lives in `foundation`, not `platform`, because the renderer (its main user) does not depend on `platform`; `Renderer::new` calls it, so applications need not. It is for short data-parallel CPU work only (renderer preparation: instance packing, frustum culling, cluster assignment, draw-list sorting). Command recording stays on the calling thread. Parallel code must return exactly what the serial loop would (order-preserving collects, stable sorts) and runs on the calling thread for small inputs (see LAYER-005 M5a).
+
 ## 11. Error handling
 
 `Pool` uses `Option` (stale is an expected, checkable condition). foundation defines `CoreError` (thiserror) only for logging init failure. Callers (RHI) convert `None` into their own `StaleHandle` error.
@@ -147,5 +149,7 @@ None for M1. Pool/handle internals are small enough to live in this spec; a modu
 | `ANVIL_LOG` | `tracing` filter directives, e.g. `info,vulkan::validation=trace` | Overrides the default filter (debug builds: engine crates at `debug`, else `info`). Unparsable: `CoreError::InvalidLogFilter`. |
 | `ANVIL_LOG_FORMAT` | `pretty` (default), `json` | `json` emits one JSON object per line with timestamp, level, target, fields, current span and span list. Other value: `CoreError::InvalidLogFormat`. |
 | `ANVIL_LOG_FILE` | file path | Create/truncate the file and log there instead of stderr, without ANSI colors. Failure: `CoreError::LogFile { path, reason }`. |
+
+Cargo feature `profile-tracy` (off by default; needs a C++ compiler for `tracy-client-sys`) adds a `tracing-tracy` layer (version 0.12) to the subscriber `init_logging` installs, so every `tracing` span (the renderer's `renderer.*` stage spans, `app_frame`, `frame`) appears in the Tracy profiler (ADR-0013 §2). Examples forward it as `cargo run --release -p pbr-scene --features profile-tracy`. Without the feature nothing changes.
 
 Output always includes the target, so agents can grep on e.g. `vulkan::validation`. After a successful install, one `info!` records the effective `filter`, `format` and `destination`.

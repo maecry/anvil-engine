@@ -18,3 +18,7 @@ tracing.workspace = true
 anyhow = "1"
 # Only for ANVIL_SCREENSHOT (ADR-0011 §11).
 png = "0.18"
+
+[features]
+# Streams tracing spans to Tracy (ADR-0013 §2).
+profile-tracy = ["foundation/profile-tracy"]
