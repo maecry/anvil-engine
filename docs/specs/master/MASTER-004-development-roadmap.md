@@ -86,3 +86,12 @@ Roadmap changes follow MASTER-000 §13.5. Milestone exit requires: exit criteria
 | No validation errors | Done | `ANVIL_SYNC_VALIDATION=1 ANVIL_EXIT_AFTER_FRAMES=120 cargo run -p triangle`: errors 0, warnings 0 (RADV, RX 9070 XT); FIFO run smooth (manual) |
 
 Open: CI never run (no remote); headless swapchain test; wait_idle shortcuts on swapchain recreate/destroy (M2).
+
+### M2 RHI and Resources (2026-11-02)
+| Exit criterion | Status | Evidence |
+|---|---|---|
+| Reusable GPU resource infrastructure | Done | buffers/textures/samplers, bindless (ADR-0010), queued uploads, deferred destruction; 126 tests incl. GPU readback roundtrips |
+| No validation errors | Done | `textured-quad` + `triangle`, 120 frames, sync validation: 0 errors / 0 warnings; GPU-AV run: 0 errors |
+| Visual check | Pending (manual) | `cargo run -p textured-quad` should show a checkerboard quad |
+
+Open: lavapipe/CI unverified; no staging ring (per-call staging); swapchain recreate still wait_idle.
