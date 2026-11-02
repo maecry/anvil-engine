@@ -20,21 +20,23 @@ Module specs refine one LAYER spec and must not contradict it, MASTER-000 or an 
 | [MODULE-004](MODULE-004-command-manager.md) | Command manager (frame slots, encoder, sync, deferred destruction) | rhi-vulkan | LAYER-004 | M1 | Accepted |
 | [MODULE-005](MODULE-005-buffer-allocator.md) | Buffer allocator | rhi-vulkan (API in rhi) | LAYER-007 | M2 | Accepted |
 | [MODULE-006](MODULE-006-texture-registry.md) | Texture registry | rhi-vulkan (API in rhi) | LAYER-007 | M2 | Accepted |
-| [MODULE-007](MODULE-007-pipeline-cache.md) | Pipeline cache | rhi-vulkan (+ shader cache keys) | LAYER-008 / LAYER-007 | M2 creation, M5 persistence | Accepted |
+| [MODULE-007](MODULE-007-pipeline-cache.md) | Pipeline cache and global bindings | rhi-vulkan (+ shader cache keys) | LAYER-008 / LAYER-007 | M2 global bindings + layout + depth; M5 cache/dedupe | Accepted (M2 scope) |
 | [MODULE-008](MODULE-008-shader-compiler.md) | Shader compiler | shader | LAYER-008 | M1 (SPIR-V only) / M2 | Draft (blocked on ADR-0003) |
 | [MODULE-009](MODULE-009-render-graph-compiler.md) | Render graph compiler | render-graph | LAYER-006 | M4 | Accepted |
 | [MODULE-010](MODULE-010-render-world.md) | Render world | renderer | LAYER-005 | M3 | Accepted |
 
 Dependency order for M1 implementation: MODULE-001 -> 002 -> 003 and 004 (003 and 004 are developed together; the frame loop needs both). MODULE-004 also contains the minimal M1 shader-module and graphics-pipeline objects, which MODULE-007 absorbs in M2.
 
+M2 implementation order: MODULE-002 amendment (§16: features, limits, allocator BDA) -> MODULE-007 (`GlobalBindings`, single layout, `Doomed::Pipeline` without layout, depth) -> MODULE-005 (buffers, `UploadState`, submit with upload command buffer) -> MODULE-006 (textures, samplers, bindless slots, quarantine) -> `examples/textured-quad` (LAYER-003 §17.7). MODULE-004 changes (upload command buffer in `FrameSlot`, two-cb submit, `destroy_doomed(&DeviceShared, ..)`) are specified in MODULE-005 §6.3/§8 and MODULE-006 §5.
+
 ## 2. Status values
 
 | Status | Meaning |
 |---|---|
-| Accepted | Concept level. Undecided points are listed in Open questions. Not enough to implement. |
-| Accepted | Complete for the milestone. Open questions do not block implementation. |
-| Review, IMPLEMENTATION-READY | Review plus concrete signatures, call order and test cases; code may start. |
-| Accepted | Implemented and matching the code. |
+| Draft | Concept level. Undecided points are listed in Open questions. Not enough to implement. |
+| Review | Complete for the milestone. Open questions do not block implementation. |
+| Accepted | Review plus concrete signatures, call order and test cases; code may start. |
+| Implemented | Implemented and matching the code. |
 
 "verify:" marks an API name or behavior not yet checked against upstream documentation. Resolve each before or during implementation and delete the marker.
 

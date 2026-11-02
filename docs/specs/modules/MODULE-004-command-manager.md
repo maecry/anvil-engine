@@ -394,3 +394,6 @@ Integration tests (lavapipe on CI, `ANVIL_GPU_TESTS=1`, validation `On`, sync va
 6. Depth attachments and `DepthAttachment` handling arrive with texture creation in M2.
 7. (verified 2026-11-02) ash 0.38 names for `queue_submit2`, `cmd_pipeline_barrier2`, `cmd_begin_rendering`, `wait_semaphores`, `get_semaphore_counter_value`, `reset_command_pool`, and `SemaphoreSubmitInfo`/`CommandBufferSubmitInfo` builders.
 8. Whether the encoder should hold the pool read lock for the whole recording (fewer lock operations) or per call (current); decide after measuring lock traffic.
+
+## 16. M2 amendments (pointer)
+Specified in MODULE-005 §6.3/§8 and MODULE-006 §5, binding on this module: `FrameSlot` gains `upload_cb`; every submit drains `DeviceShared.pending_uploads` and, when non-empty, submits `[upload_cb, frame_cb]` in one `SubmitInfo2`; `destroy_doomed` takes `&DeviceShared`; `Doomed::Pipeline` drops its layout (global layout, MODULE-007).

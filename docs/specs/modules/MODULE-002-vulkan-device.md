@@ -297,3 +297,36 @@ Integration tests (lavapipe on CI, `ANVIL_GPU_TESTS=1`, validation `On`, sync va
 2. Do we want an explicit CPU-device opt-out (`ANVIL_ALLOW_CPU=0`) for release builds? Default: CPU devices accepted everywhere.
 3. Resolved: the Vulkan spec guarantees that GRAPHICS or COMPUTE families support transfer even when TRANSFER_BIT is not reported. Do not require the bit.
 4. `max_device_local_heap` on integrated GPUs reports shared memory; acceptable as a tiebreak only.
+
+## 16. M2 amendment: bindless and buffer device address (ADR-0010)
+
+Supersedes the "no other features in M1" sentence of §6.4 from M2 on. Behavior of M1 devices is unchanged otherwise.
+
+**Extra required features** (`PhysicalDeviceVulkan12Features`, all core in Vulkan 1.2, so no new extensions):
+
+| Feature (Vulkan name / ash builder) | Why | `Rejection` |
+|---|---|---|
+| `bufferDeviceAddress` / `buffer_device_address` | `Device::buffer_address`, vertex pulling (ADR-0010 §2) | `MissingFeature("bufferDeviceAddress")` |
+| `runtimeDescriptorArray` / `runtime_descriptor_array` | unsized `texture2D textures[]` in GLSL | `MissingFeature("runtimeDescriptorArray")` |
+| `shaderSampledImageArrayNonUniformIndexing` / `shader_sampled_image_array_non_uniform_indexing` | `nonuniformEXT` indices for images and samplers | `MissingFeature("shaderSampledImageArrayNonUniformIndexing")` |
+| `descriptorBindingSampledImageUpdateAfterBind` / `descriptor_binding_sampled_image_update_after_bind` | write descriptors after the set is bound (also covers `SAMPLER`; verify) | `MissingFeature("descriptorBindingSampledImageUpdateAfterBind")` |
+| `descriptorBindingPartiallyBound` / `descriptor_binding_partially_bound` | unwritten slots legal | `MissingFeature("descriptorBindingPartiallyBound")` |
+
+`descriptorBindingVariableDescriptorCount` is **not** required (MODULE-007: fixed-size arrays). Limits: `L_img >= 1024` and `L_smp >= 64`, computed as in MODULE-007 §6.3, else `Rejection::BindlessLimits { images: u32, samplers: u32 }` (new variant; Display lists found values).
+
+**`PhysicalDeviceFacts` gains:** `buffer_device_address: bool`, `runtime_descriptor_array: bool`, `shader_sampled_image_array_non_uniform_indexing: bool`, `descriptor_binding_sampled_image_update_after_bind: bool`, `descriptor_binding_partially_bound: bool`, `bindless_sampled_images: u32` (= `L_img`), `bindless_samplers: u32` (= `L_smp`). Step 5 of §8 already chains `Vulkan12Features`; it also reads `Vulkan12Properties` (`max_per_stage_descriptor_update_after_bind_sampled_images`, `max_descriptor_set_update_after_bind_sampled_images`, `..._samplers`). `evaluate` checks the new features after the three baseline features (stable rejection order: API, baseline features, bindless features, limits, extension, queue, surface); a device failing several reports the first.
+
+**§6.4 feature chain becomes:**
+```rust
+let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
+    .timeline_semaphore(true).buffer_device_address(true)
+    .runtime_descriptor_array(true).shader_sampled_image_array_non_uniform_indexing(true)
+    .descriptor_binding_sampled_image_update_after_bind(true).descriptor_binding_partially_bound(true);
+```
+(`f13` unchanged.) ash builder names confirmed in ash 0.38 `definitions.rs`.
+
+**§8 flow:** new step 8a after `vkCreateDevice`: `GlobalBindings::new(&device, limits)` (MODULE-007); on failure destroy the device and return the error. Step 10 sets `buffer_device_address: true` in `AllocatorCreateDesc` (gpu-allocator then allocates with `DEVICE_ADDRESS`). `DeviceShared` gains `bindings: GlobalBindings`, `allocated_bytes: AtomicU64`, `upload: Mutex<UploadState>` (MODULE-005 §6.3) and `Pools` gains `buffers`, `samplers` (MODULE-005/006). `DeviceShared::drop` order: wait idle -> drain deferred (now also frees allocations, so the allocator is still alive) -> `bindings.destroy` -> destroy timeline/cache -> `allocator.take()` -> `destroy_device`.
+
+**§3 table:** the allocation API row is now delivered by MODULE-005/006.
+
+**Added tests** (unit, hand-built facts): `reject_missing_each_bindless_feature` (five cases, each names its feature), `reject_small_bindless_limits` (images 512 / samplers 32), `bindless_features_checked_after_baseline`. Integration: `device_enables_bindless_features` (create a texture + sampler, write descriptors, draw: no validation error). Acceptance: a GPU lacking any of the five features or the limits is rejected with the matching `Rejection` and logged; lavapipe and RADV are expected to pass (verify on first run).
