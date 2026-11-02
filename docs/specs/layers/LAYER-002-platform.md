@@ -73,7 +73,7 @@ pub struct WindowConfig { pub title: String, pub width: u32, pub height: u32, pu
 pub trait App: 'static {
     fn on_start(&mut self, window: &Window) -> Result<(), AppError>;   // GPU init happens here
     fn on_event(&mut self, window: &Window, event: &Event) -> Control;
-    fn on_frame(&mut self, window: &Window) -> Result<(), AppError>;
+    fn on_frame(&mut self, window: &Window) -> Result<Control, AppError>; // Exit leaves the loop cleanly
     fn on_exit(&mut self);                                              // drop GPU objects before the window
 }
 

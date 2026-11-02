@@ -1,0 +1,21 @@
+//! Compiles the GLSL shaders to SPIR-V in `OUT_DIR` (no committed .spv files).
+
+use std::{env, fs, path::PathBuf};
+
+fn main() {
+    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let compiler = shaderc::Compiler::new().expect("shaderc compiler");
+    for (file, kind) in [
+        ("triangle.vert", shaderc::ShaderKind::Vertex),
+        ("triangle.frag", shaderc::ShaderKind::Fragment),
+    ] {
+        let path = format!("shaders/{file}");
+        println!("cargo:rerun-if-changed={path}");
+        let src = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let spv = compiler
+            .compile_into_spirv(&src, kind, &path, "main", None)
+            .unwrap_or_else(|e| panic!("compile {path}: {e}"));
+        fs::write(out.join(format!("{file}.spv")), spv.as_binary_u8()).expect("write spv");
+    }
+    println!("cargo:rerun-if-changed=build.rs");
+}

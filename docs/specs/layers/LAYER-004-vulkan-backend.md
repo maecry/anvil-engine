@@ -243,3 +243,15 @@ Checked against crate sources, a compile check and `vulkaninfo` on the dev machi
 | Instance extensions (dev machine) | `VK_EXT_debug_utils`, `VK_EXT_headless_surface`, `VK_EXT_layer_settings`, wayland/xcb/xlib surface |
 | Validation layer | `VK_LAYER_KHRONOS_validation` 1.4.363 installed; sync-validation setting key `validate_sync` (from the layer manifest) |
 | Still open | lavapipe 1.3 + headless_surface on the CI runner (first CI run answers it); acquire-semaphore state after `OUT_OF_DATE` (the spec reading is "unsignalled", confirm with validation once the layer is installed) |
+
+## Verification log (2026-11-02, implementation run)
+
+Dev machine: RX 9070 XT, RADV (Mesa 26.2.5), validation layer 1.4.363, Wayland.
+
+| Item | Result |
+|---|---|
+| `VK_KHR_swapchain` on a headless instance | Validation error `VUID-vkCreateDevice-ppEnabledExtensionNames-01387`: the device extension needs the instance extension `VK_KHR_surface`. The backend now always requests `VK_KHR_surface` (optional) even without a display. |
+| Sync validation | `VK_EXT_layer_settings` key `validate_sync` works; layer reports "Synchronization" enabled. 120 triangle frames with it: zero errors and zero warnings. |
+| `ERROR_OUT_OF_DATE` acquire-semaphore state | Not exercised: the compositor never returned OUT_OF_DATE. Still open. |
+| Wayland | Every acquire reports `SUBOPTIMAL` on this compositor; frames still render and present returns Ok. With FIFO and a hidden or occluded window the compositor throttles presents to about 1 per second, so the run uses `ANVIL_VSYNC=0` (MAILBOX). |
+| Deadlock found by the tests | `diagnostics()` built a struct literal holding a pool guard while calling a function that locks the same mutex. Fixed by taking the guards in separate statements. |

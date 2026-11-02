@@ -141,10 +141,11 @@ pub trait App: 'static {
     /// Called for each translated event.
     fn on_event(&mut self, window: &Window, event: &Event) -> Control;
     /// Called once per redraw (continuous mode). Check [`Window::is_minimized`].
+    /// Return [`Control::Exit`] to leave the loop cleanly (`on_exit` still runs).
     ///
     /// # Errors
     /// An error is logged and ends the loop; `run` returns it.
-    fn on_frame(&mut self, window: &Window) -> Result<(), AppError>;
+    fn on_frame(&mut self, window: &Window) -> Result<Control, AppError>;
     /// Called once before the window is dropped; destroy GPU objects here.
     fn on_exit(&mut self);
 }
@@ -282,8 +283,10 @@ impl<A: App> ApplicationHandler for Handler<A> {
         };
         if matches!(event, WindowEvent::RedrawRequested) {
             if self.started {
-                if let Err(e) = self.app.on_frame(&window) {
-                    self.fail(el, PlatformError::App(e));
+                match self.app.on_frame(&window) {
+                    Ok(Control::Continue) => {}
+                    Ok(Control::Exit) => el.exit(),
+                    Err(e) => self.fail(el, PlatformError::App(e)),
                 }
             }
         } else if let Some(ev) = map_event(&event) {

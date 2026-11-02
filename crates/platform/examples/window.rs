@@ -25,8 +25,8 @@ impl App for Demo {
         }
         Control::Continue
     }
-    fn on_frame(&mut self, _: &Window) -> Result<(), AppError> {
-        Ok(())
+    fn on_frame(&mut self, _: &Window) -> Result<Control, AppError> {
+        Ok(Control::Continue)
     }
     fn on_exit(&mut self) {
         tracing::info!("exit");

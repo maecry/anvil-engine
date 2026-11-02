@@ -191,7 +191,7 @@ mod tests {
             s = s
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            if (s >> 33) % 3 != 0 || live.is_empty() {
+            if !(s >> 33).is_multiple_of(3) || live.is_empty() {
                 let h = p.insert(i);
                 model.insert(h, i);
                 live.push(h);
