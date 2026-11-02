@@ -46,12 +46,34 @@ impl<Tag, V> Registry<Tag, V> {
         self.vals.get_mut(h.index() as usize)?.take()
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.ids.len()
+    /// Removes the value but keeps the id allocated: `get` is `None` (stale) and the index is
+    /// not reused until [`Registry::release`] (bindless slot quarantine, ADR-0010 §4).
+    pub(crate) fn take(&mut self, h: Handle<Tag>) -> Option<V> {
+        self.ids.get(h)?;
+        self.vals.get_mut(h.index() as usize)?.take()
     }
 
+    /// Frees the id of a quarantined (or live) entry so the index can be reused.
+    pub(crate) fn release(&mut self, h: Handle<Tag>) {
+        if self.ids.remove(h).is_some()
+            && let Some(v) = self.vals.get_mut(h.index() as usize)
+        {
+            *v = None;
+        }
+    }
+
+    /// Number of live values (quarantined ids are excluded).
+    pub(crate) fn len(&self) -> usize {
+        self.vals.iter().filter(|v| v.is_some()).count()
+    }
+
+    /// Handles of live values.
     pub(crate) fn handles(&self) -> Vec<Handle<Tag>> {
-        self.ids.iter().map(|(h, _)| h).collect()
+        self.ids
+            .iter()
+            .filter(|(h, _)| self.vals[h.index() as usize].is_some())
+            .map(|(h, _)| h)
+            .collect()
     }
 }
 
@@ -79,5 +101,28 @@ mod tests {
         assert_eq!(r.get(b), Some(&9));
         assert_eq!(r.len(), 1);
         assert_eq!(generated_name("texture", b), "texture#0v2");
+    }
+
+    #[test]
+    fn take_quarantines_index_until_release() {
+        let mut r: Registry<TextureTag, u32> = Registry::new(|| TextureTag);
+        let a = r.insert(1);
+        let keep = r.insert(2);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r.take(a), Some(1));
+        assert_eq!(r.get(a), None);
+        assert_eq!(r.take(a), None);
+        assert_eq!(r.len(), 1, "quarantined entries are not counted");
+        assert_eq!(r.handles(), vec![keep]);
+        let b = r.insert(3);
+        assert_ne!(b.index(), a.index(), "quarantined index must not be reused");
+        r.release(a);
+        r.release(a); // idempotent
+        let c = r.insert(4);
+        assert_eq!(c.index(), a.index());
+        assert_ne!(c.generation(), a.generation());
+        assert_eq!(r.get(a), None);
+        assert_eq!(r.get(c), Some(&4));
+        assert_eq!(r.len(), 3);
     }
 }

@@ -38,11 +38,11 @@ pub struct PipelineTag;
 /// Tag for [`SwapchainHandle`].
 pub struct SwapchainTag;
 
-/// Buffer handle. Declared in M1 for stability; creation arrives in M2.
+/// Buffer handle.
 pub type BufferHandle = Handle<BufferTag>;
 /// Texture handle. Swapchain images are ordinary texture handles.
 pub type TextureHandle = Handle<TextureTag>;
-/// Sampler handle. Declared in M1 for stability; creation arrives in M2.
+/// Sampler handle.
 pub type SamplerHandle = Handle<SamplerTag>;
 /// Shader module handle.
 pub type ShaderModuleHandle = Handle<ShaderModuleTag>;
@@ -106,7 +106,7 @@ pub enum RhiError {
 
 // ---------------------------------------------------------------- plain types
 
-/// Texture / swapchain formats (extended in M2).
+/// Texture / swapchain formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Format {
     /// 8-bit BGRA, sRGB encoded.
@@ -117,6 +117,12 @@ pub enum Format {
     Rgba8Srgb,
     /// 8-bit RGBA, linear.
     Rgba8Unorm,
+    /// 8-bit single channel, linear.
+    R8Unorm,
+    /// 8-bit two channel, linear.
+    Rg8Unorm,
+    /// 16-bit float RGBA.
+    Rgba16Float,
     /// 32-bit float depth.
     D32Sfloat,
 }
@@ -130,6 +136,20 @@ impl Format {
     /// True for depth formats.
     pub fn is_depth(self) -> bool {
         matches!(self, Format::D32Sfloat)
+    }
+
+    /// Bytes per texel (tightly packed upload size).
+    pub fn bytes_per_texel(self) -> u32 {
+        match self {
+            Format::R8Unorm => 1,
+            Format::Rg8Unorm => 2,
+            Format::Bgra8Srgb
+            | Format::Bgra8Unorm
+            | Format::Rgba8Srgb
+            | Format::Rgba8Unorm
+            | Format::D32Sfloat => 4,
+            Format::Rgba16Float => 8,
+        }
     }
 }
 
@@ -149,6 +169,8 @@ pub enum TextureState {
     TransferDst,
     /// Source of a transfer.
     TransferSrc,
+    /// Written (and depth-tested) as a depth attachment.
+    DepthAttachment,
 }
 
 /// Validation layer policy.
@@ -163,6 +185,176 @@ pub enum ValidationMode {
     Off,
 }
 
+/// Where a buffer's memory lives (ADR-0010 §6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Memory {
+    /// Device-local, not host visible. Fill with [`Device::upload_buffer`].
+    GpuOnly,
+    /// Host-visible, persistently mapped, for CPU writes ([`Device::write_buffer`]).
+    Upload,
+    /// Host-visible, persistently mapped, for CPU reads ([`Device::read_buffer`]).
+    Readback,
+}
+
+/// Buffer usage flags (device address is always enabled).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct BufferUsage(u32);
+
+impl BufferUsage {
+    /// No usage (invalid for creation).
+    pub const NONE: Self = Self(0);
+    /// Index buffer.
+    pub const INDEX: Self = Self(1);
+    /// Storage buffer.
+    pub const STORAGE: Self = Self(1 << 1);
+    /// Uniform buffer.
+    pub const UNIFORM: Self = Self(1 << 2);
+    /// Transfer source.
+    pub const TRANSFER_SRC: Self = Self(1 << 3);
+    /// Transfer destination (required by [`Device::upload_buffer`]).
+    pub const TRANSFER_DST: Self = Self(1 << 4);
+
+    /// True when every flag of `other` is set.
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// True when no flag is set.
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl std::ops::BitOr for BufferUsage {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// Parameters for [`Device::create_buffer`].
+#[derive(Clone, Copy, Debug)]
+pub struct BufferDesc<'a> {
+    /// Debug label (ADR-0009).
+    pub label: Option<&'a str>,
+    /// Size in bytes, nonzero.
+    pub size: u64,
+    /// Usage flags, nonempty.
+    pub usage: BufferUsage,
+    /// Memory placement.
+    pub memory: Memory,
+}
+
+/// Texture usage flags.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TextureUsage(u32);
+
+impl TextureUsage {
+    /// No usage (invalid for creation).
+    pub const NONE: Self = Self(0);
+    /// Sampled in shaders (gets a bindless slot).
+    pub const SAMPLED: Self = Self(1);
+    /// Color attachment.
+    pub const COLOR_ATTACHMENT: Self = Self(1 << 1);
+    /// Depth attachment.
+    pub const DEPTH_ATTACHMENT: Self = Self(1 << 2);
+    /// Transfer source.
+    pub const TRANSFER_SRC: Self = Self(1 << 3);
+    /// Transfer destination (required by [`Device::upload_texture`]).
+    pub const TRANSFER_DST: Self = Self(1 << 4);
+
+    /// True when every flag of `other` is set.
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// True when no flag is set.
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl std::ops::BitOr for TextureUsage {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// Parameters for [`Device::create_texture`]: a single-mip, single-layer 2D image.
+#[derive(Clone, Copy, Debug)]
+pub struct TextureDesc<'a> {
+    /// Debug label (ADR-0009).
+    pub label: Option<&'a str>,
+    /// Width in texels, nonzero.
+    pub width: u32,
+    /// Height in texels, nonzero.
+    pub height: u32,
+    /// Texel format.
+    pub format: Format,
+    /// Usage flags, nonempty.
+    pub usage: TextureUsage,
+}
+
+/// Texture filtering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Filter {
+    /// Nearest texel.
+    Nearest,
+    /// Bilinear.
+    Linear,
+}
+
+/// Texture coordinate addressing outside [0, 1].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AddressMode {
+    /// Tile.
+    Repeat,
+    /// Tile, mirroring every other repetition.
+    MirroredRepeat,
+    /// Clamp to the edge texel.
+    ClampToEdge,
+}
+
+/// Parameters for [`Device::create_sampler`].
+#[derive(Clone, Copy, Debug)]
+pub struct SamplerDesc<'a> {
+    /// Debug label (ADR-0009).
+    pub label: Option<&'a str>,
+    /// Magnification filter.
+    pub mag_filter: Filter,
+    /// Minification filter.
+    pub min_filter: Filter,
+    /// Addressing along u.
+    pub address_u: AddressMode,
+    /// Addressing along v.
+    pub address_v: AddressMode,
+    /// Addressing along w.
+    pub address_w: AddressMode,
+}
+
+/// Index element type for [`CommandEncoder::bind_index_buffer`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexFormat {
+    /// 16-bit indices.
+    U16,
+    /// 32-bit indices.
+    U32,
+}
+
+impl IndexFormat {
+    /// Size of one index in bytes.
+    pub const fn size(self) -> u64 {
+        match self {
+            IndexFormat::U16 => 2,
+            IndexFormat::U32 => 4,
+        }
+    }
+}
+
+/// Size of the push constant block visible to all graphics stages (ADR-0010 §3).
+pub const PUSH_CONSTANT_BYTES: u32 = 128;
+
 /// Parameters for [`Backend::create_instance`].
 #[derive(Clone, Debug)]
 pub struct InstanceDesc {
@@ -172,6 +364,10 @@ pub struct InstanceDesc {
     pub validation: ValidationMode,
     /// Synchronization validation. `Default` reads env `ANVIL_SYNC_VALIDATION` (`1` = true).
     pub sync_validation: bool,
+    /// GPU-assisted validation (shader instrumentation, descriptor-indexing checks). `Default`
+    /// reads env `ANVIL_GPU_AV` (`1` = true). Replaces synchronization validation when set,
+    /// because the layer does not combine them.
+    pub gpu_av: bool,
     /// Display the surfaces will belong to; `None` = headless (no surface extensions).
     pub display: Option<RawDisplayHandle>,
 }
@@ -189,6 +385,7 @@ impl Default for InstanceDesc {
             sync_validation: sync_validation_from(
                 std::env::var("ANVIL_SYNC_VALIDATION").ok().as_deref(),
             ),
+            gpu_av: sync_validation_from(std::env::var("ANVIL_GPU_AV").ok().as_deref()),
             display: None,
         }
     }
@@ -367,7 +564,9 @@ impl Default for BlendState {
 
 /// Parameters for [`Device::create_graphics_pipeline`].
 ///
-/// M1: no vertex buffers, no descriptor sets, no push constants.
+/// No vertex input state: shaders pull vertices through buffer device addresses. Every pipeline
+/// uses the one global layout (bindless set 0 + [`PUSH_CONSTANT_BYTES`] of push constants).
+/// `depth_format` may be `None` or `Some(Format::D32Sfloat)` (test + write, `LESS`).
 #[derive(Clone, Copy, Debug)]
 pub struct GraphicsPipelineDesc<'a> {
     /// Debug label.
@@ -546,6 +745,32 @@ pub struct DeviceDiagnostics {
     pub swapchains: Vec<SwapchainDiagnostics>,
     /// Validation-layer messages seen so far (all zero when validation is off).
     pub validation: ValidationCounts,
+    /// GPU memory usage.
+    pub memory: MemoryDiagnostics,
+    /// Bindless descriptor slot usage.
+    pub bindless: BindlessDiagnostics,
+}
+
+/// GPU memory usage (ADR-0010 Consequences).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryDiagnostics {
+    /// Bytes handed out to live (and not yet retired) allocations.
+    pub allocated_bytes: u64,
+    /// Bytes reserved from the driver by the allocator.
+    pub reserved_bytes: u64,
+}
+
+/// Bindless descriptor array capacities and usage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BindlessDiagnostics {
+    /// Capacity of the sampled image array.
+    pub image_capacity: u32,
+    /// Capacity of the sampler array.
+    pub sampler_capacity: u32,
+    /// Highest sampled image slot written so far, plus one.
+    pub image_high_water: u32,
+    /// Highest sampler slot written so far, plus one.
+    pub sampler_high_water: u32,
 }
 
 /// Live object counts.
@@ -559,6 +784,10 @@ pub struct LiveObjects {
     pub shader_modules: usize,
     /// Graphics pipelines.
     pub pipelines: usize,
+    /// Buffers.
+    pub buffers: usize,
+    /// Samplers.
+    pub samplers: usize,
 }
 
 /// Swapchain state.
@@ -672,6 +901,42 @@ pub trait Device: Sized + Send {
     /// Destroys a pipeline (deferred).
     fn destroy_pipeline(&self, h: PipelineHandle);
 
+    /// Creates a buffer. Errors: [`RhiError::InvalidDescriptor`] (zero size, empty usage),
+    /// [`RhiError::OutOfDeviceMemory`].
+    fn create_buffer(&self, desc: &BufferDesc) -> Result<BufferHandle, RhiError>;
+    /// Destroys a buffer (deferred). Stale handles are ignored with a warning.
+    fn destroy_buffer(&self, h: BufferHandle);
+    /// GPU virtual address of the buffer, for `buffer_reference` in shaders.
+    fn buffer_address(&self, h: BufferHandle) -> Result<u64, RhiError>;
+    /// Copies `data` into a [`Memory::Upload`] buffer at `offset`. The caller guarantees the GPU
+    /// is not reading that range.
+    fn write_buffer(&self, h: BufferHandle, offset: u64, data: &[u8]) -> Result<(), RhiError>;
+    /// Copies from a [`Memory::Readback`] buffer into `out`. The caller guarantees the GPU
+    /// finished writing the range (e.g. after [`Device::wait_idle`]).
+    fn read_buffer(&self, h: BufferHandle, offset: u64, out: &mut [u8]) -> Result<(), RhiError>;
+    /// Queues a copy of `data` into any buffer with [`BufferUsage::TRANSFER_DST`]. Callable at
+    /// any time; the copy runs ahead of the commands of the next submit, in the same
+    /// submission. Overlapping ranges within one submit are unspecified.
+    fn upload_buffer(&self, h: BufferHandle, offset: u64, data: &[u8]) -> Result<(), RhiError>;
+
+    /// Creates a texture (2D, one mip, one layer). Samplable textures get a bindless slot.
+    fn create_texture(&self, desc: &TextureDesc) -> Result<TextureHandle, RhiError>;
+    /// Destroys a texture (deferred). Stale or swapchain-owned handles are ignored with a warning.
+    fn destroy_texture(&self, h: TextureHandle);
+    /// Bindless slot of a [`TextureUsage::SAMPLED`] texture in the global image array.
+    fn texture_index(&self, h: TextureHandle) -> Result<u32, RhiError>;
+    /// Queues an upload of tightly packed texels (mip 0, layer 0) into a texture with
+    /// [`TextureUsage::TRANSFER_DST`]. Callable at any time, like [`Device::upload_buffer`].
+    /// The texture ends in [`TextureState::ShaderRead`].
+    fn upload_texture(&self, h: TextureHandle, data: &[u8]) -> Result<(), RhiError>;
+
+    /// Creates a sampler and writes it into the bindless sampler array.
+    fn create_sampler(&self, desc: &SamplerDesc) -> Result<SamplerHandle, RhiError>;
+    /// Destroys a sampler (deferred). Stale handles are ignored with a warning.
+    fn destroy_sampler(&self, h: SamplerHandle);
+    /// Bindless slot of a sampler in the global sampler array.
+    fn sampler_index(&self, h: SamplerHandle) -> Result<u32, RhiError>;
+
     /// Starts a frame: waits for the slot's previous work and runs deferred destroys.
     fn begin_frame(&mut self) -> Result<FrameToken, RhiError>;
     /// Acquires the next swapchain image.
@@ -720,6 +985,33 @@ pub trait CommandEncoder {
         first_vertex: u32,
         first_instance: u32,
     );
+    /// Indexed draw. Requires a bound pipeline and index buffer.
+    fn draw_indexed(
+        &mut self,
+        index_count: u32,
+        instance_count: u32,
+        first_index: u32,
+        vertex_offset: i32,
+        first_instance: u32,
+    );
+    /// Binds an index buffer (inside rendering). `offset` must be a multiple of the index size.
+    fn bind_index_buffer(&mut self, b: BufferHandle, offset: u64, format: IndexFormat);
+    /// Writes push constants visible to all graphics stages. `offset` and `data.len()` must be
+    /// multiples of 4 and `offset + len <= PUSH_CONSTANT_BYTES`.
+    fn push_constants(&mut self, offset: u32, data: &[u8]);
+    /// Copies between buffers (outside rendering). A copy into a [`Memory::Readback`] buffer is
+    /// followed by a host-read barrier.
+    fn copy_buffer_to_buffer(
+        &mut self,
+        src: BufferHandle,
+        src_offset: u64,
+        dst: BufferHandle,
+        dst_offset: u64,
+        size: u64,
+    );
+    /// Copies a whole texture (mip 0) into a buffer (outside rendering). The texture must be
+    /// in [`TextureState::TransferSrc`].
+    fn copy_texture_to_buffer(&mut self, t: TextureHandle, dst: BufferHandle, dst_offset: u64);
     /// Opens a debug label (no-op if unsupported).
     fn begin_label(&mut self, name: &str, color: [f32; 4]);
     /// Closes the innermost debug label.
@@ -759,6 +1051,28 @@ mod tests {
         assert!(Format::Bgra8Srgb.is_srgb() && Format::Rgba8Srgb.is_srgb());
         assert!(!Format::Bgra8Unorm.is_srgb() && !Format::D32Sfloat.is_srgb());
         assert!(Format::D32Sfloat.is_depth() && !Format::Rgba8Unorm.is_depth());
+    }
+
+    #[test]
+    fn usage_flag_ops() {
+        let u = BufferUsage::INDEX | BufferUsage::TRANSFER_DST;
+        assert!(u.contains(BufferUsage::INDEX) && u.contains(BufferUsage::NONE));
+        assert!(!u.contains(BufferUsage::STORAGE | BufferUsage::INDEX));
+        assert!(BufferUsage::NONE.is_empty() && !u.is_empty());
+        let t = TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST;
+        assert!(t.contains(TextureUsage::SAMPLED) && !t.contains(TextureUsage::DEPTH_ATTACHMENT));
+        assert!(TextureUsage::NONE.is_empty() && !t.is_empty());
+    }
+
+    #[test]
+    fn format_bytes_per_texel() {
+        assert_eq!(Format::R8Unorm.bytes_per_texel(), 1);
+        assert_eq!(Format::Rg8Unorm.bytes_per_texel(), 2);
+        assert_eq!(Format::Rgba8Unorm.bytes_per_texel(), 4);
+        assert_eq!(Format::Bgra8Srgb.bytes_per_texel(), 4);
+        assert_eq!(Format::Rgba16Float.bytes_per_texel(), 8);
+        assert_eq!(Format::D32Sfloat.bytes_per_texel(), 4);
+        assert_eq!(IndexFormat::U16.size() + IndexFormat::U32.size(), 6);
     }
 
     #[test]
@@ -871,7 +1185,42 @@ mod tests {
                 pending_destroys: 0,
                 swapchains: Vec::new(),
                 validation: ValidationCounts::default(),
+                memory: MemoryDiagnostics::default(),
+                bindless: BindlessDiagnostics::default(),
             }
+        }
+        fn create_buffer(&self, _: &BufferDesc) -> Result<BufferHandle, RhiError> {
+            Ok(BufferHandle::NULL)
+        }
+        fn destroy_buffer(&self, _: BufferHandle) {}
+        fn buffer_address(&self, _: BufferHandle) -> Result<u64, RhiError> {
+            Ok(0x1000)
+        }
+        fn write_buffer(&self, _: BufferHandle, _: u64, _: &[u8]) -> Result<(), RhiError> {
+            Ok(())
+        }
+        fn read_buffer(&self, _: BufferHandle, _: u64, _: &mut [u8]) -> Result<(), RhiError> {
+            Ok(())
+        }
+        fn upload_buffer(&self, _: BufferHandle, _: u64, _: &[u8]) -> Result<(), RhiError> {
+            Ok(())
+        }
+        fn create_texture(&self, _: &TextureDesc) -> Result<TextureHandle, RhiError> {
+            Ok(TextureHandle::NULL)
+        }
+        fn destroy_texture(&self, _: TextureHandle) {}
+        fn texture_index(&self, _: TextureHandle) -> Result<u32, RhiError> {
+            Ok(0)
+        }
+        fn upload_texture(&self, _: TextureHandle, _: &[u8]) -> Result<(), RhiError> {
+            Ok(())
+        }
+        fn create_sampler(&self, _: &SamplerDesc) -> Result<SamplerHandle, RhiError> {
+            Ok(SamplerHandle::NULL)
+        }
+        fn destroy_sampler(&self, _: SamplerHandle) {}
+        fn sampler_index(&self, _: SamplerHandle) -> Result<u32, RhiError> {
+            Ok(0)
         }
         fn create_swapchain(
             &self,
@@ -935,6 +1284,21 @@ mod tests {
         fn draw(&mut self, n: u32, _: u32, _: u32, _: u32) {
             self.0 += n;
         }
+        fn draw_indexed(&mut self, n: u32, _: u32, _: u32, _: i32, _: u32) {
+            self.0 += n;
+        }
+        fn bind_index_buffer(&mut self, _: BufferHandle, _: u64, _: IndexFormat) {}
+        fn push_constants(&mut self, _: u32, _: &[u8]) {}
+        fn copy_buffer_to_buffer(
+            &mut self,
+            _: BufferHandle,
+            _: u64,
+            _: BufferHandle,
+            _: u64,
+            _: u64,
+        ) {
+        }
+        fn copy_texture_to_buffer(&mut self, _: TextureHandle, _: BufferHandle, _: u64) {}
         fn begin_label(&mut self, _: &str, _: [f32; 4]) {}
         fn end_label(&mut self) {}
         fn finish(self) -> Result<u32, RhiError> {

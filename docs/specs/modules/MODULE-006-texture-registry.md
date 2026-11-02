@@ -142,7 +142,7 @@ Create order for a texture: image -> `alloc` (scheme `DedicatedImage(image)` for
 
 `create_texture(desc)`:
 1. Validate (all `InvalidDescriptor` unless stated): width/height > 0 and within the device limit; usage non-empty; `COLOR_ATTACHMENT` only with a color format; `DEPTH_ATTACHMENT` only with a depth format; depth format with `SAMPLED` -> `Unsupported("sampled depth textures (M2)")`; each requested usage supported by 6.1 features -> else `Unsupported{what: "<format> with <usage>"}`.
-2. Create/allocate/bind/view as in section 7. Initial `state = Undefined`.
+2. Create/allocate/bind/view as in section 7. Initial `state = Undefined`. Spec fix: `vkCreateImageView` requires an image usage of SAMPLED, COLOR_ATTACHMENT or DEPTH_ATTACHMENT (VUID-VkImageViewCreateInfo-image-04441), so a transfer-only texture has a null view.
 3. Insert in the pool, apply names (`label` or `texture#<i>v<g>`).
 4. If `SAMPLED`: capacity check, then `GlobalBindings::write_sampled_image(slot, view)` (MODULE-007: `vkUpdateDescriptorSets` with `DescriptorImageInfo{ sampler: null, image_view, image_layout: SHADER_READ_ONLY_OPTIMAL }`, type `SAMPLED_IMAGE`, binding 0, `dst_array_element = slot`); bump high-water.
 5. `debug!(handle, label, width, height, format = ?, usage = ?, slot)`.
@@ -177,7 +177,7 @@ Creation/upload/destroy take `&self`. Pool locks: `textures` is `RwLock` (reads 
 
 | Condition | Error |
 |---|---|
-| zero/oversized extent, empty usage, usage/format class mismatch, wrong data length, wrong tracked state, `texture_index` on non-SAMPLED or swapchain texture, `upload_texture` without `TRANSFER_DST`, upload outside a frame | `InvalidDescriptor` |
+| zero/oversized extent, empty usage, usage/format class mismatch, wrong data length, wrong tracked state, `texture_index` on non-SAMPLED or swapchain texture, `upload_texture` without `TRANSFER_DST` (uploads are legal at any time, MODULE-005 lead amendment) | `InvalidDescriptor` |
 | unsupported format/usage combination, sampled depth, bindless capacity exceeded, unsupported state pair | `Unsupported{what}` |
 | dead handle | `StaleHandle{kind:"texture"/"sampler"}` |
 | memory exhaustion | `OutOfDeviceMemory` / `OutOfHostMemory`; allocator variants as MODULE-005 |

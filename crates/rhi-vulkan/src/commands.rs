@@ -6,16 +6,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ash::vk;
 use rhi::{
-    BlendFactor, BlendOp, BlendState, CommandEncoder, CullMode, Format, FrameToken, FrontFace,
-    GraphicsPipelineDesc, LoadOp, PipelineHandle, PrimitiveTopology, Rect2D, RenderingDesc,
-    RhiError, ShaderModuleDesc, ShaderModuleHandle, StoreOp, TextureHandle, TextureState, Viewport,
+    BlendFactor, BlendOp, BlendState, BufferHandle, BufferUsage, CommandEncoder, CullMode, Format,
+    FrameToken, FrontFace, GraphicsPipelineDesc, IndexFormat, LoadOp, Memory, PipelineHandle,
+    PrimitiveTopology, Rect2D, RenderingDesc, RhiError, ShaderModuleDesc, ShaderModuleHandle,
+    StoreOp, TextureHandle, TextureState, TextureUsage, Viewport,
 };
 
+use crate::bindings::check_push_constants;
+use crate::buffer::{check_index_alignment, check_range};
 use crate::destroy::{Doomed, destroy_doomed};
 use crate::device::DeviceShared;
 use crate::error::{invalid, map_vk, stale};
 use crate::registry::generated_name;
-use crate::swapchain::rhi_to_vk_format;
+use crate::texture::{StateCheck, TextureOwner, aspect_of, check_tracked_state, rhi_to_vk_format};
+use crate::upload::{self, PendingUpload};
 use crate::{lock, read, write};
 
 pub(crate) const MAX_COLOR_ATTACHMENTS: usize = 8;
@@ -50,6 +54,11 @@ pub(crate) fn state_as_source(s: TextureState) -> BarrierHalf {
         TextureState::ShaderRead => (L::SHADER_READ_ONLY_OPTIMAL, SHADER_STAGES, A::NONE),
         TextureState::TransferDst => (L::TRANSFER_DST_OPTIMAL, S::ALL_TRANSFER, A::TRANSFER_WRITE),
         TextureState::TransferSrc => (L::TRANSFER_SRC_OPTIMAL, S::ALL_TRANSFER, A::NONE),
+        TextureState::DepthAttachment => (
+            L::DEPTH_ATTACHMENT_OPTIMAL,
+            S::EARLY_FRAGMENT_TESTS | S::LATE_FRAGMENT_TESTS,
+            A::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        ),
     };
     BarrierHalf {
         layout,
@@ -77,6 +86,11 @@ pub(crate) fn state_as_destination(s: TextureState) -> Result<BarrierHalf, RhiEr
         ),
         TextureState::TransferDst => (L::TRANSFER_DST_OPTIMAL, S::ALL_TRANSFER, A::TRANSFER_WRITE),
         TextureState::TransferSrc => (L::TRANSFER_SRC_OPTIMAL, S::ALL_TRANSFER, A::TRANSFER_READ),
+        TextureState::DepthAttachment => (
+            L::DEPTH_ATTACHMENT_OPTIMAL,
+            S::EARLY_FRAGMENT_TESTS | S::LATE_FRAGMENT_TESTS,
+            A::DEPTH_STENCIL_ATTACHMENT_READ | A::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        ),
     };
     Ok(BarrierHalf {
         layout,
@@ -91,7 +105,22 @@ pub(crate) fn image_barrier(
     from: TextureState,
     to: TextureState,
 ) -> Result<vk::ImageMemoryBarrier2<'static>, RhiError> {
-    let (src, dst) = (state_as_source(from), state_as_destination(to)?);
+    use TextureState::{DepthAttachment, ShaderRead};
+    if matches!(
+        (from, to),
+        (DepthAttachment, ShaderRead) | (ShaderRead, DepthAttachment)
+    ) {
+        return Err(RhiError::Unsupported {
+            what: format!("texture state transition {from:?} -> {to:?}"),
+        });
+    }
+    let (mut src, dst) = (state_as_source(from), state_as_destination(to)?);
+    if from == TextureState::Undefined && aspect.contains(vk::ImageAspectFlags::DEPTH) {
+        // A depth image re-transitioned from `Undefined` every frame must be ordered after the
+        // previous frame's depth writes.
+        src.stage = vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS;
+    }
     Ok(vk::ImageMemoryBarrier2::default()
         .src_stage_mask(src.stage)
         .src_access_mask(src.access)
@@ -155,6 +184,10 @@ pub(crate) struct EncoderState {
     pipeline_bound: bool,
     label_depth: u32,
     formats: [Option<Format>; MAX_COLOR_ATTACHMENTS],
+    depth: Option<Format>,
+    index_bound: bool,
+    /// The global descriptor set was bound in this command buffer.
+    global_bound: bool,
 }
 
 impl EncoderState {
@@ -167,13 +200,15 @@ impl EncoderState {
         self.first_error.get_or_insert(e);
     }
 
-    pub(crate) fn begin_rendering(&mut self, formats: &[Format]) -> bool {
+    pub(crate) fn begin_rendering(&mut self, formats: &[Format], depth: Option<Format>) -> bool {
         if self.rendering {
             self.record(invalid("begin_rendering while already rendering"));
             return false;
         }
         self.rendering = true;
         self.pipeline_bound = false;
+        self.index_bound = false;
+        self.depth = depth;
         self.formats = [None; MAX_COLOR_ATTACHMENTS];
         for (d, f) in self.formats.iter_mut().zip(formats) {
             *d = Some(*f);
@@ -188,6 +223,7 @@ impl EncoderState {
         }
         self.rendering = false;
         self.pipeline_bound = false;
+        self.index_bound = false;
         true
     }
 
@@ -215,7 +251,11 @@ impl EncoderState {
         true
     }
 
-    pub(crate) fn check_pipeline(&mut self, p: &[Option<Format>; MAX_COLOR_ATTACHMENTS]) -> bool {
+    pub(crate) fn check_pipeline(
+        &mut self,
+        p: &[Option<Format>; MAX_COLOR_ATTACHMENTS],
+        depth: Option<Format>,
+    ) -> bool {
         if !self.check_inside_rendering("bind_pipeline") {
             return false;
         }
@@ -225,8 +265,31 @@ impl EncoderState {
             ));
             return false;
         }
+        if self.depth != depth {
+            self.record(invalid(format!(
+                "pipeline depth format {depth:?} differs from the active rendering ({:?})",
+                self.depth
+            )));
+            return false;
+        }
         self.pipeline_bound = true;
         true
+    }
+
+    pub(crate) fn check_draw_indexed(&mut self) -> bool {
+        if !self.check_draw() {
+            return false;
+        }
+        if !self.index_bound {
+            self.record(invalid("draw_indexed requires a bound index buffer"));
+            return false;
+        }
+        true
+    }
+
+    /// Returns true the first time, when the caller must bind the global descriptor set.
+    pub(crate) fn take_global_unbound(&mut self) -> bool {
+        !std::mem::replace(&mut self.global_bound, true)
     }
 
     pub(crate) fn push_label(&mut self) {
@@ -272,6 +335,8 @@ pub(crate) fn encode_label(name: &str) -> [u8; 128] {
 pub(crate) struct FrameSlot {
     pool: vk::CommandPool,
     cb: vk::CommandBuffer,
+    /// Records the queued uploads at submit (MODULE-005 §8).
+    upload_cb: vk::CommandBuffer,
     acquire_sem: vk::Semaphore,
     epoch: Arc<AtomicU64>,
     open: bool,
@@ -314,10 +379,10 @@ impl CommandManager {
         let cb_ci = vk::CommandBufferAllocateInfo::default()
             .command_pool(pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
+            .command_buffer_count(2);
         // SAFETY: `pool` was just created on this device.
-        let cb = match unsafe { s.raw.allocate_command_buffers(&cb_ci) } {
-            Ok(v) => v[0],
+        let (cb, upload_cb) = match unsafe { s.raw.allocate_command_buffers(&cb_ci) } {
+            Ok(v) => (v[0], v[1]),
             Err(r) => {
                 // SAFETY: nothing else references the pool yet.
                 unsafe { s.raw.destroy_command_pool(pool, None) };
@@ -338,11 +403,13 @@ impl CommandManager {
         };
         s.set_name(pool, &format!("frame{i}.command_pool"));
         s.set_name(cb, &format!("frame{i}.command_buffer"));
+        s.set_name(upload_cb, &format!("frame{i}.upload_command_buffer"));
         s.set_name(sem, &format!("frame{i}.acquire_semaphore"));
         tracing::debug!(slot = i, "frame slot created");
         Ok(FrameSlot {
             pool,
             cb,
+            upload_cb,
             acquire_sem: sem,
             epoch: Arc::new(AtomicU64::new(0)),
             open: false,
@@ -384,12 +451,10 @@ impl CommandManager {
         loop {
             let d = lock(&s.sync.deferred).pop_ready(completed);
             let Some(d) = d else { break };
-            let kind = match &d {
-                Doomed::ShaderModule(_) => "shader_module",
-                Doomed::Pipeline { .. } => "pipeline",
-            };
-            // SAFETY: tag retirement proved the GPU no longer uses the object; popped once.
-            unsafe { destroy_doomed(&s.raw, d) };
+            let kind = d.kind();
+            // SAFETY: tag retirement proved the GPU no longer uses the object; popped once; no
+            // lock is held here.
+            unsafe { destroy_doomed(s, d) };
             tracing::debug!(kind, completed, "deferred destroy retired");
         }
         let sl = &mut self.slots[slot];
@@ -471,7 +536,20 @@ impl CommandManager {
         let waits = [vk::SemaphoreSubmitInfo::default()
             .semaphore(self.slots[slot].acquire_sem)
             .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)];
-        let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(f.cb)];
+        // Queued uploads are recorded into this slot's upload command buffer, which runs ahead of
+        // the frame commands in the same submission (MODULE-005 lead amendment).
+        let uploads = std::mem::take(&mut *lock(&s.pending_uploads));
+        let (upload_count, upload_bytes) = (uploads.len(), upload::total_bytes(&uploads));
+        let mut cbs = Vec::with_capacity(2);
+        if !uploads.is_empty() {
+            let ucb = self.slots[slot].upload_cb;
+            if let Err(e) = upload::record(s, ucb, &uploads) {
+                defer_staging(s, uploads);
+                return Err(e);
+            }
+            cbs.push(vk::CommandBufferSubmitInfo::default().command_buffer(ucb));
+        }
+        cbs.push(vk::CommandBufferSubmitInfo::default().command_buffer(f.cb));
         let timeline = vk::SemaphoreSubmitInfo::default()
             .semaphore(s.sync.timeline)
             .value(value)
@@ -494,17 +572,18 @@ impl CommandManager {
         // is included only if an acquire is pending; render-done is unsignalled (re-acquired).
         let r = unsafe { s.raw.queue_submit2(*q, &[info], vk::Fence::null()) };
         drop(q);
+        // Staging buffers retire with this submission's timeline value (`doom_tag` == `value`).
+        defer_staging(s, uploads);
         r.map_err(|r| map_vk("vkQueueSubmit2", r))?;
         self.tracker.record_submit(slot);
         s.sync.last_submitted.store(value, Ordering::Release);
         self.slots[slot].open = false;
         self.acquired = false;
-        tracing::trace!(slot, value, "submit");
+        tracing::trace!(slot, value, uploads = upload_count, upload_bytes, "submit");
         Ok(value)
     }
 
-    /// Submit without swapchain semaphores (tests, later headless rendering).
-    #[allow(dead_code)]
+    /// Submit without swapchain semaphores (tests, headless rendering).
     pub(crate) fn submit_unwindowed(&mut self, f: VulkanFinished) -> Result<u64, RhiError> {
         self.submit(f, false, None)
     }
@@ -533,6 +612,12 @@ impl Drop for CommandManager {
     }
 }
 
+fn defer_staging(s: &DeviceShared, uploads: Vec<PendingUpload>) {
+    for u in uploads {
+        s.sync.defer(u.into_doomed());
+    }
+}
+
 // ---------------------------------------------------------------- encoder
 
 /// Recording command encoder; owned and `Send`. Errors surface at [`CommandEncoder::finish`].
@@ -543,6 +628,20 @@ pub struct VulkanCommands {
     epoch: u64,
     epoch_ref: Arc<AtomicU64>,
     st: EncoderState,
+}
+
+impl VulkanCommands {
+    /// Makes a preceding copy visible to host reads (`Readback` destinations).
+    fn host_read_barrier(&self) {
+        let mb = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COPY)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+            .dst_access_mask(vk::AccessFlags2::HOST_READ)];
+        let dep = vk::DependencyInfo::default().memory_barriers(&mb);
+        // SAFETY: open command buffer outside rendering.
+        unsafe { self.shared.raw.cmd_pipeline_barrier2(self.cb, &dep) };
+    }
 }
 
 /// A finished command buffer ready for `Device::submit`.
@@ -575,12 +674,36 @@ impl CommandEncoder for VulkanCommands {
         if self.st.failed() || !self.st.check_outside_rendering("texture_barrier") {
             return;
         }
-        let image = match read(&self.shared.pools.textures).get(t) {
-            Some(tex) => tex.image,
-            None => return self.st.record(stale("texture", t)),
+        let mut pool = write(&self.shared.pools.textures);
+        let Some(tex) = pool.get_mut(t) else {
+            drop(pool);
+            return self.st.record(stale("texture", t));
         };
-        match image_barrier(image, vk::ImageAspectFlags::COLOR, from, to) {
+        let device_owned = tex.owner == TextureOwner::Device;
+        if device_owned && (from == TextureState::Present || to == TextureState::Present) {
+            return self.st.record(RhiError::Unsupported {
+                what: "Present state on a non-swapchain texture".to_owned(),
+            });
+        }
+        let depth = tex.format.is_depth();
+        if (to == TextureState::DepthAttachment && !depth)
+            || (to == TextureState::ColorAttachment && depth)
+        {
+            return self.st.record(invalid(format!(
+                "texture_barrier to {to:?} on a {:?} texture",
+                tex.format
+            )));
+        }
+        match image_barrier(tex.image, aspect_of(tex.format), from, to) {
             Ok(b) => {
+                if device_owned
+                    && let StateCheck::Mismatch { tracked } = check_tracked_state(tex.state, from)
+                {
+                    tracing::warn!(handle = ?t, ?tracked, ?from, "texture_barrier from-state mismatch");
+                }
+                if device_owned {
+                    tex.state = to;
+                }
                 let barriers = [b];
                 let dep = vk::DependencyInfo::default().image_memory_barriers(&barriers);
                 // SAFETY: `cb` is open on this encoder's slot (pool reset this frame, single
@@ -595,11 +718,6 @@ impl CommandEncoder for VulkanCommands {
         if self.st.failed() {
             return;
         }
-        if desc.depth.is_some() {
-            return self.st.record(RhiError::Unsupported {
-                what: "depth attachments (M2)".to_owned(),
-            });
-        }
         if desc.color.is_empty() || desc.color.len() > MAX_COLOR_ATTACHMENTS {
             return self
                 .st
@@ -610,12 +728,19 @@ impl CommandEncoder for VulkanCommands {
         }
         let mut atts = [vk::RenderingAttachmentInfo::default(); MAX_COLOR_ATTACHMENTS];
         let mut formats = [Format::Bgra8Srgb; MAX_COLOR_ATTACHMENTS];
+        let mut depth_att = vk::RenderingAttachmentInfo::default();
+        let mut depth_format = None;
         {
             let tex = read(&self.shared.pools.textures);
             for (i, c) in desc.color.iter().enumerate() {
                 let Some(t) = tex.get(c.texture) else {
                     return self.st.record(stale("texture", c.texture));
                 };
+                if !t.usage.contains(TextureUsage::COLOR_ATTACHMENT) {
+                    return self.st.record(invalid(
+                        "color attachment texture lacks TextureUsage::COLOR_ATTACHMENT",
+                    ));
+                }
                 formats[i] = t.format;
                 atts[i] = vk::RenderingAttachmentInfo::default()
                     .image_view(t.view)
@@ -626,9 +751,31 @@ impl CommandEncoder for VulkanCommands {
                         color: vk::ClearColorValue { float32: c.clear },
                     });
             }
+            if let Some(d) = &desc.depth {
+                let Some(t) = tex.get(d.texture) else {
+                    return self.st.record(stale("texture", d.texture));
+                };
+                if !t.format.is_depth() || !t.usage.contains(TextureUsage::DEPTH_ATTACHMENT) {
+                    return self.st.record(invalid(
+                        "depth attachment needs a depth-format texture with TextureUsage::DEPTH_ATTACHMENT",
+                    ));
+                }
+                depth_format = Some(t.format);
+                depth_att = vk::RenderingAttachmentInfo::default()
+                    .image_view(t.view)
+                    .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                    .load_op(load_op(d.load))
+                    .store_op(store_op(d.store))
+                    .clear_value(vk::ClearValue {
+                        depth_stencil: vk::ClearDepthStencilValue {
+                            depth: d.clear,
+                            stencil: 0,
+                        },
+                    });
+            }
         }
         let n = desc.color.len();
-        if !self.st.begin_rendering(&formats[..n]) {
+        if !self.st.begin_rendering(&formats[..n], depth_format) {
             return;
         }
         let area = vk::Rect2D {
@@ -638,10 +785,13 @@ impl CommandEncoder for VulkanCommands {
                 height: desc.height,
             },
         };
-        let info = vk::RenderingInfo::default()
+        let mut info = vk::RenderingInfo::default()
             .render_area(area)
             .layer_count(1)
             .color_attachments(&atts[..n]);
+        if depth_format.is_some() {
+            info = info.depth_attachment(&depth_att);
+        }
         let vp = vk::Viewport {
             x: 0.0,
             y: 0.0,
@@ -651,7 +801,8 @@ impl CommandEncoder for VulkanCommands {
             max_depth: 1.0,
         };
         // SAFETY: `cb` is open on this encoder's slot; views were resolved under the pool lock
-        // and are owned by live swapchains; `info` and `atts` outlive the call.
+        // and their textures outlive the submission (destroy is deferred); `info`, `atts` and
+        // `depth_att` outlive the call.
         unsafe {
             self.shared.raw.cmd_begin_rendering(self.cb, &info);
             self.shared.raw.cmd_set_viewport(self.cb, 0, &[vp]);
@@ -671,12 +822,28 @@ impl CommandEncoder for VulkanCommands {
         if self.st.failed() {
             return;
         }
-        let (pipeline, formats) = match read(&self.shared.pools.pipelines).get(p) {
-            Some(v) => (v.pipeline, v.color_formats),
+        let (pipeline, formats, depth) = match read(&self.shared.pools.pipelines).get(p) {
+            Some(v) => (v.pipeline, v.color_formats, v.depth_format),
             None => return self.st.record(stale("pipeline", p)),
         };
-        if !self.st.check_pipeline(&formats) {
+        if !self.st.check_pipeline(&formats, depth) {
             return;
+        }
+        if self.st.take_global_unbound() {
+            let b = &self.shared.bindings;
+            // SAFETY: open command buffer; the set and layout live as long as the device. The
+            // set is bound once per command buffer: every pipeline shares the global layout.
+            unsafe {
+                self.shared.raw.cmd_bind_descriptor_sets(
+                    self.cb,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    b.pipeline_layout,
+                    0,
+                    &[b.set],
+                    &[],
+                )
+            };
+            tracing::trace!(target: "rhi_vulkan::bindings", "global descriptor set bound");
         }
         // SAFETY: open command buffer; the pipeline is alive: stale handles are rejected above and
         // a later destroy is deferred past the submission recording it (doom_tag).
@@ -740,6 +907,233 @@ impl CommandEncoder for VulkanCommands {
         };
     }
 
+    fn draw_indexed(
+        &mut self,
+        index_count: u32,
+        instance_count: u32,
+        first_index: u32,
+        vertex_offset: i32,
+        first_instance: u32,
+    ) {
+        if self.st.failed() || !self.st.check_draw_indexed() {
+            return;
+        }
+        // SAFETY: open command buffer inside rendering with a bound pipeline and index buffer
+        // (checked).
+        unsafe {
+            self.shared.raw.cmd_draw_indexed(
+                self.cb,
+                index_count,
+                instance_count,
+                first_index,
+                vertex_offset,
+                first_instance,
+            )
+        };
+    }
+
+    fn bind_index_buffer(&mut self, b: BufferHandle, offset: u64, format: IndexFormat) {
+        if self.st.failed() || !self.st.check_inside_rendering("bind_index_buffer") {
+            return;
+        }
+        let raw = {
+            let pool = read(&self.shared.pools.buffers);
+            let Some(buf) = pool.get(b) else {
+                drop(pool);
+                return self.st.record(stale("buffer", b));
+            };
+            if !buf.usage.contains(BufferUsage::INDEX) {
+                return self
+                    .st
+                    .record(invalid("bind_index_buffer needs BufferUsage::INDEX"));
+            }
+            if let Err(e) = check_index_alignment(offset, buf.size, format) {
+                return self.st.record(e);
+            }
+            buf.raw
+        };
+        let ty = match format {
+            IndexFormat::U16 => vk::IndexType::UINT16,
+            IndexFormat::U32 => vk::IndexType::UINT32,
+        };
+        // SAFETY: open command buffer; the buffer is alive (stale handles rejected above, later
+        // destroy deferred past this submission); offset validated.
+        unsafe {
+            self.shared
+                .raw
+                .cmd_bind_index_buffer(self.cb, raw, offset, ty)
+        };
+        self.st.index_bound = true;
+    }
+
+    fn push_constants(&mut self, offset: u32, data: &[u8]) {
+        if self.st.failed() {
+            return;
+        }
+        if let Err(e) = check_push_constants(offset, data.len()) {
+            return self.st.record(e);
+        }
+        if data.is_empty() {
+            return;
+        }
+        // SAFETY: open command buffer; range validated against the layout's 128 byte block.
+        unsafe {
+            self.shared.raw.cmd_push_constants(
+                self.cb,
+                self.shared.bindings.pipeline_layout,
+                vk::ShaderStageFlags::ALL_GRAPHICS,
+                offset,
+                data,
+            )
+        };
+        tracing::trace!(target: "rhi_vulkan::bindings", offset, bytes = data.len(), "push_constants");
+    }
+
+    fn copy_buffer_to_buffer(
+        &mut self,
+        src: BufferHandle,
+        src_offset: u64,
+        dst: BufferHandle,
+        dst_offset: u64,
+        size: u64,
+    ) {
+        if self.st.failed() || !self.st.check_outside_rendering("copy_buffer_to_buffer") {
+            return;
+        }
+        let (sraw, draw, host_read) = {
+            let pool = read(&self.shared.pools.buffers);
+            let Some(sb) = pool.get(src) else {
+                drop(pool);
+                return self.st.record(stale("buffer", src));
+            };
+            let Some(db) = pool.get(dst) else {
+                drop(pool);
+                return self.st.record(stale("buffer", dst));
+            };
+            if !sb.usage.contains(BufferUsage::TRANSFER_SRC) {
+                return self.st.record(invalid(
+                    "copy_buffer_to_buffer: source needs BufferUsage::TRANSFER_SRC",
+                ));
+            }
+            if !db.usage.contains(BufferUsage::TRANSFER_DST) {
+                return self.st.record(invalid(
+                    "copy_buffer_to_buffer: destination needs BufferUsage::TRANSFER_DST",
+                ));
+            }
+            for r in [
+                check_range("copy_buffer_to_buffer source", src_offset, size, sb.size),
+                check_range(
+                    "copy_buffer_to_buffer destination",
+                    dst_offset,
+                    size,
+                    db.size,
+                ),
+            ] {
+                if let Err(e) = r {
+                    return self.st.record(e);
+                }
+            }
+            if src == dst && src_offset < dst_offset + size && dst_offset < src_offset + size {
+                return self.st.record(invalid(
+                    "copy_buffer_to_buffer: overlapping ranges in the same buffer",
+                ));
+            }
+            (sb.raw, db.raw, db.memory == Memory::Readback)
+        };
+        if size == 0 {
+            return;
+        }
+        let region = [vk::BufferCopy2::default()
+            .src_offset(src_offset)
+            .dst_offset(dst_offset)
+            .size(size)];
+        let info = vk::CopyBufferInfo2::default()
+            .src_buffer(sraw)
+            .dst_buffer(draw)
+            .regions(&region);
+        // SAFETY: open command buffer outside rendering; buffers alive (see bind_index_buffer);
+        // usages and ranges validated.
+        unsafe { self.shared.raw.cmd_copy_buffer2(self.cb, &info) };
+        if host_read {
+            self.host_read_barrier();
+        }
+    }
+
+    fn copy_texture_to_buffer(&mut self, t: TextureHandle, dst: BufferHandle, dst_offset: u64) {
+        if self.st.failed() || !self.st.check_outside_rendering("copy_texture_to_buffer") {
+            return;
+        }
+        let (image, extent, bytes, tracked) = {
+            let pool = read(&self.shared.pools.textures);
+            let Some(tex) = pool.get(t) else {
+                drop(pool);
+                return self.st.record(stale("texture", t));
+            };
+            if tex.owner != TextureOwner::Device
+                || !tex.usage.contains(TextureUsage::TRANSFER_SRC)
+                || tex.format.is_depth()
+            {
+                return self.st.record(invalid(
+                    "copy_texture_to_buffer needs a device-owned color texture with TextureUsage::TRANSFER_SRC",
+                ));
+            }
+            let bytes = u64::from(tex.width)
+                * u64::from(tex.height)
+                * u64::from(tex.format.bytes_per_texel());
+            (tex.image, (tex.width, tex.height), bytes, tex.state)
+        };
+        let (draw, host_read) = {
+            let pool = read(&self.shared.pools.buffers);
+            let Some(db) = pool.get(dst) else {
+                drop(pool);
+                return self.st.record(stale("buffer", dst));
+            };
+            if !db.usage.contains(BufferUsage::TRANSFER_DST) {
+                return self.st.record(invalid(
+                    "copy_texture_to_buffer: destination needs BufferUsage::TRANSFER_DST",
+                ));
+            }
+            if let Err(e) = check_range("copy_texture_to_buffer", dst_offset, bytes, db.size) {
+                return self.st.record(e);
+            }
+            (db.raw, db.memory == Memory::Readback)
+        };
+        if tracked != TextureState::TransferSrc {
+            tracing::warn!(handle = ?t, ?tracked, "copy_texture_to_buffer from a texture not tracked as TransferSrc");
+        }
+        let region = [vk::BufferImageCopy {
+            buffer_offset: dst_offset,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::Offset3D::default(),
+            image_extent: vk::Extent3D {
+                width: extent.0,
+                height: extent.1,
+                depth: 1,
+            },
+        }];
+        // SAFETY: open command buffer outside rendering; image and buffer alive; the caller put
+        // the image in TRANSFER_SRC_OPTIMAL with texture_barrier (advisory, warned above).
+        unsafe {
+            self.shared.raw.cmd_copy_image_to_buffer(
+                self.cb,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                draw,
+                &region,
+            )
+        };
+        if host_read {
+            self.host_read_barrier();
+        }
+    }
+
     fn begin_label(&mut self, name: &str, color: [f32; 4]) {
         self.st.push_label();
         if self.st.failed() {
@@ -798,8 +1192,20 @@ pub(crate) struct VkShaderModule {
 
 pub(crate) struct VkPipeline {
     pub pipeline: vk::Pipeline,
-    pub layout: vk::PipelineLayout,
     pub color_formats: [Option<Format>; MAX_COLOR_ATTACHMENTS],
+    pub depth_format: Option<Format>,
+}
+
+/// Depth/stencil state for a pipeline (MODULE-007 §6.4): off without a depth format, otherwise
+/// test + write with `LESS`.
+pub(crate) fn depth_state(
+    depth_format: Option<Format>,
+) -> vk::PipelineDepthStencilStateCreateInfo<'static> {
+    let on = depth_format.is_some();
+    vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(on)
+        .depth_write_enable(on)
+        .depth_compare_op(vk::CompareOp::LESS)
 }
 
 pub(crate) fn check_spirv(words: &[u32]) -> Result<(), RhiError> {
@@ -813,10 +1219,15 @@ pub(crate) fn check_spirv(words: &[u32]) -> Result<(), RhiError> {
 pub(crate) fn validate_pipeline_desc(
     desc: &GraphicsPipelineDesc,
 ) -> Result<(CString, CString), RhiError> {
-    if desc.depth_format.is_some() {
-        return Err(RhiError::Unsupported {
-            what: "depth attachments (M2)".to_owned(),
-        });
+    if let Some(f) = desc.depth_format
+        && f != Format::D32Sfloat
+    {
+        return Err(invalid(format!(
+            "pipeline depth format must be D32Sfloat, got {f:?}"
+        )));
+    }
+    if desc.color_formats.iter().any(|f| f.is_depth()) {
+        return Err(invalid("a depth format is not a color target format"));
     }
     let n = desc.color_formats.len();
     if n == 0 || n > MAX_COLOR_ATTACHMENTS {
@@ -941,15 +1352,13 @@ pub(crate) fn create_graphics_pipeline(
     let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blends);
     let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
+    let depth_stencil = depth_state(desc.depth_format);
     let mut rendering =
         vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&vk_formats);
-
-    // SAFETY: plain creation of an empty layout on a live device.
-    let layout = unsafe {
-        s.raw
-            .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)
+    if let Some(d) = desc.depth_format {
+        rendering = rendering.depth_attachment_format(rhi_to_vk_format(d));
     }
-    .map_err(|r| map_vk("vkCreatePipelineLayout", r))?;
+    let layout = s.bindings.pipeline_layout;
     let ci = vk::GraphicsPipelineCreateInfo::default()
         .stages(&stages)
         .vertex_input_state(&vertex_input)
@@ -957,6 +1366,7 @@ pub(crate) fn create_graphics_pipeline(
         .viewport_state(&viewport)
         .rasterization_state(&raster)
         .multisample_state(&ms)
+        .depth_stencil_state(&depth_stencil)
         .color_blend_state(&blend)
         .dynamic_state(&dynamic)
         .layout(layout)
@@ -969,12 +1379,11 @@ pub(crate) fn create_graphics_pipeline(
     } {
         Ok(v) => v[0],
         Err((made, r)) => {
-            // SAFETY: partially created pipelines and the layout are owned here and unused.
+            // SAFETY: partially created pipelines are owned here and unused.
             unsafe {
                 for p in made.into_iter().filter(|p| *p != vk::Pipeline::null()) {
                     s.raw.destroy_pipeline(p, None);
                 }
-                s.raw.destroy_pipeline_layout(layout, None);
             }
             return Err(map_vk("vkCreateGraphicsPipelines", r));
         }
@@ -985,15 +1394,14 @@ pub(crate) fn create_graphics_pipeline(
     }
     let h = write(&s.pools.pipelines).insert(VkPipeline {
         pipeline,
-        layout,
         color_formats,
+        depth_format: desc.depth_format,
     });
     let name = desc
         .label
         .map_or_else(|| generated_name("pipeline", h), str::to_owned);
     s.set_name(pipeline, &name);
-    s.set_name(layout, &format!("{name}.layout"));
-    tracing::debug!(handle = ?h, label = %name, color_formats = ?desc.color_formats, topology = ?desc.topology, "pipeline created");
+    tracing::debug!(handle = ?h, label = %name, color_formats = ?desc.color_formats, depth_format = ?desc.depth_format, topology = ?desc.topology, "pipeline created");
     Ok(h)
 }
 
@@ -1012,7 +1420,6 @@ pub(crate) fn destroy_pipeline(s: &DeviceShared, h: PipelineHandle) {
         Some(p) => {
             s.sync.defer(Doomed::Pipeline {
                 pipeline: p.pipeline,
-                layout: p.layout,
             });
             tracing::debug!(handle = ?h, "pipeline destroy deferred");
         }
@@ -1031,13 +1438,14 @@ mod tests {
     use super::*;
     use vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as S};
 
-    const ALL: [TextureState; 6] = [
+    const ALL: [TextureState; 7] = [
         TextureState::Undefined,
         TextureState::ColorAttachment,
         TextureState::Present,
         TextureState::ShaderRead,
         TextureState::TransferDst,
         TextureState::TransferSrc,
+        TextureState::DepthAttachment,
     ];
 
     #[test]
@@ -1058,12 +1466,120 @@ mod tests {
         assert_eq!(t.next_value(), 3);
     }
 
+    fn is_depth_shader_pair(a: TextureState, b: TextureState) -> bool {
+        use TextureState::{DepthAttachment, ShaderRead};
+        matches!(
+            (a, b),
+            (DepthAttachment, ShaderRead) | (ShaderRead, DepthAttachment)
+        )
+    }
+
+    #[test]
+    fn state_pair_mapping() {
+        let b = image_barrier(
+            vk::Image::null(),
+            vk::ImageAspectFlags::DEPTH,
+            TextureState::Undefined,
+            TextureState::DepthAttachment,
+        )
+        .unwrap();
+        assert_eq!(b.new_layout, L::DEPTH_ATTACHMENT_OPTIMAL);
+        assert_eq!(b.subresource_range.aspect_mask, vk::ImageAspectFlags::DEPTH);
+        assert!(
+            b.dst_stage_mask
+                .contains(S::EARLY_FRAGMENT_TESTS | S::LATE_FRAGMENT_TESTS)
+        );
+        assert!(
+            b.dst_access_mask
+                .contains(A::DEPTH_STENCIL_ATTACHMENT_WRITE)
+        );
+        for (a, c) in [
+            (TextureState::DepthAttachment, TextureState::ShaderRead),
+            (TextureState::ShaderRead, TextureState::DepthAttachment),
+        ] {
+            assert!(matches!(
+                image_barrier(vk::Image::null(), vk::ImageAspectFlags::DEPTH, a, c),
+                Err(RhiError::Unsupported { .. })
+            ));
+        }
+        let up = image_barrier(
+            vk::Image::null(),
+            vk::ImageAspectFlags::COLOR,
+            TextureState::Undefined,
+            TextureState::TransferDst,
+        )
+        .unwrap();
+        assert_eq!(up.old_layout, L::UNDEFINED);
+        assert_eq!(up.dst_access_mask, A::TRANSFER_WRITE);
+        let done = image_barrier(
+            vk::Image::null(),
+            vk::ImageAspectFlags::COLOR,
+            TextureState::TransferDst,
+            TextureState::ShaderRead,
+        )
+        .unwrap();
+        assert_eq!(done.src_access_mask, A::TRANSFER_WRITE);
+        assert_eq!(done.dst_access_mask, A::SHADER_SAMPLED_READ);
+        assert_eq!(done.new_layout, L::SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    #[test]
+    fn depth_state_mapping() {
+        let off = depth_state(None);
+        assert_eq!(
+            (off.depth_test_enable, off.depth_write_enable),
+            (vk::FALSE, vk::FALSE)
+        );
+        let on = depth_state(Some(Format::D32Sfloat));
+        assert_eq!(
+            (on.depth_test_enable, on.depth_write_enable),
+            (vk::TRUE, vk::TRUE)
+        );
+        assert_eq!(on.depth_compare_op, vk::CompareOp::LESS);
+        assert_eq!(on.stencil_test_enable, vk::FALSE);
+    }
+
+    #[test]
+    fn encoder_depth_and_index_checks() {
+        let mut s = EncoderState::default();
+        s.begin_rendering(&[Format::Bgra8Srgb], Some(Format::D32Sfloat));
+        let mut p = [None; MAX_COLOR_ATTACHMENTS];
+        p[0] = Some(Format::Bgra8Srgb);
+        assert!(!s.check_pipeline(&p, None));
+        assert!(is_invalid(s.finish()));
+
+        let mut s = EncoderState::default();
+        s.begin_rendering(&[Format::Bgra8Srgb], None);
+        assert!(!s.check_pipeline(&p, Some(Format::D32Sfloat)));
+        assert!(is_invalid(s.finish()));
+
+        let mut s = EncoderState::default();
+        s.begin_rendering(&[Format::Bgra8Srgb], Some(Format::D32Sfloat));
+        assert!(s.check_pipeline(&p, Some(Format::D32Sfloat)));
+        assert!(!s.check_draw_indexed()); // no index buffer
+        assert!(is_invalid(s.finish()));
+
+        let mut s = EncoderState::default();
+        assert!(s.take_global_unbound());
+        assert!(!s.take_global_unbound());
+        s.begin_rendering(&[Format::Bgra8Srgb], None);
+        s.check_pipeline(&p, None);
+        s.index_bound = true;
+        assert!(s.check_draw_indexed());
+        s.end_rendering();
+        assert!(s.finish().is_ok());
+    }
+
     #[test]
     fn barrier_table_total_and_rules() {
         for from in ALL {
             for to in &ALL[1..] {
-                let b = image_barrier(vk::Image::null(), vk::ImageAspectFlags::COLOR, from, *to)
-                    .unwrap();
+                let Ok(b) =
+                    image_barrier(vk::Image::null(), vk::ImageAspectFlags::COLOR, from, *to)
+                else {
+                    assert!(is_depth_shader_pair(from, *to));
+                    continue;
+                };
                 assert_eq!(b.old_layout, state_as_source(from).layout);
                 assert_eq!(b.new_layout, state_as_destination(*to).unwrap().layout);
                 assert!(
@@ -1142,18 +1658,18 @@ mod tests {
         assert!(is_invalid(s.finish()));
 
         let mut s = EncoderState::default();
-        assert!(s.begin_rendering(&[Format::Bgra8Srgb]));
-        assert!(!s.begin_rendering(&[Format::Bgra8Srgb]));
+        assert!(s.begin_rendering(&[Format::Bgra8Srgb], None));
+        assert!(!s.begin_rendering(&[Format::Bgra8Srgb], None));
         assert!(is_invalid(s.finish()));
 
         let mut s = EncoderState::default();
         assert!(!s.check_draw());
-        assert!(s.begin_rendering(&[Format::Bgra8Srgb]));
+        assert!(s.begin_rendering(&[Format::Bgra8Srgb], None));
         assert!(s.end_rendering());
         assert!(is_invalid(s.finish())); // first error (draw outside) wins
 
         let mut s = EncoderState::default();
-        assert!(s.begin_rendering(&[Format::Bgra8Srgb]));
+        assert!(s.begin_rendering(&[Format::Bgra8Srgb], None));
         assert!(is_invalid(s.finish())); // unbalanced rendering
 
         let mut s = EncoderState::default();
@@ -1165,15 +1681,15 @@ mod tests {
     #[test]
     fn encoder_pipeline_format_and_labels() {
         let mut s = EncoderState::default();
-        s.begin_rendering(&[Format::Rgba8Unorm]);
+        s.begin_rendering(&[Format::Rgba8Unorm], None);
         let mut p = [None; MAX_COLOR_ATTACHMENTS];
         p[0] = Some(Format::Bgra8Srgb);
-        assert!(!s.check_pipeline(&p));
+        assert!(!s.check_pipeline(&p, None));
         assert!(is_invalid(s.finish()));
 
         let mut s = EncoderState::default();
-        s.begin_rendering(&[Format::Bgra8Srgb]);
-        assert!(s.check_pipeline(&p));
+        s.begin_rendering(&[Format::Bgra8Srgb], None);
+        assert!(s.check_pipeline(&p, None));
         assert!(s.check_draw());
         s.end_rendering();
         s.push_label();
@@ -1230,9 +1746,11 @@ mod tests {
         ));
         d.blend = &[];
         d.depth_format = Some(Format::D32Sfloat);
+        assert!(validate_pipeline_desc(&d).is_ok());
+        d.depth_format = Some(Format::Rgba8Unorm);
         assert!(matches!(
             validate_pipeline_desc(&d),
-            Err(RhiError::Unsupported { .. })
+            Err(RhiError::InvalidDescriptor(_))
         ));
         d.depth_format = None;
         d.vertex = mk("ma\0in");

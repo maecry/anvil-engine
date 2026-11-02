@@ -6,19 +6,26 @@ use std::time::Instant;
 
 use ash::vk;
 use ash::{ext, khr};
+use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc};
 use rhi::{
-    Acquire, DEFAULT_FRAMES_IN_FLIGHT, DeviceDesc, DeviceDiagnostics, DeviceInfo, Format,
-    FrameToken, GpuKind, GraphicsPipelineDesc, LiveObjects, PipelineHandle, PipelineTag,
-    PresentStatus, RhiError, ShaderModuleDesc, ShaderModuleHandle, ShaderModuleTag, SwapchainDesc,
-    SwapchainHandle, SwapchainImage, SwapchainTag, TextureTag,
+    Acquire, BufferDesc, BufferHandle, BufferTag, DEFAULT_FRAMES_IN_FLIGHT, DeviceDesc,
+    DeviceDiagnostics, DeviceInfo, Format, FrameToken, GpuKind, GraphicsPipelineDesc, LiveObjects,
+    MemoryDiagnostics, PipelineHandle, PipelineTag, PresentStatus, RhiError, SamplerDesc,
+    SamplerHandle, SamplerTag, ShaderModuleDesc, ShaderModuleHandle, ShaderModuleTag,
+    SwapchainDesc, SwapchainHandle, SwapchainImage, SwapchainTag, TextureDesc, TextureHandle,
+    TextureTag,
 };
 
+use crate::bindings::{BindlessLimits, GlobalBindings};
+use crate::buffer::{self, VkBuffer};
 use crate::commands::{CommandManager, VkPipeline, VkShaderModule, VulkanCommands, VulkanFinished};
-use crate::destroy::{DeferredQueue, Doomed, destroy_doomed};
+use crate::destroy::{DeferredQueue, Doomed, drain_all};
 use crate::error::{invalid, map_vk};
 use crate::instance::InstanceShared;
 use crate::registry::Registry;
-use crate::swapchain::{self, VkSwapchain, VkTexture, VulkanSurface};
+use crate::swapchain::{self, VkSwapchain, VulkanSurface};
+use crate::texture::{self, VkSampler, VkTexture};
+use crate::upload::PendingUpload;
 use crate::{lock, read, write};
 
 // ---------------------------------------------------------------- selection (pure)
@@ -45,6 +52,17 @@ pub(crate) struct PhysicalDeviceFacts {
     pub dynamic_rendering: bool,
     pub synchronization2: bool,
     pub timeline_semaphore: bool,
+    pub buffer_device_address: bool,
+    pub runtime_descriptor_array: bool,
+    pub shader_sampled_image_array_non_uniform_indexing: bool,
+    pub descriptor_binding_sampled_image_update_after_bind: bool,
+    pub descriptor_binding_partially_bound: bool,
+    /// `L_img` of MODULE-007 §6.3.
+    pub bindless_sampled_images: u32,
+    /// `L_smp` of MODULE-007 §6.3.
+    pub bindless_samplers: u32,
+    pub max_image_dimension_2d: u32,
+    pub non_coherent_atom_size: u64,
     pub queue_families: Vec<QueueFamilyFacts>,
     pub max_device_local_heap: u64,
     pub surface: Option<SurfaceFacts>,
@@ -55,6 +73,7 @@ pub(crate) enum Rejection {
     ApiVersion { found: u32 },
     MissingFeature(&'static str),
     MissingExtension(&'static str),
+    BindlessLimits { images: u32, samplers: u32 },
     NoGraphicsQueue,
     NoPresentSupport,
     SurfaceUnusable,
@@ -71,12 +90,19 @@ impl std::fmt::Display for Rejection {
             ),
             Self::MissingFeature(n) => write!(f, "missing feature {n}"),
             Self::MissingExtension(n) => write!(f, "missing extension {n}"),
+            Self::BindlessLimits { images, samplers } => write!(
+                f,
+                "bindless limits too small (sampled images {images} < 1024 or samplers {samplers} < 64)"
+            ),
             Self::NoGraphicsQueue => f.write_str("no graphics queue family"),
             Self::NoPresentSupport => f.write_str("no graphics queue family can present"),
             Self::SurfaceUnusable => f.write_str("surface has no formats or present modes"),
         }
     }
 }
+
+const MIN_BINDLESS_IMAGES: u32 = 1024;
+const MIN_BINDLESS_SAMPLERS: u32 = 64;
 
 pub(crate) fn evaluate(f: &PhysicalDeviceFacts) -> Result<u32, Rejection> {
     if f.api_version < vk::API_VERSION_1_3 {
@@ -92,6 +118,34 @@ pub(crate) fn evaluate(f: &PhysicalDeviceFacts) -> Result<u32, Rejection> {
     }
     if !f.timeline_semaphore {
         return Err(Rejection::MissingFeature("timelineSemaphore"));
+    }
+    for (ok, name) in [
+        (f.buffer_device_address, "bufferDeviceAddress"),
+        (f.runtime_descriptor_array, "runtimeDescriptorArray"),
+        (
+            f.shader_sampled_image_array_non_uniform_indexing,
+            "shaderSampledImageArrayNonUniformIndexing",
+        ),
+        (
+            f.descriptor_binding_sampled_image_update_after_bind,
+            "descriptorBindingSampledImageUpdateAfterBind",
+        ),
+        (
+            f.descriptor_binding_partially_bound,
+            "descriptorBindingPartiallyBound",
+        ),
+    ] {
+        if !ok {
+            return Err(Rejection::MissingFeature(name));
+        }
+    }
+    if f.bindless_sampled_images < MIN_BINDLESS_IMAGES
+        || f.bindless_samplers < MIN_BINDLESS_SAMPLERS
+    {
+        return Err(Rejection::BindlessLimits {
+            images: f.bindless_sampled_images,
+            samplers: f.bindless_samplers,
+        });
     }
     if !f.extensions.iter().any(|e| e == "VK_KHR_swapchain") {
         return Err(Rejection::MissingExtension("VK_KHR_swapchain"));
@@ -226,6 +280,14 @@ pub(crate) struct Pools {
     pub shader_modules: RwLock<Registry<ShaderModuleTag, VkShaderModule>>,
     pub pipelines: RwLock<Registry<PipelineTag, VkPipeline>>,
     pub swapchains: Mutex<Registry<SwapchainTag, VkSwapchain>>,
+    pub buffers: RwLock<Registry<BufferTag, VkBuffer>>,
+    pub samplers: Mutex<Registry<SamplerTag, VkSampler>>,
+}
+
+/// Device limits the resource code needs.
+pub(crate) struct DeviceLimits {
+    pub max_image_dimension_2d: u32,
+    pub non_coherent_atom: u64,
 }
 
 pub(crate) struct SyncShared {
@@ -257,6 +319,12 @@ pub(crate) struct DeviceShared {
     pub pools: Pools,
     pub pipeline_cache: vk::PipelineCache,
     pub sync: SyncShared,
+    pub bindings: GlobalBindings,
+    pub limits: DeviceLimits,
+    /// Bytes of live (not yet retired) allocations.
+    pub allocated_bytes: AtomicU64,
+    /// Uploads waiting for the next submit (MODULE-005 lead amendment).
+    pub pending_uploads: Mutex<Vec<PendingUpload>>,
     // Declared last so it drops after `Drop::drop` destroyed the device.
     pub instance: Arc<InstanceShared>,
 }
@@ -275,6 +343,57 @@ impl DeviceShared {
         let _ = unsafe { du.set_debug_utils_object_name(&info) };
     }
 
+    /// Allocates memory and accounts for it. Lock order: `pools` -> `allocator`.
+    pub(crate) fn alloc(&self, desc: &AllocationCreateDesc) -> Result<Allocation, RhiError> {
+        let mut g = lock(&self.allocator);
+        let Some(a) = g.as_mut() else {
+            return Err(invalid("allocation after device shutdown"));
+        };
+        match a.allocate(desc) {
+            Ok(alloc) => {
+                self.allocated_bytes
+                    .fetch_add(alloc.size(), Ordering::Relaxed);
+                tracing::trace!(target: "rhi_vulkan::buffer", name = desc.name, bytes = alloc.size(), "memory allocated");
+                Ok(alloc)
+            }
+            Err(e) => {
+                tracing::warn!(target: "rhi_vulkan::buffer", variant = ?e, name = desc.name, size = desc.requirements.size, location = ?desc.location, "allocation failed");
+                Err(match e {
+                    gpu_allocator::AllocationError::OutOfMemory => RhiError::OutOfDeviceMemory,
+                    _ => RhiError::Backend {
+                        op: "gpu_allocator",
+                        code: -1,
+                    },
+                })
+            }
+        }
+    }
+
+    /// Returns memory to the allocator.
+    pub(crate) fn free(&self, a: Allocation) {
+        let size = a.size();
+        match lock(&self.allocator).as_mut() {
+            Some(al) => {
+                if let Err(e) = al.free(a) {
+                    tracing::warn!(target: "rhi_vulkan::buffer", error = ?e, "allocation free failed");
+                }
+            }
+            None => {
+                tracing::warn!(target: "rhi_vulkan::buffer", "allocation freed after allocator shutdown")
+            }
+        }
+        self.allocated_bytes.fetch_sub(size, Ordering::Relaxed);
+    }
+
+    /// Destroys staging buffers of uploads that never reached a submit.
+    pub(crate) fn drop_pending_uploads(&self) {
+        let pending = std::mem::take(&mut *lock(&self.pending_uploads));
+        for u in pending {
+            // SAFETY: the buffer was never submitted; destroyed exactly once.
+            unsafe { crate::destroy::destroy_doomed(self, u.into_doomed()) };
+        }
+    }
+
     pub(crate) fn wait_idle(&self) -> Result<(), RhiError> {
         let q = lock(&self.queue);
         // SAFETY: queue mutex held (vkDeviceWaitIdle needs all queues externally synchronized).
@@ -287,17 +406,15 @@ impl DeviceShared {
 impl Drop for DeviceShared {
     fn drop(&mut self) {
         let _ = self.wait_idle();
-        let mut q = lock(&self.sync.deferred);
-        while let Some(d) = q.pop_any() {
-            // SAFETY: device is idle (above); entries popped exactly once.
-            unsafe { destroy_doomed(&self.raw, d) };
-        }
-        drop(q);
+        self.drop_pending_uploads();
+        drain_all(self);
         // The allocator must drop before the device (ADR-0007).
         lock(&self.allocator).take();
         // SAFETY: all children are destroyed (shutdown order) and the device is idle; the
-        // timeline and cache are destroyed exactly once, immediately before the device.
+        // global bindings, timeline and cache are destroyed exactly once, immediately before
+        // the device.
         unsafe {
+            self.bindings.destroy(&self.raw);
             self.raw.destroy_semaphore(self.sync.timeline, None);
             self.raw.destroy_pipeline_cache(self.pipeline_cache, None);
             self.raw.destroy_device(None);
@@ -399,6 +516,23 @@ fn gather_facts(
         dynamic_rendering: f13.dynamic_rendering == vk::TRUE,
         synchronization2: f13.synchronization2 == vk::TRUE,
         timeline_semaphore: f12.timeline_semaphore == vk::TRUE,
+        buffer_device_address: f12.buffer_device_address == vk::TRUE,
+        runtime_descriptor_array: f12.runtime_descriptor_array == vk::TRUE,
+        shader_sampled_image_array_non_uniform_indexing: f12
+            .shader_sampled_image_array_non_uniform_indexing
+            == vk::TRUE,
+        descriptor_binding_sampled_image_update_after_bind: f12
+            .descriptor_binding_sampled_image_update_after_bind
+            == vk::TRUE,
+        descriptor_binding_partially_bound: f12.descriptor_binding_partially_bound == vk::TRUE,
+        bindless_sampled_images: p12
+            .max_per_stage_descriptor_update_after_bind_sampled_images
+            .min(p12.max_descriptor_set_update_after_bind_sampled_images),
+        bindless_samplers: p12
+            .max_per_stage_descriptor_update_after_bind_samplers
+            .min(p12.max_descriptor_set_update_after_bind_samplers),
+        max_image_dimension_2d: props.limits.max_image_dimension2_d,
+        non_coherent_atom_size: props.limits.non_coherent_atom_size,
         queue_families,
         max_device_local_heap: max_heap,
         surface: surface_facts,
@@ -409,6 +543,16 @@ pub(crate) fn create_device(
     inst: &Arc<InstanceShared>,
     desc: &DeviceDesc,
     surface: Option<&VulkanSurface>,
+) -> Result<VulkanDevice, RhiError> {
+    create_device_with(inst, desc, surface, None)
+}
+
+/// `bindless_override` lowers the bindless capacities (tests only).
+pub(crate) fn create_device_with(
+    inst: &Arc<InstanceShared>,
+    desc: &DeviceDesc,
+    surface: Option<&VulkanSurface>,
+    bindless_override: Option<BindlessLimits>,
 ) -> Result<VulkanDevice, RhiError> {
     let started = Instant::now();
     check_frames_in_flight(desc.frames_in_flight)?;
@@ -451,7 +595,13 @@ pub(crate) fn create_device(
         .queue_family_index(sel.queue_family)
         .queue_priorities(&priorities)];
     let ext_names = [khr::swapchain::NAME.as_ptr()];
-    let mut f12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
+    let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
+        .timeline_semaphore(true)
+        .buffer_device_address(true)
+        .runtime_descriptor_array(true)
+        .shader_sampled_image_array_non_uniform_indexing(true)
+        .descriptor_binding_sampled_image_update_after_bind(true)
+        .descriptor_binding_partially_bound(true);
     let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
         .dynamic_rendering(true)
         .synchronization2(true);
@@ -464,6 +614,17 @@ pub(crate) fn create_device(
     let raw = unsafe { inst.raw.create_device(pd, &ci, None) }
         .map_err(|r| map_vk("vkCreateDevice", r))?;
 
+    let limits = bindless_override.unwrap_or_else(|| {
+        BindlessLimits::from_device(f.bindless_sampled_images, f.bindless_samplers)
+    });
+    let bindings = match GlobalBindings::new(&raw, limits) {
+        Ok(b) => b,
+        Err(e) => {
+            // SAFETY: no children exist yet.
+            unsafe { raw.destroy_device(None) };
+            return Err(e);
+        }
+    };
     let mut tl_type = vk::SemaphoreTypeCreateInfo::default()
         .semaphore_type(vk::SemaphoreType::TIMELINE)
         .initial_value(0);
@@ -472,8 +633,11 @@ pub(crate) fn create_device(
     let timeline = match unsafe { raw.create_semaphore(&tl_ci, None) } {
         Ok(s) => s,
         Err(r) => {
-            // SAFETY: no children exist.
-            unsafe { raw.destroy_device(None) };
+            // SAFETY: only the global bindings exist besides the device.
+            unsafe {
+                bindings.destroy(&raw);
+                raw.destroy_device(None);
+            }
             return Err(map_vk("vkCreateSemaphore", r));
         }
     };
@@ -482,8 +646,9 @@ pub(crate) fn create_device(
         match unsafe { raw.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) } {
             Ok(c) => c,
             Err(r) => {
-                // SAFETY: only the timeline exists besides the device.
+                // SAFETY: only the timeline and bindings exist besides the device.
                 unsafe {
+                    bindings.destroy(&raw);
                     raw.destroy_semaphore(timeline, None);
                     raw.destroy_device(None);
                 }
@@ -509,8 +674,17 @@ pub(crate) fn create_device(
             shader_modules: RwLock::new(Registry::new(|| ShaderModuleTag)),
             pipelines: RwLock::new(Registry::new(|| PipelineTag)),
             swapchains: Mutex::new(Registry::new(|| SwapchainTag)),
+            buffers: RwLock::new(Registry::new(|| BufferTag)),
+            samplers: Mutex::new(Registry::new(|| SamplerTag)),
         },
         pipeline_cache: cache,
+        bindings,
+        limits: DeviceLimits {
+            max_image_dimension_2d: f.max_image_dimension_2d,
+            non_coherent_atom: f.non_coherent_atom_size,
+        },
+        allocated_bytes: AtomicU64::new(0),
+        pending_uploads: Mutex::new(Vec::new()),
         sync: SyncShared {
             timeline,
             last_submitted: AtomicU64::new(0),
@@ -523,6 +697,12 @@ pub(crate) fn create_device(
     shared.set_name(queue, "graphics queue");
     shared.set_name(timeline, "graphics timeline");
     shared.set_name(cache, "pipeline cache");
+    shared.set_name(shared.bindings.set_layout, "global-bindings.set_layout");
+    shared.set_name(
+        shared.bindings.pipeline_layout,
+        "global-bindings.pipeline_layout",
+    );
+    shared.set_name(shared.bindings.set, "global-bindings.set");
 
     let allocator =
         gpu_allocator::vulkan::Allocator::new(&gpu_allocator::vulkan::AllocatorCreateDesc {
@@ -530,7 +710,7 @@ pub(crate) fn create_device(
             device: shared.raw.clone(),
             physical_device: pd,
             debug_settings: Default::default(),
-            buffer_device_address: false,
+            buffer_device_address: true,
             allocation_sizes: Default::default(),
         })
         .map_err(|e| match e {
@@ -579,13 +759,8 @@ impl VulkanDevice {
         self.shut = true;
         let s = &self.shared;
         let idle = s.wait_idle();
-        {
-            let mut q = lock(&s.sync.deferred);
-            while let Some(d) = q.pop_any() {
-                // SAFETY: device idle (or lost); entries popped exactly once.
-                unsafe { destroy_doomed(&s.raw, d) };
-            }
-        }
+        s.drop_pending_uploads();
+        drain_all(s);
         let pipelines = {
             let mut p = write(&s.pools.pipelines);
             let hs = p.handles();
@@ -597,11 +772,10 @@ impl VulkanDevice {
             tracing::warn!(handle = ?h, "leaked pipeline destroyed at shutdown");
             // SAFETY: device idle; removed from the pool so destroyed once.
             unsafe {
-                destroy_doomed(
-                    &s.raw,
+                crate::destroy::destroy_doomed(
+                    s,
                     Doomed::Pipeline {
                         pipeline: p.pipeline,
-                        layout: p.layout,
                     },
                 )
             };
@@ -616,8 +790,10 @@ impl VulkanDevice {
         for (h, m) in modules {
             tracing::warn!(handle = ?h, "leaked shader module destroyed at shutdown");
             // SAFETY: as above.
-            unsafe { destroy_doomed(&s.raw, Doomed::ShaderModule(m.raw)) };
+            unsafe { crate::destroy::destroy_doomed(s, Doomed::ShaderModule(m.raw)) };
         }
+        buffer::destroy_leaked(s);
+        texture::destroy_leaked(s);
         let scs = lock(&s.pools.swapchains).handles();
         for h in scs {
             tracing::warn!(handle = ?h, "leaked swapchain destroyed at shutdown");
@@ -627,6 +803,16 @@ impl VulkanDevice {
         lock(&s.allocator).take();
         tracing::debug!(device = %s.info.name, "device shutdown");
         idle
+    }
+
+    /// Submits finished commands without swapchain semaphores (headless rendering, tests).
+    /// Returns the timeline value the submission signals.
+    ///
+    /// # Errors
+    /// As [`rhi::Device::submit`], except no acquired image is required.
+    pub fn submit_unwindowed(&mut self, cmds: VulkanFinished) -> Result<u64, RhiError> {
+        self.shared.instance.check_validation_panic();
+        self.frames.submit_unwindowed(cmds)
     }
 
     fn frame_span(&self) -> tracing::Span {
@@ -661,7 +847,10 @@ impl rhi::Device for VulkanDevice {
             textures: read(&s.pools.textures).len(),
             shader_modules: read(&s.pools.shader_modules).len(),
             pipelines: read(&s.pools.pipelines).len(),
+            buffers: read(&s.pools.buffers).len(),
+            samplers: lock(&s.pools.samplers).len(),
         };
+        let reserved_bytes = lock(&s.allocator).as_ref().map_or(0, |a| a.capacity());
         let pending_destroys = lock(&s.sync.deferred).len();
         DeviceDiagnostics {
             info: s.info.clone(),
@@ -672,7 +861,64 @@ impl rhi::Device for VulkanDevice {
             pending_destroys,
             swapchains: swapchain::diagnostics(s),
             validation: s.instance.counts(),
+            memory: MemoryDiagnostics {
+                allocated_bytes: s.allocated_bytes.load(Ordering::Relaxed),
+                reserved_bytes,
+            },
+            bindless: s.bindings.diagnostics(),
         }
+    }
+
+    fn create_buffer(&self, desc: &BufferDesc) -> Result<BufferHandle, RhiError> {
+        buffer::create_buffer(&self.shared, desc)
+    }
+
+    fn destroy_buffer(&self, h: BufferHandle) {
+        buffer::destroy_buffer(&self.shared, h);
+    }
+
+    fn buffer_address(&self, h: BufferHandle) -> Result<u64, RhiError> {
+        buffer::buffer_address(&self.shared, h)
+    }
+
+    fn write_buffer(&self, h: BufferHandle, offset: u64, data: &[u8]) -> Result<(), RhiError> {
+        buffer::write_buffer(&self.shared, h, offset, data)
+    }
+
+    fn read_buffer(&self, h: BufferHandle, offset: u64, out: &mut [u8]) -> Result<(), RhiError> {
+        buffer::read_buffer(&self.shared, h, offset, out)
+    }
+
+    fn upload_buffer(&self, h: BufferHandle, offset: u64, data: &[u8]) -> Result<(), RhiError> {
+        buffer::upload_buffer(&self.shared, h, offset, data)
+    }
+
+    fn create_texture(&self, desc: &TextureDesc) -> Result<TextureHandle, RhiError> {
+        texture::create_texture(&self.shared, desc)
+    }
+
+    fn destroy_texture(&self, h: TextureHandle) {
+        texture::destroy_texture(&self.shared, h);
+    }
+
+    fn texture_index(&self, h: TextureHandle) -> Result<u32, RhiError> {
+        texture::texture_index(&self.shared, h)
+    }
+
+    fn upload_texture(&self, h: TextureHandle, data: &[u8]) -> Result<(), RhiError> {
+        texture::upload_texture(&self.shared, h, data)
+    }
+
+    fn create_sampler(&self, desc: &SamplerDesc) -> Result<SamplerHandle, RhiError> {
+        texture::create_sampler(&self.shared, desc)
+    }
+
+    fn destroy_sampler(&self, h: SamplerHandle) {
+        texture::destroy_sampler(&self.shared, h);
+    }
+
+    fn sampler_index(&self, h: SamplerHandle) -> Result<u32, RhiError> {
+        texture::sampler_index(&self.shared, h)
     }
 
     fn create_swapchain(
@@ -804,6 +1050,15 @@ mod tests {
             dynamic_rendering: true,
             synchronization2: true,
             timeline_semaphore: true,
+            buffer_device_address: true,
+            runtime_descriptor_array: true,
+            shader_sampled_image_array_non_uniform_indexing: true,
+            descriptor_binding_sampled_image_update_after_bind: true,
+            descriptor_binding_partially_bound: true,
+            bindless_sampled_images: 65536,
+            bindless_samplers: 1024,
+            max_image_dimension_2d: 16384,
+            non_coherent_atom_size: 64,
             queue_families: vec![QueueFamilyFacts {
                 index: 0,
                 flags: vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE,
@@ -861,6 +1116,80 @@ mod tests {
             present_mode_count: 0,
         });
         assert_eq!(evaluate(&f), Err(Rejection::SurfaceUnusable));
+    }
+
+    #[test]
+    fn reject_missing_each_bindless_feature() {
+        type Clear = fn(&mut PhysicalDeviceFacts);
+        let cases: [(&str, Clear); 5] = [
+            ("bufferDeviceAddress", |f| f.buffer_device_address = false),
+            ("runtimeDescriptorArray", |f| {
+                f.runtime_descriptor_array = false
+            }),
+            ("shaderSampledImageArrayNonUniformIndexing", |f| {
+                f.shader_sampled_image_array_non_uniform_indexing = false
+            }),
+            ("descriptorBindingSampledImageUpdateAfterBind", |f| {
+                f.descriptor_binding_sampled_image_update_after_bind = false
+            }),
+            ("descriptorBindingPartiallyBound", |f| {
+                f.descriptor_binding_partially_bound = false
+            }),
+        ];
+        for (name, clear) in cases {
+            let mut f = facts("a", D);
+            clear(&mut f);
+            assert_eq!(evaluate(&f), Err(Rejection::MissingFeature(name)));
+        }
+    }
+
+    #[test]
+    fn reject_small_bindless_limits() {
+        let mut f = facts("a", D);
+        f.bindless_sampled_images = 512;
+        assert_eq!(
+            evaluate(&f),
+            Err(Rejection::BindlessLimits {
+                images: 512,
+                samplers: 1024
+            })
+        );
+        let mut f = facts("a", D);
+        f.bindless_samplers = 32;
+        assert!(matches!(
+            evaluate(&f),
+            Err(Rejection::BindlessLimits { .. })
+        ));
+        let mut f = facts("a", D);
+        f.bindless_sampled_images = 1024;
+        f.bindless_samplers = 64;
+        assert_eq!(evaluate(&f), Ok(0));
+        assert!(
+            Rejection::BindlessLimits {
+                images: 512,
+                samplers: 32
+            }
+            .to_string()
+            .contains("512")
+        );
+    }
+
+    #[test]
+    fn bindless_features_checked_after_baseline() {
+        let mut f = facts("a", D);
+        f.buffer_device_address = false;
+        f.synchronization2 = false;
+        assert_eq!(
+            evaluate(&f),
+            Err(Rejection::MissingFeature("synchronization2"))
+        );
+        let mut f = facts("a", D);
+        f.buffer_device_address = false;
+        f.extensions.clear();
+        assert_eq!(
+            evaluate(&f),
+            Err(Rejection::MissingFeature("bufferDeviceAddress"))
+        );
     }
 
     #[test]

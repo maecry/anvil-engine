@@ -3,13 +3,49 @@
 use std::collections::VecDeque;
 
 use ash::vk;
+use gpu_allocator::vulkan::Allocation;
+use rhi::{SamplerHandle, TextureHandle};
+
+use crate::device::DeviceShared;
+use crate::lock;
+use crate::write;
 
 pub(crate) enum Doomed {
     ShaderModule(vk::ShaderModule),
+    /// The pipeline layout is global (MODULE-007), so a pipeline owns nothing else.
     Pipeline {
         pipeline: vk::Pipeline,
-        layout: vk::PipelineLayout,
     },
+    /// A buffer and its memory; `staging` marks internal upload staging buffers (logging only).
+    Buffer {
+        buffer: vk::Buffer,
+        allocation: Allocation,
+        staging: bool,
+    },
+    /// Image, default view and memory; `slot` is released (bindless index reusable) afterwards.
+    Image {
+        image: vk::Image,
+        view: vk::ImageView,
+        allocation: Allocation,
+        slot: TextureHandle,
+    },
+    Sampler {
+        sampler: vk::Sampler,
+        slot: SamplerHandle,
+    },
+}
+
+impl Doomed {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Doomed::ShaderModule(_) => "shader_module",
+            Doomed::Pipeline { .. } => "pipeline",
+            Doomed::Buffer { staging: true, .. } => "staging",
+            Doomed::Buffer { .. } => "buffer",
+            Doomed::Image { .. } => "image",
+            Doomed::Sampler { .. } => "sampler",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -44,17 +80,49 @@ impl DeferredQueue {
 
 /// # Safety
 /// The GPU must no longer use the object (tag retired, or device idle); call once per object.
-pub(crate) unsafe fn destroy_doomed(device: &ash::Device, d: Doomed) {
+/// No pool lock or the `deferred` lock may be held by the caller.
+pub(crate) unsafe fn destroy_doomed(s: &DeviceShared, d: Doomed) {
     // SAFETY: forwarded from the caller's contract; entries are popped so destruction is
     // exactly-once.
     unsafe {
         match d {
-            Doomed::ShaderModule(m) => device.destroy_shader_module(m, None),
-            Doomed::Pipeline { pipeline, layout } => {
-                device.destroy_pipeline(pipeline, None);
-                device.destroy_pipeline_layout(layout, None);
+            Doomed::ShaderModule(m) => s.raw.destroy_shader_module(m, None),
+            Doomed::Pipeline { pipeline } => s.raw.destroy_pipeline(pipeline, None),
+            Doomed::Buffer {
+                buffer, allocation, ..
+            } => {
+                s.raw.destroy_buffer(buffer, None);
+                s.free(allocation);
+            }
+            Doomed::Image {
+                image,
+                view,
+                allocation,
+                slot,
+            } => {
+                s.raw.destroy_image_view(view, None);
+                s.raw.destroy_image(image, None);
+                s.free(allocation);
+                write(&s.pools.textures).release(slot);
+                tracing::debug!(target: "rhi_vulkan::texture", slot = slot.index(), "bindless image slot released");
+            }
+            Doomed::Sampler { sampler, slot } => {
+                s.raw.destroy_sampler(sampler, None);
+                lock(&s.pools.samplers).release(slot);
+                tracing::debug!(target: "rhi_vulkan::texture", slot = slot.index(), "bindless sampler slot released");
             }
         }
+    }
+}
+
+/// Destroys every queued object; the device must be idle.
+pub(crate) fn drain_all(s: &DeviceShared) {
+    loop {
+        let d = lock(&s.sync.deferred).pop_any();
+        let Some(d) = d else { break };
+        // SAFETY: the caller made the device idle; entries are popped exactly once and no lock
+        // is held here.
+        unsafe { destroy_doomed(s, d) };
     }
 }
 

@@ -20,3 +20,7 @@ gpu-allocator = { version = "0.28.0", default-features = false, features = ["vul
 
 [dev-dependencies]
 foundation = { path = "../foundation", features = ["log-init"] }
+
+[build-dependencies]
+# Compiles the GLSL test shaders of tests/ (draw, bindless and BDA tests need real SPIR-V).
+shaderc = "0.10.1"

@@ -7,13 +7,14 @@ use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use rhi::{
     Acquire, Format, PresentStatus, RhiError, SwapchainDesc, SwapchainDiagnostics, SwapchainHandle,
-    SwapchainImage, TextureHandle,
+    SwapchainImage, TextureHandle, TextureState, TextureUsage,
 };
 
 use crate::device::DeviceShared;
 use crate::error::{invalid, map_vk, stale};
 use crate::instance::InstanceShared;
 use crate::registry::generated_name;
+use crate::texture::{TextureOwner, VkTexture};
 use crate::{lock, write};
 
 // ---------------------------------------------------------------- surface
@@ -91,26 +92,9 @@ pub(crate) struct SwapchainConfig {
     pub composite_alpha: vk::CompositeAlphaFlagsKHR,
 }
 
-pub(crate) fn vk_to_rhi_format(f: vk::Format) -> Option<Format> {
-    Some(match f {
-        vk::Format::B8G8R8A8_SRGB => Format::Bgra8Srgb,
-        vk::Format::B8G8R8A8_UNORM => Format::Bgra8Unorm,
-        vk::Format::R8G8B8A8_SRGB => Format::Rgba8Srgb,
-        vk::Format::R8G8B8A8_UNORM => Format::Rgba8Unorm,
-        vk::Format::D32_SFLOAT => Format::D32Sfloat,
-        _ => return None,
-    })
-}
-
-pub(crate) fn rhi_to_vk_format(f: Format) -> vk::Format {
-    match f {
-        Format::Bgra8Srgb => vk::Format::B8G8R8A8_SRGB,
-        Format::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
-        Format::Rgba8Srgb => vk::Format::R8G8B8A8_SRGB,
-        Format::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
-        Format::D32Sfloat => vk::Format::D32_SFLOAT,
-    }
-}
+#[cfg(test)]
+pub(crate) use crate::texture::rhi_to_vk_format;
+pub(crate) use crate::texture::vk_to_rhi_format;
 
 pub(crate) fn choose_surface_format(
     available: &[vk::SurfaceFormatKHR],
@@ -121,7 +105,7 @@ pub(crate) fn choose_surface_format(
         .filter(|f| f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR)
         .filter_map(|f| {
             vk_to_rhi_format(f.format)
-                .filter(|r| !r.is_depth())
+                .filter(|r| !r.is_depth() && r.bytes_per_texel() == 4)
                 .map(|r| (*f, r))
         })
         .collect();
@@ -256,12 +240,6 @@ pub(crate) fn classify_present(r: Result<bool, vk::Result>) -> Result<PresentSta
 }
 
 // ---------------------------------------------------------------- objects
-
-pub(crate) struct VkTexture {
-    pub image: vk::Image,
-    pub view: vk::ImageView,
-    pub format: Format,
-}
 
 pub(crate) struct VkSwapchain {
     pub raw: vk::SwapchainKHR,
@@ -415,6 +393,13 @@ fn build(
             image,
             view,
             format: cfg.format,
+            width: cfg.extent.width,
+            height: cfg.extent.height,
+            usage: TextureUsage::COLOR_ATTACHMENT,
+            owner: TextureOwner::Swapchain,
+            allocation: None,
+            state: TextureState::Undefined,
+            label: "swapchain image".to_owned(),
         }));
     }
     Ok(b)

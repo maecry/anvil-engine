@@ -9,6 +9,8 @@
 //! `trace` inside a `frame` span, state changes log at `info`, validation messages go to the
 //! target `vulkan::validation`, and every Vulkan object gets a debug name.
 
+mod bindings;
+mod buffer;
 mod commands;
 mod destroy;
 mod device;
@@ -16,6 +18,8 @@ mod error;
 mod instance;
 mod registry;
 mod swapchain;
+mod texture;
+mod upload;
 
 #[cfg(test)]
 mod gpu_tests;

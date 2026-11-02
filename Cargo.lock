@@ -1159,6 +1159,7 @@ dependencies = [
  "gpu-allocator",
  "raw-window-handle",
  "rhi",
+ "shaderc",
  "thiserror 2.0.21",
  "tracing",
 ]
@@ -1412,6 +1413,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "textured-quad"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "foundation",
+ "platform",
+ "rhi",
+ "rhi-vulkan",
+ "shaderc",
+ "tracing",
 ]
 
 [[package]]

@@ -283,8 +283,9 @@ impl VulkanInstance {
             desc.validation,
             cfg!(debug_assertions),
             layer_present,
-            desc.sync_validation,
+            desc.sync_validation && !desc.gpu_av,
         )?;
+        let gpu_av = desc.gpu_av && plan.enable_layer;
         if plan.warn_missing {
             tracing::warn!(
                 layer = "VK_LAYER_KHRONOS_validation",
@@ -316,16 +317,18 @@ impl VulkanInstance {
         }
         // VK_KHR_surface is needed by the device extension VK_KHR_swapchain even for headless devices.
         let mut optional = vec![ext::debug_utils::NAME, khr::surface::NAME];
-        let use_layer_settings = plan.sync && available.contains(&ext::layer_settings::NAME);
-        let use_validation_features =
-            plan.sync && !use_layer_settings && available.contains(&ext::validation_features::NAME);
+        let want_settings = plan.sync || gpu_av;
+        let use_layer_settings = want_settings && available.contains(&ext::layer_settings::NAME);
+        let use_validation_features = want_settings
+            && !use_layer_settings
+            && available.contains(&ext::validation_features::NAME);
         if use_layer_settings {
             optional.push(ext::layer_settings::NAME);
         } else if use_validation_features {
             optional.push(ext::validation_features::NAME);
-        } else if plan.sync {
+        } else if want_settings {
             tracing::warn!(
-                "neither VK_EXT_layer_settings nor VK_EXT_validation_features is available; synchronization validation skipped"
+                "neither VK_EXT_layer_settings nor VK_EXT_validation_features is available; synchronization/GPU-assisted validation skipped"
             );
         }
         let enabled_exts = plan_extensions(&available, &required, &optional)?;
@@ -349,14 +352,25 @@ impl VulkanInstance {
             .engine_name(engine)
             .api_version(vk::API_VERSION_1_3);
         let mut messenger_ci = messenger_info(user);
-        let sync_value = [u8::from(true), 0, 0, 0]; // VkBool32 TRUE, little-endian bytes
-        let settings = [vk::LayerSettingEXT::default()
-            .layer_name(VALIDATION_LAYER)
-            .setting_name(c"validate_sync")
-            .ty(vk::LayerSettingTypeEXT::BOOL32)
-            .values(&sync_value)];
+        let true_value = [u8::from(true), 0, 0, 0]; // VkBool32 TRUE, little-endian bytes
+        let setting = |name: &'static CStr| {
+            vk::LayerSettingEXT::default()
+                .layer_name(VALIDATION_LAYER)
+                .setting_name(name)
+                .ty(vk::LayerSettingTypeEXT::BOOL32)
+                .values(&true_value)
+        };
+        let settings: Vec<_> = if gpu_av {
+            vec![setting(c"gpuav_enable")]
+        } else {
+            vec![setting(c"validate_sync")]
+        };
         let mut layer_settings_ci = vk::LayerSettingsCreateInfoEXT::default().settings(&settings);
-        let enables = [vk::ValidationFeatureEnableEXT::SYNCHRONIZATION_VALIDATION];
+        let enables = if gpu_av {
+            vec![vk::ValidationFeatureEnableEXT::GPU_ASSISTED]
+        } else {
+            vec![vk::ValidationFeatureEnableEXT::SYNCHRONIZATION_VALIDATION]
+        };
         let mut features_ci =
             vk::ValidationFeaturesEXT::default().enabled_validation_features(&enables);
 
@@ -408,7 +422,8 @@ impl VulkanInstance {
             counters,
             caps: InstanceCaps {
                 validation_active: plan.enable_layer,
-                sync_validation_active: use_layer_settings || use_validation_features,
+                sync_validation_active: plan.sync
+                    && (use_layer_settings || use_validation_features),
             },
         });
         let ext_names: Vec<_> = enabled_exts.iter().map(|c| c.to_string_lossy()).collect();
@@ -424,6 +439,7 @@ impl VulkanInstance {
             extensions = ?ext_names,
             validation = shared.caps.validation_active,
             sync_validation = shared.caps.sync_validation_active,
+            gpu_av = gpu_av && (use_layer_settings || use_validation_features),
             debug_utils = debug_utils_on,
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
             "instance created"

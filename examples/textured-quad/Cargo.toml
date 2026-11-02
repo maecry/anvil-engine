@@ -1,0 +1,20 @@
+[package]
+name = "textured-quad"
+description = "M2 vertical slice: indexed quad, vertices via buffer device address, bindless texture and sampler, push constants."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+foundation = { path = "../../crates/foundation", features = ["log-init"] }
+platform = { path = "../../crates/platform" }
+rhi = { path = "../../crates/rhi" }
+rhi-vulkan = { path = "../../crates/rhi-vulkan" }
+tracing.workspace = true
+anyhow = "1"
+
+[build-dependencies]
+shaderc = "0.10.1"
