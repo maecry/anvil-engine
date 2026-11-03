@@ -1,0 +1,5 @@
+(
+    version: 1,
+    name: "Orbital Siege",
+    startup_scene: "assets/scenes/main.scene",
+)

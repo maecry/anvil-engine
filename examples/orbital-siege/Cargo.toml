@@ -1,0 +1,29 @@
+[package]
+name = "orbital-siege"
+description = "Orbital Siege: a small 3D arcade fixed-shooter built on the runtime/scene/assets game API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "orbital-siege"
+path = "src/main.rs"
+
+[dependencies]
+foundation = { path = "../../crates/foundation", features = ["log-init"] }
+runtime = { path = "../../crates/runtime" }
+scene = { path = "../../crates/scene" }
+assets = { path = "../../crates/assets" }
+# Only for `KeyCode` (runtime does not re-export it).
+platform = { path = "../../crates/platform" }
+tracing.workspace = true
+anyhow.workspace = true
+hecs.workspace = true
+
+[dev-dependencies]
+assets = { path = "../../crates/assets", features = ["fixtures"] }
+ron.workspace = true

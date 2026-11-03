@@ -1591,6 +1591,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "orbital-siege"
+version = "1.0.0-rc.1"
+dependencies = [
+ "anyhow",
+ "assets",
+ "foundation",
+ "hecs",
+ "platform",
+ "ron",
+ "runtime",
+ "scene",
+ "tracing",
+]
+
+[[package]]
 name = "owned_ttf_parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,16 @@
+(
+    version: 1,
+    base_color: (0.025, 0.035, 0.07, 1.0),
+    base_color_texture: None,
+    metallic: 0.6,
+    roughness: 0.55,
+    metallic_roughness_texture: None,
+    normal_texture: None,
+    normal_scale: 1.0,
+    occlusion_texture: None,
+    occlusion_strength: 1.0,
+    emissive: (0.0, 0.0, 0.0),
+    emissive_texture: None,
+    alpha_mode: Opaque,
+    double_sided: false,
+)

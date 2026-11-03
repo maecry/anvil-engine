@@ -1,0 +1,27 @@
+(
+    version: 1,
+    id: "9023023f-7492-40ae-ae24-aa6ceb429124",
+    importer: "gltf",
+    sub_assets: [
+        (
+            id: "525c9798-0cd3-548a-be71-898fbf5991c9",
+            kind: Mesh,
+            name: "mesh/0/0",
+        ),
+        (
+            id: "08007968-7160-5bc7-95a8-d08ff2d3735e",
+            kind: Mesh,
+            name: "mesh/1/0",
+        ),
+        (
+            id: "7324a7e5-adeb-5779-8517-117c41380a5d",
+            kind: Mesh,
+            name: "mesh/2/0",
+        ),
+        (
+            id: "1c0529c1-c1a3-5696-9cd3-5abc784fd028",
+            kind: Mesh,
+            name: "mesh/3/0",
+        ),
+    ],
+)

@@ -33,4 +33,6 @@ cargo run -p editor -- samples/sample-project
 ANVIL_WINDOW=0 ANVIL_EDITOR_SCRIPT=script.ron cargo run -p editor
 ```
 
+A small 3D arcade shooter built on the game API: [Orbital Siege](examples/orbital-siege/README.md) (`cargo run -p orbital-siege`).
+
 Linux x86_64 and Vulkan 1.3 only. Building needs `libshaderc`; validation layers are optional but recommended for development. The Rust toolchain is pinned in `rust-toolchain.toml`.
