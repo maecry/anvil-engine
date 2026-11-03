@@ -7,7 +7,7 @@
 //! none; upgrade when a windowed test harness exists.
 
 use std::path::Path;
-use std::sync::Once;
+use std::sync::{Mutex, MutexGuard, Once};
 use std::time::{Duration, Instant};
 
 use assets::AssetServer;
@@ -36,6 +36,9 @@ struct Rig {
     dev: VulkanDevice,
     target: SwapchainImage,
     software: bool,
+    // Last field, so it drops after the device: one stress test at a time (concurrent devices
+    // under sync validation crashed lavapipe in CI, and overlapping runs skew the stress counts).
+    _serial: MutexGuard<'static, ()>,
 }
 
 /// Multiplies a count by 10 under `ANVIL_STRESS=1`.
@@ -52,6 +55,9 @@ fn rig() -> Option<Rig> {
         eprintln!("skipped: set ANVIL_GPU_TESTS=1 to run GPU tests");
         return None;
     }
+    static SERIAL: Mutex<()> = Mutex::new(());
+    // A failed (panicked) earlier test poisons the lock; the next test can still run.
+    let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     static ENV: Once = Once::new();
     ENV.call_once(|| {
         let _ = foundation::init_logging();
@@ -92,6 +98,7 @@ fn rig() -> Option<Rig> {
         dev,
         target,
         software,
+        _serial: serial,
     })
 }
 
