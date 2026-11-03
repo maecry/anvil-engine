@@ -285,7 +285,8 @@ fn streaming_under_a_small_budget() {
     let Some(mut rig) = rig() else { return };
     let mut r = rig.renderer();
     let plane = r.create_mesh(&rig.dev, "plane", &mesh::plane(2.0)).unwrap();
-    let count: u32 = if rig.software { 10 } else { 16 };
+    // Same counts on every driver: fewer textures or frames never exceed the budget.
+    let count: u32 = 16;
     let texels: Vec<u8> = (0..512 * 512 * 4).map(|i| (i * 7 % 251) as u8).collect();
     let mut textures = Vec::new();
     let mut materials = Vec::new();
@@ -300,7 +301,7 @@ fn streaming_under_a_small_budget() {
         textures.push(t);
     }
     let mut last = r.stats().textures;
-    for f in 0..scaled(if rig.software { 20 } else { 60 }) {
+    for f in 0..scaled(60) {
         // Four textures visible per frame, shifting by one each frame.
         let meshes = (0..4)
             .map(|k| {
@@ -389,8 +390,10 @@ fn hot_reload() {
         let c = (i % 200) as u8;
         std::fs::write(&texture, checker_png(64, 16, [c, 90, 50], [235, 215, 180])).unwrap();
         std::fs::write(&material, &material_text).unwrap();
-        let end = Instant::now() + Duration::from_millis(350);
-        while Instant::now() < end {
+        // Render until this round's texture reimport lands, so slow runners never merge rounds.
+        let want = before + u64::from(i) + 1;
+        let end = Instant::now() + Duration::from_secs(5);
+        while p.core.assets.stats().cache_misses < want && Instant::now() < end {
             p.frame(&mut rig);
             std::thread::sleep(Duration::from_millis(10));
         }
