@@ -1,0 +1,27 @@
+[package]
+name = "debug"
+description = "egui on the Anvil RHI plus reusable diagnostics panels (ADR-0014 §8)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+foundation = { path = "../foundation" }
+platform = { path = "../platform" }
+rhi = { path = "../rhi" }
+renderer = { path = "../renderer" }
+render-graph = { path = "../render-graph" }
+egui.workspace = true
+egui-winit.workspace = true
+bytemuck.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+shaderc = "0.10.1"
+
+[dev-dependencies]
+rhi-vulkan = { path = "../rhi-vulkan" }
+foundation = { path = "../foundation", features = ["log-init"] }

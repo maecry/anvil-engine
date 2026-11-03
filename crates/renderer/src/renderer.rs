@@ -1743,6 +1743,11 @@ impl Renderer {
         self.lod_pixels = pixels.max(0.0);
     }
 
+    /// The LOD error threshold in pixels.
+    pub fn lod_pixels(&self) -> f32 {
+        self.lod_pixels
+    }
+
     /// Counters of the last rendered frame.
     pub fn stats(&self) -> RendererStats {
         self.stats.clone()

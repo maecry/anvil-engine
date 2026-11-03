@@ -17,6 +17,7 @@
 //! `ANVIL_BENCH=path.json` runs the benchmark protocol (ADR-0013 §1): the camera orbits, vsync
 //! is off, the window defaults to 1920x1080 (`ANVIL_WINDOW=WxH`), `ANVIL_BENCH_WARMUP` (120) plus
 //! `ANVIL_BENCH_FRAMES` (1000) frames are rendered, results go to the JSON file.
+//! `ANVIL_OVERLAY=1` shows the egui diagnostics overlay (`debug` crate; F1 toggles); unset, no debug code runs.
 //! See ADR-0009 §7, ADR-0011 §11 and ADR-0012 §11.
 
 use std::sync::Arc;
@@ -125,6 +126,8 @@ struct Gfx {
     device: VulkanDevice,
     swapchain: SwapchainHandle,
     renderer: Renderer,
+    /// `ANVIL_OVERLAY=1`: diagnostics overlay (F1 toggles); `None` runs no debug code.
+    overlay: Option<debug::Overlay>,
     instances: Vec<MeshInstance>,
     lights: Vec<Light>,
 }
@@ -188,6 +191,9 @@ impl PbrScene {
         )?;
         let format = device.swapchain_format(swapchain)?;
         let mut r = Renderer::new(&device, format, (w.max(1), h.max(1)))?;
+        let overlay = debug::Overlay::enabled_by_env()
+            .then(|| debug::Overlay::new(&device, window, format))
+            .transpose()?;
 
         let sphere = r.create_mesh(&device, "sphere", &mesh::uv_sphere(48, 24))?;
         let cube = r.create_mesh(&device, "cube", &mesh::cube())?;
@@ -323,6 +329,7 @@ impl PbrScene {
             device,
             swapchain,
             renderer: r,
+            overlay,
             instances,
             lights,
         })
@@ -414,6 +421,14 @@ impl PbrScene {
             };
         }
         g.renderer.set_post(self.post);
+        if let Some(o) = g.overlay.as_mut() {
+            o.run(&g.device, window, &mut g.renderer)?;
+            // The panel edits the renderer; keep the app's copies in step so they are not undone.
+            self.path = g.renderer.render_path();
+            self.post = g.renderer.post();
+            self.debug = g.renderer.debug_view();
+            self.debug_draw = g.renderer.debug_draw();
+        }
         let scene = RenderScene {
             camera: scene_camera,
             meshes,
@@ -440,8 +455,15 @@ impl PbrScene {
         } else {
             TextureState::Present
         };
+        let scene_end = g
+            .overlay
+            .as_ref()
+            .map_or(final_state, |o| o.scene_final_state(final_state));
         g.renderer
-            .render(&g.device, &mut cmd, &frame, &scene, &image, final_state)?;
+            .render(&g.device, &mut cmd, &frame, &scene, &image, scene_end)?;
+        if let Some(o) = g.overlay.as_mut() {
+            o.render(&g.device, &mut cmd, &frame, &image, final_state)?;
+        }
         if let Some(rb) = readback {
             cmd.copy_texture_to_buffer(image.texture, rb, 0);
             cmd.texture_barrier(
@@ -482,6 +504,9 @@ impl PbrScene {
         let Some(g) = self.gfx.take() else { return };
         if let Err(e) = g.device.wait_idle() {
             tracing::error!(error = %e, "wait_idle failed");
+        }
+        if let Some(o) = g.overlay {
+            o.destroy(&g.device);
         }
         g.renderer.destroy(&g.device);
         g.device.destroy_swapchain(g.swapchain);
@@ -535,7 +560,25 @@ impl App for PbrScene {
         Ok(())
     }
 
+    fn on_raw_event(&mut self, window: &Window, event: &platform::RawWindowEvent) {
+        if let Some(o) = self.gfx.as_mut().and_then(|g| g.overlay.as_mut()) {
+            o.on_window_event(window, event);
+        }
+    }
+
     fn on_event(&mut self, _: &Window, event: &Event) -> Control {
+        // Presses the overlay wants (text fields, clicks on panels) do not reach the app.
+        if let Some(o) = self.gfx.as_ref().and_then(|g| g.overlay.as_ref())
+            && match event {
+                Event::Key { pressed: true, .. } => o.wants_keyboard(),
+                Event::MouseButton { pressed: true, .. } | Event::MouseMotion { .. } => {
+                    o.wants_pointer()
+                }
+                _ => false,
+            }
+        {
+            return Control::Continue;
+        }
         match event {
             Event::Resized { width, height } if *width > 0 && *height > 0 => {
                 if let Some(g) = &self.gfx
