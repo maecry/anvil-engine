@@ -21,7 +21,8 @@ struct Header {
     importer_version: u32,
     source_hash: u64,
     count: u32,
-    pad: u32,
+    /// [`checksum`] of `count` and everything after the header.
+    checksum: u32,
 }
 
 /// FNV-1a 64 of the source bytes.
@@ -30,6 +31,13 @@ pub(crate) fn hash(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     })
+}
+
+/// 32-bit fold of [`hash`] over the body, seeded with the entry count: catches damaged caches
+/// that would otherwise decode into an inconsistent bundle.
+fn checksum(count: u32, body: &[u8]) -> u32 {
+    let h = hash(body) ^ u64::from(count);
+    (h ^ (h >> 32)) as u32
 }
 
 fn put(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -43,14 +51,14 @@ fn ron_bytes<T: serde::Serialize>(v: &T) -> Vec<u8> {
 
 /// Serializes a bundle with the given source hash.
 pub(crate) fn encode(bundle: &[Imported], source_hash: u64) -> Vec<u8> {
-    let header = Header {
+    let mut header = Header {
         magic: MAGIC,
         importer_version: IMPORTER_VERSION,
         source_hash,
         count: bundle.len() as u32,
-        pad: 0,
+        checksum: 0,
     };
-    let mut out = bytemuck::bytes_of(&header).to_vec();
+    let mut out = Vec::new();
     for item in bundle {
         out.extend_from_slice(&item.id.0.to_le_bytes());
         put(&mut out, item.name.as_bytes());
@@ -90,7 +98,10 @@ pub(crate) fn encode(bundle: &[Imported], source_hash: u64) -> Vec<u8> {
         out.push(tag);
         put(&mut out, &payload);
     }
-    out
+    header.checksum = checksum(header.count, &out);
+    let mut file = bytemuck::bytes_of(&header).to_vec();
+    file.append(&mut out);
+    file
 }
 
 struct Reader<'a>(&'a [u8]);
@@ -146,6 +157,9 @@ pub(crate) fn decode(bytes: &[u8], source_hash: u64) -> Result<Vec<Imported>, As
     {
         return Err(AssetError::Corrupt("cache stale".into()));
     }
+    if header.checksum != checksum(header.count, &bytes[hs..]) {
+        return Err(AssetError::Corrupt("cache checksum".into()));
+    }
     let mut r = Reader(&bytes[hs..]);
     let mut out = Vec::new();
     for _ in 0..header.count {
@@ -156,15 +170,30 @@ pub(crate) fn decode(bytes: &[u8], source_hash: u64) -> Result<Vec<Imported>, As
         let tag = r.take(1)?[0];
         let mut p = Reader(r.block()?);
         let asset = match tag {
-            0 => Asset::Mesh(Arc::new(MeshAsset {
-                positions: pods(p.block()?)?,
-                normals: pods(p.block()?)?,
-                uvs: pods(p.block()?)?,
-                tangents: pods(p.block()?)?,
-                indices: pods(p.block()?)?,
-            })),
+            0 => {
+                let mesh = MeshAsset {
+                    positions: pods(p.block()?)?,
+                    normals: pods(p.block()?)?,
+                    uvs: pods(p.block()?)?,
+                    tangents: pods(p.block()?)?,
+                    indices: pods(p.block()?)?,
+                };
+                let n = mesh.positions.len();
+                if mesh.normals.len() != n
+                    || mesh.uvs.len() != n
+                    || mesh.tangents.len() != n
+                    || !mesh.indices.len().is_multiple_of(3)
+                    || mesh.indices.iter().any(|&i| i as usize >= n)
+                {
+                    return Err(AssetError::Corrupt("cache mesh inconsistent".into()));
+                }
+                Asset::Mesh(Arc::new(mesh))
+            }
             1 => {
                 let (width, height) = (p.u32()?, p.u32()?);
+                if u64::from(width) * u64::from(height) * 4 != p.0.len() as u64 {
+                    return Err(AssetError::Corrupt("cache texture size".into()));
+                }
                 Asset::Texture(Arc::new(TextureAsset {
                     width,
                     height,

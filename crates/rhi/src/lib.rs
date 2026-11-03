@@ -535,7 +535,8 @@ pub struct DeviceDesc {
     /// Frames in flight, valid 1..=3.
     pub frames_in_flight: u32,
     /// Pipeline cache file, loaded at creation and saved at destruction. `None`: env
-    /// `ANVIL_PIPELINE_CACHE`, else `target/anvil-pipeline-cache.bin`.
+    /// `ANVIL_PIPELINE_CACHE`, else `$XDG_CACHE_HOME/anvil/pipeline-cache.bin` (falling back to
+    /// `~/.cache/anvil/`); the directory is created when missing.
     pub pipeline_cache: Option<std::path::PathBuf>,
 }
 

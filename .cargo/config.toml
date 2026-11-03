@@ -1,0 +1,4 @@
+# Dev builds, tests and examples keep their pipeline cache inside `target/` instead of the user's
+# cache directory (ADR-0015 §8). Shipped binaries use the XDG default.
+[env]
+ANVIL_PIPELINE_CACHE = { value = "target/anvil-pipeline-cache.bin", relative = true }

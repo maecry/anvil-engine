@@ -33,7 +33,7 @@ pub(crate) fn import(
         }]
     };
     Ok(match importer {
-        "gltf" => import_gltf(path, id)?,
+        "gltf" => import_gltf(path, id, bytes)?,
         "image" => one(Asset::Texture(Arc::new(import_image(bytes)?))),
         "ktx2" => one(Asset::Texture(Arc::new(import_ktx2(bytes)?))),
         "material" => one(Asset::Material(Arc::new(import_material(bytes)?))),
@@ -43,7 +43,18 @@ pub(crate) fn import(
 }
 
 fn import_image(bytes: &[u8]) -> Result<TextureAsset, AssetError> {
-    let img = image::load_from_memory(bytes).map_err(|e| AssetError::Format(e.to_string()))?;
+    // A tiny file can declare a huge image, so decoders get an explicit allocation cap.
+    // shortcut: 128 MiB decode cap (4096x4096 RGBA8; larger textures are rejected), raise it when streaming of big textures lands.
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(128 << 20);
+    limits.max_image_width = Some(16384);
+    limits.max_image_height = Some(16384);
+    let fmt = |e: &dyn std::fmt::Display| AssetError::Format(e.to_string());
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| fmt(&e))?;
+    reader.limits(limits);
+    let img = reader.decode().map_err(|e| fmt(&e))?;
     // shortcut: EXR/HDR is clamped to 8-bit LDR RGBA, upgrade when the renderer takes float textures.
     let rgba = img.to_rgba8();
     Ok(TextureAsset {
@@ -156,9 +167,21 @@ fn mesh_name(mesh: usize, prim: usize) -> String {
     format!("mesh/{mesh}/{prim}")
 }
 
-fn import_gltf(path: &Path, root: AssetId) -> Result<Vec<Imported>, AssetError> {
+fn import_gltf(path: &Path, root: AssetId, bytes: &[u8]) -> Result<Vec<Imported>, AssetError> {
     // shortcut: the cache key covers the .gltf/.glb file only, edits to external .bin/.png files are not noticed until the main file changes.
-    let (doc, buffers, images) = gltf::import(path).map_err(gltf_err)?;
+    // Parse from the bytes already read: `gltf::import(path)` sizes a GLB buffer from the header's
+    // length field before reading (a 4 GiB request for a 2 KiB file); `from_slice` checks it against the data.
+    // gltf-json 1.4.1 also indexes `accessors[i]` before validating `i` and panics on a dangling POSITION accessor.
+    // shortcut: contain that upstream panic here (the panic hook still prints), drop this when gltf-json fixes it.
+    let base = path.parent();
+    let (doc, buffers, images) = std::panic::catch_unwind(|| -> gltf::Result<_> {
+        let gltf::Gltf { document, blob } = gltf::Gltf::from_slice(bytes)?;
+        let buffers = gltf::import_buffers(&document, base, blob)?;
+        let images = gltf::import_images(&document, base, &buffers)?;
+        Ok((document, buffers, images))
+    })
+    .map_err(|_| AssetError::Format("gltf: malformed document (parser panicked)".into()))?
+    .map_err(gltf_err)?;
     let mut out = vec![Imported {
         id: root,
         name: String::new(),
