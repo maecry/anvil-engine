@@ -87,7 +87,22 @@ impl RuntimeCore {
                 &mut old_textures,
             );
         }
-        // Materials were repointed first; only now are the replaced images unused.
+        // A texture can reload without its materials doing so: repoint every material before the
+        // replaced images are destroyed.
+        if !old_textures.is_empty() {
+            let mats: Vec<_> = self.materials.iter().map(|(a, m)| (*a, *m)).collect();
+            for (id, mat) in mats {
+                if mat == self.renderer.missing_material()
+                    || mat == self.renderer.default_material()
+                {
+                    continue;
+                }
+                if let Some(Asset::Material(m)) = self.assets.get(id) {
+                    let desc = self.material_desc(device, &m);
+                    self.renderer.update_material(mat, &desc);
+                }
+            }
+        }
         for t in old_textures {
             self.renderer.destroy_texture(device, t);
         }

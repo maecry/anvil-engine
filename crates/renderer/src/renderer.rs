@@ -2274,13 +2274,20 @@ impl Renderer {
             .unwrap_or(1) as usize;
         let mut materials = vec![bytemuck::Zeroable::zeroed(); dense];
         for (h, m) in self.materials.iter() {
-            let slot = |t: TextureId| self.textures.get(t).map_or(0, |t| t.index);
+            // A texture destroyed after the material was built falls back to its default, never
+            // to bindless slot 0 (which may be unwritten).
+            let slot = |t: TextureId, default: TextureId| {
+                self.textures
+                    .get(t)
+                    .or_else(|| self.textures.get(default))
+                    .map_or(0, |t| t.index)
+            };
             let mut g: GpuMaterial = m.gpu;
-            g.base_color_tex = slot(m.textures[0]);
-            g.mr_tex = slot(m.textures[1]);
-            g.normal_tex = slot(m.textures[2]);
-            g.occlusion_tex = slot(m.textures[3]);
-            g.emissive_tex = slot(m.textures[4]);
+            g.base_color_tex = slot(m.textures[0], self.white_srgb);
+            g.mr_tex = slot(m.textures[1], self.white_linear);
+            g.normal_tex = slot(m.textures[2], self.flat_normal);
+            g.occlusion_tex = slot(m.textures[3], self.white_linear);
+            g.emissive_tex = slot(m.textures[4], self.white_srgb);
             g.base_mip = self.textures.get(m.textures[0]).map_or(0, |t| t.base);
             materials[h.index() as usize] = g;
         }
