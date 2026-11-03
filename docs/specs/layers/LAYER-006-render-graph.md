@@ -131,3 +131,6 @@ Pure unit tests with no GPU on the compile step (`plan.rs`) and the pool (`pool.
 ## 16. Related modules
 
 MODULE-009-render-graph-compiler.
+
+### 8c. M5c use of per-view tracking (cube shadow maps)
+Each face of a point-light cube map is a one-layer view tracked as its own graph texture (the same opt-in as the depth pyramid); the shading passes declare a read of the six faces and sample the whole cube through its own bindless slot. Only the cubes of lights that cast this frame are imported. No graph changes were needed; transient aliasing and async compute stay not adopted (LAYER-005, BENCH-001 §13).

@@ -84,8 +84,13 @@ pub enum Light {
         color: Vec3,
         /// Intensity multiplier (candela).
         intensity: f32,
-        /// Range window: contribution reaches zero at this distance.
+        /// Range window: contribution reaches zero at this distance; also the far plane of the
+        /// shadow cube map.
         range: f32,
+        /// Casts an omnidirectional shadow (six 512x512 depth faces). Only the
+        /// [`MAX_POINT_SHADOWS`] best candidates per frame (nearest and brightest, needs a range
+        /// of at least 0.5) get one.
+        cast_shadows: bool,
     },
     /// Cone light with inverse-square falloff.
     Spot {
@@ -145,6 +150,9 @@ pub const MAX_LIGHTS: usize = 1024;
 
 /// Spot lights that get a shadow map per frame.
 pub const MAX_SPOT_SHADOWS: usize = 4;
+
+/// Point lights that get a cube shadow map per frame.
+pub const MAX_POINT_SHADOWS: usize = 4;
 
 /// Everything the renderer needs for one frame.
 #[derive(Clone, Debug)]

@@ -17,14 +17,17 @@ use rhi::{
     Filter, Format, FrameToken, FrontFace, GraphicsPipelineDesc, Memory, PipelineHandle,
     PrimitiveTopology, RhiError, SamplerDesc, SamplerHandle, ShaderModuleDesc, ShaderModuleHandle,
     ShaderStageDesc, SwapchainImage, TextureDesc, TextureHandle, TextureState, TextureUsage,
+    TextureViewDesc,
 };
 
 use crate::arena::{Arena, ArenaSlot};
 
 use crate::cluster::{CLUSTER_FAR, ClusterGrid, GRID, LightSphere, spot_bounds};
-use crate::cull::{Frustum, bounding_sphere};
+use crate::cull::{Frustum, bounding_sphere, transform_sphere};
+use crate::debug::DebugLines;
 use crate::gpu::{
     COUNTS_BYTES, CULL_VIEWS, GpuCullParams, GpuFrame, GpuInstance, GpuLight, GpuMaterial, GpuMesh,
+    SHADOW_VIEWS,
 };
 use crate::gpu_cull::{
     CullBuffers, CullLayout, CullPipelines, CullStats, Pyramid, camera_cull_pass, hiz_passes,
@@ -33,17 +36,22 @@ use crate::gpu_cull::{
 use crate::ibl::Ibl;
 use crate::mesh::{MAX_LODS, generate_lods};
 use crate::passes::{
-    ArenaRef, Draw, DrawSource, GbufferInputs, GeometryInputs, GpuDraws, LightingInputs, Pipes,
-    PrepassInputs, ShadedInputs, ShadowInputs, SkyboxInputs, TonemapInputs, forward_pass,
-    gbuffer_pass, lighting_pass, prepass, shadow_pass, skybox_pass, tonemap_pass, transparent_pass,
+    ArenaRef, DebugInputs, Draw, DrawSource, GbufferInputs, GeometryInputs, GpuDraws,
+    LightingInputs, Pipes, PrepassInputs, ShadedInputs, ShadowInputs, SkyboxInputs, TonemapInputs,
+    debug_pass, forward_pass, gbuffer_pass, lighting_pass, prepass, shadow_pass, skybox_pass,
+    tonemap_pass, transparent_pass,
 };
 use crate::post::{
     BloomInputs, BloomTargets, DOWN_NAMES, TaaInputs, UP_NAMES, bloom_passes, jitter_pixels,
     jitter_projection, ssao_blur_pass, ssao_pass, taa_pass,
 };
 use crate::prep::{self, Resolved};
-use crate::shadow::{CASCADES, cascade_splits, fit_directional, fit_spot};
-use crate::{Light, MAX_LIGHTS, MAX_SPOT_SHADOWS, MeshData, RenderScene};
+use crate::shadow::{
+    CASCADES, POINT_SHADOW_SIZE, cascade_splits, fit_directional, fit_spot, point_face_view_proj,
+    select_point_shadows,
+};
+use crate::streaming::{self, PlanItem};
+use crate::{Light, MAX_LIGHTS, MAX_POINT_SHADOWS, MAX_SPOT_SHADOWS, MeshData, RenderScene};
 
 macro_rules! spv {
     ($name:literal) => {
@@ -67,6 +75,8 @@ static TONEMAP_FRAG: &[u8] = spv!("tonemap.frag");
 static CULL_CAMERA_COMP: &[u8] = spv!("cull_camera.comp");
 static CULL_SHADOW_COMP: &[u8] = spv!("cull_shadow.comp");
 static HIZ_COMP: &[u8] = spv!("hiz.comp");
+static DEBUG_VERT: &[u8] = spv!("debug.vert");
+static DEBUG_FRAG: &[u8] = spv!("debug.frag");
 
 /// Size of each per-frame-in-flight upload ring: frame data, lights, materials, cluster lists,
 /// culling parameters and the changed instances of the frame.
@@ -84,8 +94,21 @@ const RUN_GAP: u32 = 4;
 const PHASE1_VIEWS: &[usize] = &[0];
 const PHASE2_VIEWS: &[usize] = &[1];
 const CAMERA_VIEWS: &[usize] = &[0, 1];
-/// Culling view of each shadow map: 4 cascades, then 4 spot lights.
-const SHADOW_VIEWS: [&[usize]; CULL_VIEWS - 2] = [&[2], &[3], &[4], &[5], &[6], &[7], &[8], &[9]];
+/// `0, 1, 2, ...`: single-view slices for the geometry passes.
+static VIEW_IDS: [usize; CULL_VIEWS] = {
+    let mut a = [0; CULL_VIEWS];
+    let mut i = 0;
+    while i < CULL_VIEWS {
+        a[i] = i;
+        i += 1;
+    }
+    a
+};
+
+/// The culling view of shadow view `k` (4 cascades, 4 spot lights, then 6 faces per point light).
+fn shadow_cull_view(k: usize) -> &'static [usize] {
+    &VIEW_IDS[2 + k..3 + k]
+}
 /// Default LOD error threshold: a level is used while its projected geometric error stays under
 /// this many pixels. `ANVIL_LOD=0` disables LODs, `ANVIL_LOD=<px>` overrides.
 const DEFAULT_LOD_PIXELS: f32 = 0.5;
@@ -102,6 +125,12 @@ const CASCADE_NAMES: [&str; CASCADES] = [
     "shadow.cascade1",
     "shadow.cascade2",
     "shadow.cascade3",
+];
+const POINT_NAMES: [&str; MAX_POINT_SHADOWS] = [
+    "shadow.point0",
+    "shadow.point1",
+    "shadow.point2",
+    "shadow.point3",
 ];
 const SPOT_NAMES: [&str; MAX_SPOT_SHADOWS] = [
     "shadow.spot0",
@@ -121,15 +150,37 @@ pub struct Mesh {
     radius: f32,
 }
 
-/// A GPU texture with its bindless slot. Handle: [`TextureId`].
+/// A streamed texture (ADR-0013 §8, LAYER-007 §18). Handle: [`TextureId`].
+///
+/// The CPU keeps the whole mip chain; the GPU image holds the levels from `base` down, so its
+/// bindless slot changes when the residency does (materials look the slot up every frame).
 pub struct Texture {
+    /// The GPU image: CPU level `base` and every coarser one.
     texture: TextureHandle,
     index: u32,
+    label: String,
+    width: u32,
+    height: u32,
+    srgb: bool,
+    /// The full chain, level 0 first.
+    mips: Vec<Vec<u8>>,
+    /// Resident base level and the coarsest level residency may drop to.
+    base: u32,
+    floor: u32,
+    /// Frame of the last residency change.
+    changed: u64,
+    /// Pixels the largest object using this texture covered recently (a slowly decaying maximum).
+    pixels: f32,
+    /// `suffix[b]`: resident bytes with base level `b`.
+    suffix: Vec<u64>,
 }
 
 /// A material record (GPU layout plus the alpha mode that selects pipelines). Handle: [`MaterialId`].
 pub struct Material {
+    /// Factors; the texture slots are filled in every frame from `textures`.
     gpu: GpuMaterial,
+    /// Base color, metallic-roughness, normal, occlusion and emissive textures (defaults resolved).
+    textures: [TextureId; 5],
     alpha_mode: AlphaMode,
     double_sided: bool,
 }
@@ -172,10 +223,14 @@ pub enum DebugView {
     Lod = 4,
     /// Instances that occlusion culling phase 2 drew this frame tinted magenta (GPU culling).
     Occlusion,
+    /// Resident mip level of each material's base color texture tinted: 0 green, 1 light green,
+    /// 2 yellow, 3 orange, 4 red, 5 and up magenta (texture streaming).
+    Mips,
 }
 
 impl DebugView {
-    /// Parses the `ANVIL_DEBUG_VIEW` names: `clusters`, `cascades`, `ssao`, `lod`, `occlusion`.
+    /// Parses the `ANVIL_DEBUG_VIEW` names: `clusters`, `cascades`, `ssao`, `lod`, `occlusion`,
+    /// `mips`.
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "clusters" => Self::Clusters,
@@ -183,6 +238,35 @@ impl DebugView {
             "ssao" => Self::Ssao,
             "lod" => Self::Lod,
             "occlusion" => Self::Occlusion,
+            "mips" => Self::Mips,
+            _ => return None,
+        })
+    }
+}
+
+/// Which debug geometry the renderer draws by itself (`ANVIL_DEBUG_DRAW`); the application can
+/// always add its own lines through [`Renderer::debug_lines`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DebugDraw {
+    /// Nothing.
+    #[default]
+    None,
+    /// Bounding spheres of the instances within 60 m of the camera (objects over 50 m radius,
+    /// like a ground plane, are skipped).
+    Bounds,
+    /// The four directional shadow cascade volumes.
+    Cascades,
+    /// Point-light ranges and spot-light cones.
+    Lights,
+}
+
+impl DebugDraw {
+    /// Parses the `ANVIL_DEBUG_DRAW` names: `bounds`, `cascades`, `lights`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "bounds" => Self::Bounds,
+            "cascades" => Self::Cascades,
+            "lights" => Self::Lights,
             _ => return None,
         })
     }
@@ -298,6 +382,8 @@ pub struct StageTimes {
     pub shadow_lists: Duration,
     /// Copying frame data into the upload ring.
     pub upload: Duration,
+    /// Texture streaming: need estimate, residency plan and the uploads it triggers.
+    pub streaming: Duration,
     /// Declaring the render graph (passes and bodies).
     pub graph_build: Duration,
     /// [`RenderGraph::compile`].
@@ -329,6 +415,29 @@ impl Drop for StageGuard<'_> {
     }
 }
 
+/// Texture streaming counters (ADR-0013 §8).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextureStats {
+    /// Textures.
+    pub textures: u32,
+    /// Bytes resident on the GPU.
+    pub resident_bytes: u64,
+    /// The VRAM budget (`ANVIL_TEXTURE_BUDGET_MB`).
+    pub budget_bytes: u64,
+    /// Bytes if every texture were fully resident.
+    pub full_bytes: u64,
+    /// Textures that want a finer level than they have (the upload budget deferred them).
+    pub pending_uploads: u32,
+    /// Bytes still to upload for them.
+    pub pending_bytes: u64,
+    /// Textures re-uploaded this frame (promotions and demotions).
+    pub uploads: u32,
+    /// Bytes uploaded this frame.
+    pub uploaded_bytes: u64,
+    /// Textures dropped to a coarser level so far.
+    pub evictions: u64,
+}
+
 /// Per-frame counters (ADR-0011 §11), logged once per second at `debug`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RendererStats {
@@ -356,6 +465,10 @@ pub struct RendererStats {
     pub instances_uploaded: u32,
     /// Instances in the scene (slots of the instance buffer).
     pub instances: u32,
+    /// Point lights that rendered a cube shadow map this frame.
+    pub point_shadows: u32,
+    /// Texture streaming counters.
+    pub textures: TextureStats,
     /// CPU time of each preparation stage.
     pub stages: StageTimes,
     /// Per-pass GPU times of an earlier frame (`frames_in_flight` old, see
@@ -382,9 +495,22 @@ pub struct Renderer {
     transparent: Pipes,
     lighting: PipelineHandle,
     shadow_pipes: Pipes,
+    /// Shadow pipelines of the cube faces: the face images are mirrored, so the culled winding is
+    /// the opposite of the other shadow maps.
+    shadow_cube_pipes: Pipes,
     tonemap: PipelineHandle,
+    debug_pipeline: PipelineHandle,
     cascades: [ShadowMap; CASCADES],
     spots: [ShadowMap; MAX_SPOT_SHADOWS],
+    points: [PointShadow; MAX_POINT_SHADOWS],
+    debug_lines: DebugLines,
+    debug_draw: DebugDraw,
+    /// VRAM budget for texture residency and the per-frame upload budget (bytes).
+    texture_budget: u64,
+    upload_budget: u64,
+    /// Textures demoted so far.
+    evictions: u64,
+    texture_stats: TextureStats,
     cluster_grid: Option<ClusterGrid>,
     ssao_pipeline: PipelineHandle,
     ssao_blur_pipeline: PipelineHandle,
@@ -519,6 +645,105 @@ struct ShadowMap {
     index: u32,
 }
 
+/// A depth cube map of a point light: `cube` is sampled through `index` (a `textureCube` slot),
+/// each of the six `faces` is a one-layer view the passes render into.
+struct PointShadow {
+    cube: TextureHandle,
+    faces: [TextureHandle; 6],
+    index: u32,
+}
+
+fn point_shadow<D: Device>(d: &D, label: &str) -> Result<PointShadow, RhiError> {
+    let usage = TextureUsage::DEPTH_ATTACHMENT | TextureUsage::SAMPLED;
+    let cube = d.create_texture(&TextureDesc {
+        label: Some(label),
+        width: POINT_SHADOW_SIZE,
+        height: POINT_SHADOW_SIZE,
+        format: DEPTH_FORMAT,
+        usage,
+        mip_levels: 1,
+        array_layers: 6,
+        cube: true,
+    })?;
+    let mut faces = [TextureHandle::NULL; 6];
+    let made = (|| {
+        for (f, face) in faces.iter_mut().enumerate() {
+            *face = d.create_texture_view(
+                cube,
+                &TextureViewDesc {
+                    label: Some("shadow.point.face"),
+                    base_mip: 0,
+                    mip_count: 1,
+                    base_layer: f as u32,
+                    layer_count: 1,
+                    usage,
+                },
+            )?;
+        }
+        d.texture_index(cube)
+    })();
+    match made {
+        Ok(index) => Ok(PointShadow { cube, faces, index }),
+        Err(e) => {
+            for f in faces.into_iter().filter(|f| *f != TextureHandle::NULL) {
+                d.destroy_texture(f);
+            }
+            d.destroy_texture(cube);
+            Err(e)
+        }
+    }
+}
+
+/// Per-frame decay of a texture's covered-pixels maximum: about a quarter second to halve at 60 fps.
+const PIXEL_DECAY: f32 = 0.95;
+
+/// Bytes from the environment variable `name` given in MiB (fractions allowed), or `default_mb`.
+fn env_megabytes(name: &str, default_mb: f64) -> u64 {
+    let mb = std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v >= 0.0)
+        .unwrap_or(default_mb);
+    (mb * (1u64 << 20) as f64) as u64
+}
+
+/// Creates the GPU image of `tex`'s chain from level `base` down and uploads it.
+fn make_resident<D: Device>(
+    device: &D,
+    tex: &Texture,
+    base: u32,
+) -> Result<(TextureHandle, u32), RhiError> {
+    let (w, h) = streaming::level_size(tex.width, tex.height, base);
+    let texture = device.create_texture(&TextureDesc {
+        label: Some(&tex.label),
+        width: w,
+        height: h,
+        format: if tex.srgb {
+            Format::Rgba8Srgb
+        } else {
+            Format::Rgba8Unorm
+        },
+        usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+        mip_levels: tex.mips.len() as u32 - base,
+        array_layers: 1,
+        cube: false,
+    })?;
+    let levels: Vec<&[u8]> = tex.mips[base as usize..]
+        .iter()
+        .map(Vec::as_slice)
+        .collect();
+    match device
+        .upload_texture_mips(texture, &levels)
+        .and_then(|()| device.texture_index(texture))
+    {
+        Ok(index) => Ok((texture, index)),
+        Err(e) => {
+            device.destroy_texture(texture);
+            Err(e)
+        }
+    }
+}
+
 fn spirv_words(bytes: &[u8]) -> Vec<u32> {
     bytes
         .as_chunks::<4>()
@@ -552,6 +777,31 @@ pub(crate) fn make_pipeline_blend<D: Device>(
     cull: CullMode,
     blend: &[BlendState],
 ) -> Result<PipelineHandle, RhiError> {
+    make_pipeline_topology(
+        d,
+        label,
+        vert,
+        frag,
+        color,
+        depth,
+        cull,
+        blend,
+        PrimitiveTopology::TriangleList,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_pipeline_topology<D: Device>(
+    d: &D,
+    label: &str,
+    vert: &[u8],
+    frag: &[u8],
+    color: &[Format],
+    depth: Option<DepthState>,
+    cull: CullMode,
+    blend: &[BlendState],
+    topology: PrimitiveTopology,
+) -> Result<PipelineHandle, RhiError> {
     let mk = |bytes: &[u8], l: String| -> Result<ShaderModuleHandle, RhiError> {
         d.create_shader_module(&ShaderModuleDesc {
             spirv: &spirv_words(bytes),
@@ -572,7 +822,7 @@ pub(crate) fn make_pipeline_blend<D: Device>(
         },
         color_formats: color,
         depth,
-        topology: PrimitiveTopology::TriangleList,
+        topology,
         cull,
         front_face: FrontFace::CounterClockwise,
         blend,
@@ -804,6 +1054,36 @@ impl Renderer {
             CullMode::Front,
             &[],
         )?;
+        let shadow_bias = Some(DepthBias {
+            constant: 2.0,
+            slope: 2.5,
+            clamp: 0.0,
+        });
+        let shadow_cube_pipes = make_variants(
+            device,
+            "renderer.shadow_cube",
+            SHADOW_VERT,
+            &SHADOW_FRAGS,
+            &[],
+            depth_state(CompareOp::LessOrEqual, true, shadow_bias),
+            CullMode::Back,
+            &[],
+        )?;
+        let debug_pipeline = make_pipeline_topology(
+            device,
+            "renderer.debug_lines",
+            DEBUG_VERT,
+            DEBUG_FRAG,
+            &[HDR_FORMAT],
+            depth_state(CompareOp::GreaterOrEqual, false, None),
+            CullMode::None,
+            &none,
+            PrimitiveTopology::LineList,
+        )?;
+        let mut points = Vec::new();
+        for name in POINT_NAMES {
+            points.push(point_shadow(device, name)?);
+        }
         let mut cascades = Vec::new();
         for name in CASCADE_NAMES {
             cascades.push(shadow_map(device, name, SHADOW_SIZE)?);
@@ -824,6 +1104,9 @@ impl Renderer {
         let mut graph = RenderGraph::new(device.diagnostics().frames_in_flight);
         for m in cascades.iter().chain(&spots) {
             graph.track(m.texture, TextureState::Undefined);
+        }
+        for f in points.iter().flat_map(|p| p.faces) {
+            graph.track(f, TextureState::Undefined);
         }
         let sampler = |label, address| {
             device.create_sampler(&SamplerDesc {
@@ -882,9 +1165,18 @@ impl Renderer {
             transparent,
             lighting,
             shadow_pipes,
+            shadow_cube_pipes,
             tonemap,
+            debug_pipeline,
             cascades: cascades.try_into().ok().expect("4 cascades"),
             spots: spots.try_into().ok().expect("4 spot maps"),
+            points: points.try_into().ok().expect("4 point maps"),
+            debug_lines: DebugLines::default(),
+            debug_draw: DebugDraw::None,
+            texture_budget: env_megabytes("ANVIL_TEXTURE_BUDGET_MB", 512.0),
+            upload_budget: env_megabytes("ANVIL_TEXTURE_UPLOAD_MB", 8.0),
+            evictions: 0,
+            texture_stats: TextureStats::default(),
             cluster_grid: None,
             ssao_pipeline,
             ssao_blur_pipeline,
@@ -1069,10 +1361,15 @@ impl Renderer {
         }
     }
 
-    /// Uploads a tightly packed RGBA8 image (`srgb` selects the color space).
+    /// Registers a tightly packed RGBA8 image (`srgb` selects the color space). The full mip chain
+    /// is generated on the CPU (box filter, in linear light for sRGB) and kept; the GPU holds only
+    /// the levels the streaming policy wants resident (ADR-0013 §8): small textures (at most 128
+    /// texels a side) fully, larger ones start at a 64 texel level and are refined by
+    /// [`Renderer::render`] as materials that use them are seen up close.
     ///
     /// # Errors
-    /// Any [`RhiError`] from texture creation or upload (e.g. wrong data length).
+    /// [`RhiError::InvalidDescriptor`] when `rgba8` is not `width * height * 4` bytes, or any
+    /// [`RhiError`] from texture creation or upload.
     pub fn create_texture<D: Device>(
         &mut self,
         device: &D,
@@ -1082,28 +1379,194 @@ impl Renderer {
         height: u32,
         srgb: bool,
     ) -> Result<TextureId, RhiError> {
-        let texture = device.create_texture(&TextureDesc {
-            label: Some(label),
+        if width == 0
+            || height == 0
+            || rgba8.len() as u64 != u64::from(width) * u64::from(height) * 4
+        {
+            return Err(RhiError::InvalidDescriptor(format!(
+                "texture {label}: expected {width}x{height}x4 bytes, got {}",
+                rgba8.len()
+            )));
+        }
+        let started = Instant::now();
+        let mips = streaming::mip_chain(rgba8, width, height, srgb);
+        let (floor, initial) = streaming::residency_bounds(width, height);
+        let mut suffix = vec![0u64; mips.len() + 1];
+        for l in (0..mips.len()).rev() {
+            suffix[l] = suffix[l + 1] + mips[l].len() as u64;
+        }
+        let mut tex = Texture {
+            texture: TextureHandle::NULL,
+            index: 0,
+            label: label.to_owned(),
             width,
             height,
-            format: if srgb {
-                Format::Rgba8Srgb
-            } else {
-                Format::Rgba8Unorm
-            },
-            usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
-            mip_levels: 1,
-            array_layers: 1,
-            cube: false,
-        })?;
-        if let Err(e) = device.upload_texture(texture, rgba8) {
-            device.destroy_texture(texture);
-            return Err(e);
-        }
-        let index = device.texture_index(texture)?;
-        let id = self.textures.insert(Texture { texture, index });
-        tracing::debug!(label, ?id, width, height, srgb, index, "texture created");
+            srgb,
+            mips,
+            base: initial,
+            floor,
+            changed: u64::from(self.frame_index),
+            pixels: 0.0,
+            suffix,
+        };
+        (tex.texture, tex.index) = make_resident(device, &tex, initial)?;
+        let resident = tex.suffix[initial as usize];
+        let (levels, index) = (tex.mips.len(), tex.index);
+        let id = self.textures.insert(tex);
+        tracing::debug!(
+            label,
+            ?id,
+            width,
+            height,
+            srgb,
+            index,
+            levels,
+            base = initial,
+            resident_bytes = resident,
+            chain_ms = started.elapsed().as_secs_f64() * 1e3,
+            "texture created"
+        );
         Ok(id)
+    }
+
+    /// Re-creates the GPU image of `id` with base level `base` and uploads its levels. The old
+    /// image is destroyed (deferred by the device); the bindless slot changes.
+    fn set_residency<D: Device>(
+        &mut self,
+        device: &D,
+        id: TextureId,
+        base: u32,
+    ) -> Result<(), RhiError> {
+        let Some(t) = self.textures.get_mut(id) else {
+            return Ok(());
+        };
+        let (texture, index) = make_resident(device, t, base)?;
+        let old = std::mem::replace(&mut t.texture, texture);
+        let (from, label) = (t.base, t.label.clone());
+        (t.index, t.base, t.changed) = (index, base, u64::from(self.frame_index));
+        device.destroy_texture(old);
+        tracing::debug!(label, from, to = base, index, "texture residency changed");
+        Ok(())
+    }
+
+    /// Texture streaming for this frame (ADR-0013 §8): estimates the pixels each material covers
+    /// from the instances in view, derives the base level each texture wants, then plans and
+    /// applies the residency changes under the VRAM and upload budgets.
+    ///
+    /// The estimate takes an object's projected diameter `2 r f / d` (radius `r`, distance `d`,
+    /// focal length `f` in pixels) as the number of texels a mapping across the whole object
+    /// needs. shortcut: tiling and UV scale are ignored (a texture repeated 8 times over a
+    /// surface is under-resolved by 3 levels); upgrade to GPU feedback when assets carry UV
+    /// density.
+    fn update_streaming<D: Device>(
+        &mut self,
+        device: &D,
+        scene: &RenderScene,
+        view_proj: Mat4,
+        focal: f32,
+    ) -> Result<(), RhiError> {
+        let dense = self
+            .materials
+            .iter()
+            .map(|(h, _)| h.index() + 1)
+            .max()
+            .unwrap_or(1) as usize;
+        let frustum = Frustum::from_view_proj(view_proj);
+        let cam = scene.camera.position;
+        let (meshes, materials, default) = (&self.meshes, &self.materials, self.default_material);
+        let one = |inst: &crate::MeshInstance, acc: &mut [f32]| {
+            let Some(mesh) = meshes.get(inst.mesh) else {
+                return;
+            };
+            let (c, r) = transform_sphere(&inst.transform, mesh.center, mesh.radius);
+            if !frustum.intersects_sphere(c, r) {
+                return;
+            }
+            let px = 2.0 * r * focal / c.distance(cam).max(r).max(1e-3);
+            let m = if materials.get(inst.material).is_some() {
+                inst.material
+            } else {
+                default
+            };
+            let slot = &mut acc[m.index() as usize];
+            *slot = slot.max(px);
+        };
+        let pixels = if scene.meshes.len() >= prep::PAR_MIN {
+            scene
+                .meshes
+                .par_chunks(4096)
+                .map(|chunk| {
+                    let mut acc = vec![0.0f32; dense];
+                    chunk.iter().for_each(|i| one(i, &mut acc));
+                    acc
+                })
+                .reduce(
+                    || vec![0.0; dense],
+                    |mut a, b| {
+                        a.iter_mut().zip(&b).for_each(|(x, y)| *x = x.max(*y));
+                        a
+                    },
+                )
+        } else {
+            let mut acc = vec![0.0f32; dense];
+            scene.meshes.iter().for_each(|i| one(i, &mut acc));
+            acc
+        };
+        // Pixels per texture: the largest of the materials that use it.
+        let mut tex_pixels: Vec<f32> = Vec::new();
+        for (h, m) in self.materials.iter() {
+            let px = pixels[h.index() as usize];
+            for t in m.textures {
+                let i = t.index() as usize;
+                if tex_pixels.len() <= i {
+                    tex_pixels.resize(i + 1, 0.0);
+                }
+                tex_pixels[i] = tex_pixels[i].max(px);
+            }
+        }
+        let frame = u64::from(self.frame_index);
+        let ids: Vec<TextureId> = self.textures.iter().map(|(id, _)| id).collect();
+        let (mut items, mut full_bytes) = (Vec::new(), 0);
+        for &id in &ids {
+            let Some(t) = self.textures.get_mut(id) else {
+                continue;
+            };
+            let px = tex_pixels.get(id.index() as usize).copied().unwrap_or(0.0);
+            t.pixels = px.max(t.pixels * PIXEL_DECAY);
+            full_bytes += t.suffix[0];
+            items.push(PlanItem {
+                base: t.base,
+                want: streaming::wanted_base(t.width.max(t.height), t.pixels, t.floor),
+                floor: t.floor,
+                stable: frame.saturating_sub(t.changed),
+                suffix: t.suffix.clone(),
+            });
+        }
+        let plan = streaming::plan(&items, self.texture_budget, self.upload_budget);
+        let floor_bytes: u64 = items.iter().map(|it| it.suffix[it.floor as usize]).sum();
+        if floor_bytes > self.texture_budget {
+            tracing::warn!(
+                floor_bytes,
+                budget = self.texture_budget,
+                "texture budget below the always-resident tail of every texture"
+            );
+        }
+        for &(i, base) in &plan.changes {
+            self.set_residency(device, ids[i], base)?;
+        }
+        self.evictions += u64::from(plan.evictions);
+        self.texture_stats = TextureStats {
+            textures: ids.len() as u32,
+            resident_bytes: plan.resident_bytes,
+            budget_bytes: self.texture_budget,
+            full_bytes,
+            pending_uploads: plan.pending,
+            pending_bytes: plan.pending_bytes,
+            uploads: plan.changes.len() as u32,
+            uploaded_bytes: plan.upload_bytes,
+            evictions: self.evictions,
+        };
+        Ok(())
     }
 
     /// Destroys a texture (deferred by the device).
@@ -1117,10 +1580,16 @@ impl Renderer {
     /// Registers a material. Stale texture ids fall back to the built-in defaults.
     pub fn create_material(&mut self, desc: &MaterialDesc) -> MaterialId {
         let tex = |t: Option<TextureId>, default: TextureId| {
-            t.and_then(|t| self.textures.get(t))
-                .or_else(|| self.textures.get(default))
-                .map_or(0, |t| t.index)
+            t.filter(|t| self.textures.get(*t).is_some())
+                .unwrap_or(default)
         };
+        let textures = [
+            tex(desc.base_color_texture, self.white_srgb),
+            tex(desc.metallic_roughness_texture, self.white_linear),
+            tex(desc.normal_texture, self.flat_normal),
+            tex(desc.occlusion_texture, self.white_linear),
+            tex(desc.emissive_texture, self.white_srgb),
+        ];
         let m = GpuMaterial {
             base_color: desc.base_color,
             emissive: [desc.emissive[0], desc.emissive[1], desc.emissive[2], 0.0],
@@ -1128,19 +1597,21 @@ impl Renderer {
             roughness: desc.roughness,
             normal_scale: desc.normal_scale,
             occlusion_strength: desc.occlusion_strength,
-            base_color_tex: tex(desc.base_color_texture, self.white_srgb),
-            mr_tex: tex(desc.metallic_roughness_texture, self.white_linear),
-            normal_tex: tex(desc.normal_texture, self.flat_normal),
-            occlusion_tex: tex(desc.occlusion_texture, self.white_linear),
-            emissive_tex: tex(desc.emissive_texture, self.white_srgb),
+            base_color_tex: 0,
+            mr_tex: 0,
+            normal_tex: 0,
+            occlusion_tex: 0,
+            emissive_tex: 0,
             alpha_cutoff: match desc.alpha_mode {
                 AlphaMode::Mask(c) => c,
                 _ => 0.0,
             },
-            pad: [0; 2],
+            base_mip: 0,
+            pad: 0,
         };
         let id = self.materials.insert(Material {
             gpu: m,
+            textures,
             alpha_mode: desc.alpha_mode,
             double_sided: desc.double_sided,
         });
@@ -1184,6 +1655,24 @@ impl Renderer {
     /// Current debug visualisation.
     pub fn debug_view(&self) -> DebugView {
         self.debug_view
+    }
+
+    /// Selects the debug geometry the renderer draws itself (`ANVIL_DEBUG_DRAW`), see
+    /// [`DebugDraw`].
+    pub fn set_debug_draw(&mut self, mode: DebugDraw) {
+        self.debug_draw = mode;
+    }
+
+    /// Current built-in debug geometry.
+    pub fn debug_draw(&self) -> DebugDraw {
+        self.debug_draw
+    }
+
+    /// The per-frame debug line buffer: lines added before [`Renderer::render`] are drawn by that
+    /// frame's `debug.lines` pass (after the transparent pass, depth tested, no depth write) and
+    /// then discarded.
+    pub fn debug_lines(&mut self) -> &mut DebugLines {
+        &mut self.debug_lines
     }
 
     /// Switches GPU-driven culling, LOD and indirect draws on or off (default on; the
@@ -1315,6 +1804,88 @@ impl Renderer {
         Ok(())
     }
 
+    /// Adds the geometry of the selected [`DebugDraw`] mode to the frame's debug lines.
+    fn queue_debug_draw(
+        &mut self,
+        scene: &RenderScene,
+        lights: &[Light],
+        cascade_vp: Option<[Mat4; CASCADES]>,
+        frustum: &Frustum,
+    ) {
+        /// Bounding spheres are drawn for instances this near the camera, up to this radius.
+        const BOUNDS_DISTANCE: f32 = 60.0;
+        const BOUNDS_MAX_RADIUS: f32 = 50.0;
+        let lines = &mut self.debug_lines;
+        match self.debug_draw {
+            DebugDraw::None => {}
+            DebugDraw::Bounds => {
+                let cam = scene.camera.position;
+                for inst in &scene.meshes {
+                    let Some(mesh) = self.meshes.get(inst.mesh) else {
+                        continue;
+                    };
+                    let (c, r) = transform_sphere(&inst.transform, mesh.center, mesh.radius);
+                    if r <= BOUNDS_MAX_RADIUS
+                        && c.distance(cam) - r < BOUNDS_DISTANCE
+                        && frustum.intersects_sphere(c, r)
+                    {
+                        // 2 % larger so bounds that hug the mesh are not hidden by its surface.
+                        lines.sphere(c, r * 1.02, Vec3::new(0.2, 1.0, 1.0));
+                    }
+                }
+            }
+            DebugDraw::Cascades => {
+                const TINT: [Vec3; CASCADES] = [
+                    Vec3::new(1.0, 0.25, 0.25),
+                    Vec3::new(0.25, 1.0, 0.25),
+                    Vec3::new(0.3, 0.4, 1.0),
+                    Vec3::new(1.0, 1.0, 0.25),
+                ];
+                for (vp, tint) in cascade_vp.iter().flatten().zip(TINT) {
+                    lines.frustum(*vp, tint);
+                }
+            }
+            DebugDraw::Lights => {
+                for l in lights {
+                    match *l {
+                        Light::Point {
+                            position,
+                            color,
+                            range,
+                            ..
+                        } if range > 0.0 => {
+                            lines.sphere(position, range, color.normalize_or_zero())
+                        }
+                        Light::Spot {
+                            position,
+                            direction,
+                            color,
+                            range,
+                            outer_cone,
+                            ..
+                        } if range > 0.0 => {
+                            let (dir, color) = (direction.normalize(), color.normalize_or_zero());
+                            let side = dir.any_orthonormal_vector();
+                            let (u, v) = (side, dir.cross(side));
+                            let rim = position + dir * range;
+                            let radius = range * outer_cone.tan();
+                            lines.circle(rim, u * radius, v * radius, color);
+                            for i in 0..8 {
+                                let a = i as f32 / 8.0 * std::f32::consts::TAU;
+                                lines.line(
+                                    position,
+                                    rim + (u * a.cos() + v * a.sin()) * radius,
+                                    color,
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     /// Builds and records the frame as a render graph: environment bakes (when the environment
     /// changed), four shadow cascades and up to four spot shadows, the depth prepass, then
     /// either forward lighting or G-buffer + lighting, the skybox, blended geometry and tonemap
@@ -1429,8 +2000,11 @@ impl Renderer {
         let dir_count = lights.len();
         let mut spot_vp = [Mat4::IDENTITY; MAX_SPOT_SHADOWS];
         let mut spot_used = 0;
+        // Point lights with a cube shadow map: the best candidates by distance and intensity.
+        let point_pick = select_point_shadows(lights_in, cam, SHADOW_DISTANCE);
+        let mut point_vp = [Mat4::IDENTITY; MAX_POINT_SHADOWS * 6];
         let mut spheres = Vec::new();
-        for l in lights_in {
+        for (light_index, l) in lights_in.iter().enumerate() {
             let (center, radius) = match *l {
                 Light::Directional { .. } => continue,
                 Light::Point {
@@ -1465,6 +2039,16 @@ impl Renderer {
                 g.spot[2] = spot_used as f32;
                 spot_used += 1;
             }
+            if let Light::Point {
+                position, range, ..
+            } = *l
+                && let Some(slot) = point_pick.iter().position(|&p| p == light_index)
+            {
+                for f in 0..6 {
+                    point_vp[slot * 6 + f] = point_face_view_proj(position, range, f);
+                }
+                g.spot[2] = slot as f32;
+            }
             spheres.push(LightSphere {
                 center: view.transform_point3(center),
                 // A light without range reaches everywhere.
@@ -1488,6 +2072,23 @@ impl Renderer {
                 start = splits[c];
             }
         }
+
+        // Every shadow view with a light: 4 cascades, 4 spots, then 6 faces per point light.
+        let point_used = point_pick.len();
+        let mut shadow_vp: Vec<Option<Mat4>> = vec![None; SHADOW_VIEWS];
+        for c in 0..CASCADES {
+            shadow_vp[c] = cascade_dir.map(|_| cascade_vp[c]);
+        }
+        for i in 0..spot_used {
+            shadow_vp[CASCADES + i] = Some(spot_vp[i]);
+        }
+        for k in 0..point_used * 6 {
+            shadow_vp[CASCADES + MAX_SPOT_SHADOWS + k] = Some(point_vp[k]);
+        }
+        let view_mask = shadow_vp
+            .iter()
+            .enumerate()
+            .fold(0u32, |m, (k, v)| m | (u32::from(v.is_some()) << k));
 
         // Clustered assignment.
         let cluster_guard = StageGuard::new(
@@ -1549,6 +2150,12 @@ impl Renderer {
             StageGuard::new(tracing::debug_span!("renderer.upload"), &mut stages.upload);
         let upload_runs = self.sync_instances(device, slot)?;
         drop(upload_guard);
+        let streaming_guard = StageGuard::new(
+            tracing::debug_span!("renderer.streaming"),
+            &mut stages.streaming,
+        );
+        self.update_streaming(device, scene, view_proj_unjit, h as f32 / (2.0 * tan_y))?;
+        drop(streaming_guard);
 
         // GPU-driven culling needs at least one opaque instance; otherwise the (empty) CPU path.
         let gpu_cull = self.gpu_culling && self.cache.variant_counts.iter().sum::<u32>() > 0;
@@ -1599,13 +2206,8 @@ impl Renderer {
                     (0..n).map(one).collect()
                 }
             };
-        let cascade_draws = view_lists(CASCADES, &|c| cascade_dir.map(|_| cascade_vp[c]));
-        let spot_draws = view_lists(MAX_SPOT_SHADOWS, &|i| (i < spot_used).then(|| spot_vp[i]));
-        let shadow_draw_count = cascade_draws
-            .iter()
-            .chain(&spot_draws)
-            .map(Vec::len)
-            .sum::<usize>();
+        let shadow_draws = view_lists(SHADOW_VIEWS, &|k| shadow_vp[k]);
+        let shadow_draw_count = shadow_draws.iter().map(Vec::len).sum::<usize>();
         drop(shadow_guard);
 
         let dense = self
@@ -1616,7 +2218,15 @@ impl Renderer {
             .unwrap_or(1) as usize;
         let mut materials = vec![bytemuck::Zeroable::zeroed(); dense];
         for (h, m) in self.materials.iter() {
-            materials[h.index() as usize] = m.gpu;
+            let slot = |t: TextureId| self.textures.get(t).map_or(0, |t| t.index);
+            let mut g: GpuMaterial = m.gpu;
+            g.base_color_tex = slot(m.textures[0]);
+            g.mr_tex = slot(m.textures[1]);
+            g.normal_tex = slot(m.textures[2]);
+            g.occlusion_tex = slot(m.textures[3]);
+            g.emissive_tex = slot(m.textures[4]);
+            g.base_mip = self.textures.get(m.textures[0]).map_or(0, |t| t.base);
+            materials[h.index() as usize] = g;
         }
 
         let upload_guard =
@@ -1638,11 +2248,13 @@ impl Renderer {
             prev_view_proj,
             cascade_vp,
             spot_vp,
+            point_vp,
             camera_pos: [cam.x, cam.y, cam.z, 1.0],
             cascade_splits: splits,
             cascade_texel,
             cascade_tex: std::array::from_fn(|i| self.cascades[i].index),
             spot_tex: std::array::from_fn(|i| self.spots[i].index),
+            point_tex: std::array::from_fn(|i| self.points[i].index),
             light_count: lights.len() as u32,
             dir_count: dir_count as u32,
             sampler_index: self.sampler_indices.0,
@@ -1676,24 +2288,32 @@ impl Renderer {
             lights_addr,
             materials_addr,
         ];
+        // Debug geometry: the built-in modes and the application's lines go to the ring.
+        self.queue_debug_draw(
+            scene,
+            lights_in,
+            (cascade_dir.is_some()).then_some(cascade_vp),
+            &cam_frustum,
+        );
+        let debug_verts = self.debug_lines.take();
+        let debug_vertices = debug_verts.len() as u32;
+        let debug_address = if debug_verts.is_empty() {
+            0
+        } else {
+            self.ring_push(device, slot, bytemuck::cast_slice(&debug_verts))?
+        };
         // GPU culling: parameters of the compute passes (planes of the camera and every shadow
         // view, the unjittered camera, LOD threshold, depth pyramid) and the command layout.
-        let layout = CullLayout::new(self.cache.variant_counts);
+        let layout = CullLayout::new(self.cache.variant_counts, view_mask);
         let cull_params = if gpu_cull {
             self.ensure_pyramid(device, w, h)?;
             let pyr = self.pyramid.as_ref().expect("pyramid ensured above");
-            let mut planes = [[[0.0f32; 4]; 6]; 9];
-            let mut view_mask = 0u32;
+            let mut planes = [[[0.0f32; 4]; 6]; 1 + SHADOW_VIEWS];
             planes[0] = cam_frustum.planes();
-            if cascade_dir.is_some() {
-                for c in 0..CASCADES {
-                    planes[1 + c] = Frustum::from_view_proj(cascade_vp[c]).planes();
-                    view_mask |= 1 << c;
+            for (k, vp) in shadow_vp.iter().enumerate() {
+                if let Some(vp) = vp {
+                    planes[1 + k] = Frustum::from_view_proj(*vp).planes();
                 }
-            }
-            for i in 0..spot_used {
-                planes[1 + CASCADES + i] = Frustum::from_view_proj(spot_vp[i]).planes();
-                view_mask |= 1 << (CASCADES + i);
             }
             let params = GpuCullParams {
                 planes,
@@ -1747,6 +2367,18 @@ impl Renderer {
                 None,
             )
         });
+        // Cube faces of the lights that cast: each one-layer view is its own graph texture; the
+        // shaders sample the whole cube through its own slot (like the depth pyramid).
+        let point_ids: Vec<TexId> = (0..point_used * 6)
+            .map(|k| {
+                b.import(
+                    format!("{}.face{}", POINT_NAMES[k / 6], k % 6),
+                    self.points[k / 6].faces[k % 6],
+                    (POINT_SHADOW_SIZE, POINT_SHADOW_SIZE),
+                    None,
+                )
+            })
+            .collect();
         let ids = self.ibl.import(&mut b);
         let swapchain = b.import(
             "swapchain",
@@ -1854,10 +2486,10 @@ impl Renderer {
             shadow_pass(
                 &mut b,
                 ShadowInputs {
-                    name: CASCADE_NAMES[c],
+                    name: CASCADE_NAMES[c].into(),
                     texture: cascade_ids[c],
                     view_index: c as u32,
-                    geometry: geometry(self.shadow_pipes, &cascade_draws[c], SHADOW_VIEWS[c]),
+                    geometry: geometry(self.shadow_pipes, &shadow_draws[c], shadow_cull_view(c)),
                 },
             );
         }
@@ -1865,13 +2497,29 @@ impl Renderer {
             shadow_pass(
                 &mut b,
                 ShadowInputs {
-                    name: SPOT_NAMES[i],
+                    name: SPOT_NAMES[i].into(),
                     texture: spot_ids[i],
-                    view_index: 4 + i as u32,
+                    view_index: (CASCADES + i) as u32,
                     geometry: geometry(
                         self.shadow_pipes,
-                        &spot_draws[i],
-                        SHADOW_VIEWS[CASCADES + i],
+                        &shadow_draws[CASCADES + i],
+                        shadow_cull_view(CASCADES + i),
+                    ),
+                },
+            );
+        }
+        for (k, &face) in point_ids.iter().enumerate() {
+            let view = CASCADES + MAX_SPOT_SHADOWS + k;
+            shadow_pass(
+                &mut b,
+                ShadowInputs {
+                    name: format!("shadow.point{}.face{}", k / 6, k % 6).into(),
+                    texture: face,
+                    view_index: view as u32,
+                    geometry: geometry(
+                        self.shadow_cube_pipes,
+                        &shadow_draws[view],
+                        shadow_cull_view(view),
                     ),
                 },
             );
@@ -1933,6 +2581,7 @@ impl Renderer {
             ao
         });
         let mut reads: Vec<_> = cascade_ids.into_iter().chain(spot_ids).collect();
+        reads.extend(point_ids.iter().copied());
         reads.extend([ids.sky, ids.irradiance, ids.lut]);
         reads.extend(ids.prefilter);
         match self.path {
@@ -1993,6 +2642,19 @@ impl Renderer {
                     reads,
                     ssao: None,
                     geometry: geo.cpu(self.transparent, &blended),
+                },
+            );
+        }
+        if debug_vertices > 0 {
+            debug_pass(
+                &mut b,
+                DebugInputs {
+                    pipeline: self.debug_pipeline,
+                    hdr,
+                    depth,
+                    frame_address: addresses[0],
+                    vertex_address: debug_address,
+                    vertex_count: debug_vertices,
                 },
             );
         }
@@ -2116,6 +2778,8 @@ impl Renderer {
             instances_uploaded,
             instances: self.cache.len() as u32,
             lights: lights.len() as u32,
+            point_shadows: point_used as u32,
+            textures: self.texture_stats,
             ring_bytes_used: self.ring_used,
             graph: graph_stats,
             culled: culled + cs.frustum_culled,
@@ -2157,6 +2821,12 @@ impl Renderer {
         for m in self.cascades.iter().chain(&self.spots) {
             device.destroy_texture(m.texture);
         }
+        for p in &self.points {
+            for f in p.faces {
+                device.destroy_texture(f);
+            }
+            device.destroy_texture(p.cube);
+        }
         device.destroy_sampler(self.shadow_sampler);
         if let Some(h) = self.history {
             for t in h.textures {
@@ -2166,6 +2836,7 @@ impl Renderer {
         for p in self
             .shadow_pipes
             .into_iter()
+            .chain(self.shadow_cube_pipes)
             .chain(self.prepass)
             .chain(self.forward)
             .chain(self.gbuffer)
@@ -2176,6 +2847,7 @@ impl Renderer {
                 self.cull_pipes.hiz,
                 self.lighting,
                 self.tonemap,
+                self.debug_pipeline,
                 self.ssao_pipeline,
                 self.ssao_blur_pipeline,
                 self.taa_pipeline,

@@ -17,7 +17,8 @@ void main() {
 #ifdef MASK
     if (s.alpha < pc.materials.m[v_material].alpha_cutoff) discard;
 #endif
-    out_albedo = vec4(s.base * instance_tint(pc.frame.d.debug_mode, v_flags), s.metallic);
+    vec3 tint = instance_tint(pc.frame.d.debug_mode, v_flags, v_material);
+    out_albedo = vec4(pc.frame.d.debug_mode == 6u ? tint * 0.5 : s.base * tint, s.metallic);
     out_normal = vec4(s.n, s.roughness);
     out_emissive = vec4(s.emissive, s.ao);
 }

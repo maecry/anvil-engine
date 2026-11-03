@@ -174,6 +174,7 @@ impl Bench {
             ("shadow_lists", ms(st.shadow_lists)),
             ("clusters", ms(st.clusters)),
             ("upload", ms(st.upload)),
+            ("streaming", ms(st.streaming)),
             ("graph_build", ms(st.graph_build)),
             ("compile", ms(st.compile)),
             ("execute", ms(st.execute)),
@@ -234,7 +235,7 @@ impl Bench {
             .map(|(n, v)| format!("    {}: {}", json_str(n), stat_json(v)))
             .collect();
         format!(
-            "{{\n  \"schema\": 1,\n  \"workload\": {},\n  \"variant_env\": {{{}}},\n  \"machine\": {{\n    \"gpu\": {},\n    \"driver\": {},\n    \"vendor_id\": {},\n    \"vulkan_api\": \"{}.{}.{}\",\n    \"cpu\": {},\n    \"logical_cpus\": {},\n    \"worker_threads\": {},\n    \"os\": {},\n    \"kernel\": {},\n    \"rustc\": {},\n    \"build\": \"{}\"\n  }},\n  \"protocol\": {{\"warmup_frames\": {}, \"measured_frames\": {}, \"resolution\": [{}, {}]}},\n  \"cpu_frame_ms\": {},\n  \"frame_interval_ms\": {},\n  \"gpu_frame_ms\": {},\n  \"cpu_stages_ms\": {{\n{}\n  }},\n  \"gpu_passes_ms\": [\n{}\n  ],\n  \"draws\": {},\n  \"shadow_draws\": {},\n  \"triangles\": {},\n  \"lights\": {},\n  \"culled_instances\": {},\n  \"gpu_culling\": {},\n  \"instances\": {},\n  \"instances_uploaded\": {},\n  \"cull\": {{\"visible\": {}, \"frustum_culled\": {}, \"occlusion_culled\": {}, \"triangles\": {}, \"camera_draws\": {}, \"phase2_draws\": {}, \"shadow_draws\": {}}},\n  \"vram_bytes\": {{\"allocated\": {}, \"reserved\": {}}}\n}}\n",
+            "{{\n  \"schema\": 1,\n  \"workload\": {},\n  \"variant_env\": {{{}}},\n  \"machine\": {{\n    \"gpu\": {},\n    \"driver\": {},\n    \"vendor_id\": {},\n    \"vulkan_api\": \"{}.{}.{}\",\n    \"cpu\": {},\n    \"logical_cpus\": {},\n    \"worker_threads\": {},\n    \"os\": {},\n    \"kernel\": {},\n    \"rustc\": {},\n    \"build\": \"{}\"\n  }},\n  \"protocol\": {{\"warmup_frames\": {}, \"measured_frames\": {}, \"resolution\": [{}, {}]}},\n  \"cpu_frame_ms\": {},\n  \"frame_interval_ms\": {},\n  \"gpu_frame_ms\": {},\n  \"cpu_stages_ms\": {{\n{}\n  }},\n  \"gpu_passes_ms\": [\n{}\n  ],\n  \"draws\": {},\n  \"shadow_draws\": {},\n  \"triangles\": {},\n  \"lights\": {},\n  \"culled_instances\": {},\n  \"gpu_culling\": {},\n  \"instances\": {},\n  \"instances_uploaded\": {},\n  \"cull\": {{\"visible\": {}, \"frustum_culled\": {}, \"occlusion_culled\": {}, \"triangles\": {}, \"camera_draws\": {}, \"phase2_draws\": {}, \"shadow_draws\": {}}},\n  \"point_shadows\": {},\n  \"textures\": {{\"count\": {}, \"resident_bytes\": {}, \"full_bytes\": {}, \"budget_bytes\": {}, \"pending_uploads\": {}, \"evictions\": {}}},\n  \"vram_bytes\": {{\"allocated\": {}, \"reserved\": {}}}\n}}\n",
             json_str(&self.workload),
             env.join(", "),
             json_str(&g.name),
@@ -278,6 +279,13 @@ impl Bench {
             stats.cull.camera_draws,
             stats.cull.phase2_draws,
             stats.cull.shadow_draws,
+            stats.point_shadows,
+            stats.textures.textures,
+            stats.textures.resident_bytes,
+            stats.textures.full_bytes,
+            stats.textures.budget_bytes,
+            stats.textures.pending_uploads,
+            stats.textures.evictions,
             diag.memory.allocated_bytes,
             diag.memory.reserved_bytes,
         )

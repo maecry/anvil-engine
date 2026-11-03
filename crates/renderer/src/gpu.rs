@@ -18,11 +18,15 @@ pub(crate) struct GpuFrame {
     pub prev_view_proj: Mat4,
     pub cascade_vp: [Mat4; 4],
     pub spot_vp: [Mat4; 4],
+    /// Faces of the point-light cube maps: light `i` face `f` at `i * 6 + f`.
+    pub point_vp: [Mat4; 24],
     pub camera_pos: [f32; 4],
     pub cascade_splits: [f32; 4],
     pub cascade_texel: [f32; 4],
     pub cascade_tex: [u32; 4],
     pub spot_tex: [u32; 4],
+    /// Bindless slots of the point-light shadow cube maps.
+    pub point_tex: [u32; 4],
     pub light_count: u32,
     pub dir_count: u32,
     pub sampler_index: u32,
@@ -86,8 +90,10 @@ pub(crate) struct GpuMesh {
     pub pad: [u32; 2],
 }
 
-/// Number of culling views: camera phase 1 and 2, 4 cascades, 4 spot lights.
-pub(crate) const CULL_VIEWS: usize = 10;
+/// Shadow views: 4 cascades, 4 spot lights and 4 point lights with 6 faces each.
+pub(crate) const SHADOW_VIEWS: usize = 32;
+/// Number of culling views: camera phase 1 and 2, then the shadow views.
+pub(crate) const CULL_VIEWS: usize = 2 + SHADOW_VIEWS;
 /// Pipeline variants per view (`Draw::variant`).
 pub(crate) const VARIANTS: usize = 4;
 /// Index of the first statistics counter after the `CULL_VIEWS * VARIANTS` draw counters.
@@ -102,8 +108,8 @@ pub(crate) const COUNTS_BYTES: u64 = ((STATS + STAT_WORDS) * 4) as u64;
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(crate) struct GpuCullParams {
-    /// Inward frustum planes of 9 views: the camera, then 4 cascades and 4 spot lights.
-    pub planes: [[[f32; 4]; 6]; 9],
+    /// Inward frustum planes of the camera and then every shadow view.
+    pub planes: [[[f32; 4]; 6]; 1 + SHADOW_VIEWS],
     pub view: Mat4,
     /// P00, P11, near, LOD error threshold in pixels.
     pub proj: [f32; 4],
@@ -157,6 +163,7 @@ impl GpuLight {
                 color,
                 intensity,
                 range,
+                ..
             } => Self {
                 position_type: [position.x, position.y, position.z, 1.0],
                 direction_range: [0.0, 0.0, 0.0, range],
@@ -208,7 +215,9 @@ pub(crate) struct GpuMaterial {
     pub occlusion_tex: u32,
     pub emissive_tex: u32,
     pub alpha_cutoff: f32,
-    pub pad: [u32; 2],
+    /// Resident base mip level of the base color texture (debug view `mips`).
+    pub base_mip: u32,
+    pub pad: u32,
 }
 
 #[cfg(test)]
@@ -217,10 +226,10 @@ mod tests {
 
     #[test]
     fn layouts_match_std430() {
-        assert_eq!(size_of::<GpuFrame>(), 1200);
+        assert_eq!(size_of::<GpuFrame>(), 2752);
         assert_eq!(size_of::<GpuInstance>(), 224);
         assert_eq!(size_of::<GpuMesh>(), 80);
-        assert_eq!(size_of::<GpuCullParams>(), 1184);
+        assert_eq!(size_of::<GpuCullParams>(), 3872);
         assert_eq!(size_of::<GpuLight>(), 64);
         assert_eq!(size_of::<GpuMaterial>(), 80);
     }

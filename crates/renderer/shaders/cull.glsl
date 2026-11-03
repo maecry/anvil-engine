@@ -6,13 +6,13 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer Visible { ui
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer Counts { uint c[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer Commands { uint w[]; };
 
-// Views: 0 camera phase 1, 1 camera phase 2, 2..5 shadow cascades, 6..9 spot shadows. Each view
-// has one command region and one counter per pipeline variant: index view * 4 + variant.
-// counts.c[40..] are statistics: visible, frustum culled, occlusion culled, triangles, camera
+// Views: 0 camera phase 1, 1 camera phase 2, 2..5 shadow cascades, 6..9 spot shadows, 10..33 point
+// shadow cube faces (light * 6 + face). Each view has one command region and one counter per
+// pipeline variant: index view * 4 + variant. counts.c[136..] are statistics: visible, frustum culled, occlusion culled, triangles, camera
 // draws, phase 2 draws, shadow draws.
-const uint STATS = 40u;
+const uint STATS = 136u;
 struct CullParams {
-    vec4 planes[54];            // frustum planes (inward) of 9 views: camera, then 8 shadow views
+    vec4 planes[198];           // frustum planes (inward) of 33 views: camera, then 32 shadow views
     mat4 view;                  // unjittered camera view
     vec4 proj;                  // P00, P11, near, LOD error threshold in pixels (0 = always LOD 0)
     vec4 cam;                   // camera position, pixels per world unit at distance 1
@@ -21,10 +21,10 @@ struct CullParams {
     Meshes meshes;
     Visible visible;
     uint instance_count;
-    uint view_mask;             // shadow views to cull for (bit k = shadow view 2 + k)
+    uint view_mask;             // shadow views to cull for (bit k = view 2 + k)
     uint pad0;
     uint pad1;
-    uint region[40];            // first command of each (view, variant) region
+    uint region[136];            // first command of each (view, variant) region
 };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Params { CullParams p; };
 

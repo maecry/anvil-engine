@@ -6,6 +6,8 @@ const uint CLUSTERS_X = 16u;
 const uint CLUSTERS_Y = 9u;
 const uint CLUSTERS_Z = 24u;
 const float SPOT_SHADOW_SIZE = 1024.0; // mirrors SPOT_SHADOW_SIZE in the renderer
+const float POINT_SHADOW_SIZE = 512.0; // mirrors POINT_SHADOW_SIZE and POINT_NEAR in shadow.rs
+const float POINT_NEAR = 0.05;
 
 // GGX normal distribution.
 float d_ggx(float n_o_h, float a2) {
@@ -80,6 +82,41 @@ float spot_shadow(FrameData f, uint slot, Light l, vec3 world_pos, vec3 n, float
     return pcf(f.spot_tex[slot], vec3(ndc.xy * 0.5 + 0.5, ndc.z));
 }
 
+// Depth the shadow face stores for a light-to-point vector `d`: conventional 0..1 depth of the
+// major-axis distance between POINT_NEAR and `far` (see point_face_view_proj in shadow.rs).
+float point_depth(vec3 d, float far) {
+    vec3 a = abs(d);
+    float z = max(a.x, max(a.y, a.z));
+    return far * (z - POINT_NEAR) / (z * (far - POINT_NEAR));
+}
+
+// Cube shadow: normal-offset lookup, then four hardware-compared taps (each bilinear, so about a
+// 3x3 kernel) spread +-half a texel across the plane perpendicular to the lookup direction. The
+// reference depth is recomputed per tap, so taps that cross onto a neighbouring face compare
+// against that face's own depth and the seams stay invisible (cube sampling is seamless).
+float point_shadow(FrameData f, uint slot, Light l, vec3 world_pos, vec3 n, float n_o_l) {
+    float far = l.direction_range.w;
+    vec3 light = l.position_type.xyz;
+    float dist = distance(world_pos, light);
+    if (dist >= far) return 1.0;
+    float texel = 2.0 * dist / POINT_SHADOW_SIZE;
+    vec3 d = world_pos + n * texel * (1.5 + 2.5 * (1.0 - n_o_l)) - light;
+    vec3 up = abs(d.y) < 0.9 * length(d) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 t1 = normalize(cross(d, up));
+    vec3 t2 = normalize(cross(d, t1));
+    float step_len = 0.5 * 2.0 * length(d) / POINT_SHADOW_SIZE;
+    uint tex = f.point_tex[slot];
+    float sum = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        vec2 o = vec2((i & 1) == 0 ? -1.0 : 1.0, (i & 2) == 0 ? -1.0 : 1.0);
+        vec3 q = d + (t1 * o.x + t2 * o.y) * step_len;
+        sum += texture(samplerCubeShadow(cubes[nonuniformEXT(tex)],
+                                         shadow_samplers[nonuniformEXT(f.shadow_sampler)]),
+                       vec4(q, point_depth(q, far)));
+    }
+    return sum * 0.25;
+}
+
 float ssao_factor(vec2 frag_xy) {
     if (pc.ssao_index == 0xFFFFFFFFu) return 1.0;
     return texelFetch(textures[nonuniformEXT(pc.ssao_index)], ivec2(frag_xy), 0).r;
@@ -127,6 +164,7 @@ void add_light(FrameData f, Light l, uint index, Surface s, vec3 world_pos, vec3
     if (l.spot.z >= 0.0) {
         if (type == 0) att *= directional_shadow(f, world_pos, s.n, n_o_l, view_z);
         else if (type == 2) att *= spot_shadow(f, uint(l.spot.z), l, world_pos, s.n, n_o_l);
+        else att *= point_shadow(f, uint(l.spot.z), l, world_pos, s.n, n_o_l);
     }
     vec3 h = normalize(L + v);
     float n_o_h = clamp(dot(s.n, h), 0.0, 1.0);

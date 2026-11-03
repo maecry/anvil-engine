@@ -1,6 +1,6 @@
 #version 460
 // Shadow culling: every shadow view with its bit set in `view_mask` gets a frustum-only culled,
-// LOD-selected command list (views 2..9). One thread handles one instance for all views.
+// LOD-selected command list (views 2..33). One thread handles one instance for all views.
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
 #include "cull.glsl"
@@ -17,7 +17,7 @@ void main() {
     if ((inst.flags & 12u) != 8u) return;        // blended objects do not cast shadows
     MeshRecord m = P.p.meshes.m[inst.mesh];
     uint lod = 0xffffffffu;
-    for (uint k = 0u; k < 8u; ++k) {
+    for (uint k = 0u; k < 32u; ++k) {
         if ((P.p.view_mask & (1u << k)) == 0u || !in_frustum(P, 1u + k, inst.sphere)) continue;
         if (lod == 0xffffffffu) lod = select_lod(P, m, inst);
         emit_draw(P, pc.commands, counts, 2u + k, inst.flags & 3u, m, lod, i, 0u);

@@ -34,3 +34,7 @@ workload pbr-scene-deferred-stress pbr-scene ANVIL_RENDER_PATH=deferred ANVIL_ST
 workload many-draws many-draws
 # The M4 CPU path for comparison (ANVIL_GPU_CULLING=0 is ignored by renderers before M5b).
 workload many-draws-cpu-path many-draws ANVIL_GPU_CULLING=0
+# M5c: the point-light shadow cost (pbr-scene's warm light with and without a cube shadow; three
+# shadow-casting lights in many-draws). Only meaningful from tag m5c on.
+workload pbr-scene-forward-no-point-shadow pbr-scene ANVIL_POINT_SHADOWS=0
+workload many-draws-point-shadows many-draws ANVIL_POINT_SHADOWS=3

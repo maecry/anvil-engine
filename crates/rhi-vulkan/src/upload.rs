@@ -21,7 +21,8 @@ pub(crate) enum PendingUpload {
         staging: vk::Buffer,
         allocation: Allocation,
         image: vk::Image,
-        extent: (u32, u32),
+        /// Per mip level: byte offset in the staging buffer, width, height.
+        mips: Vec<(u64, u32, u32)>,
         bytes: u64,
         /// Tracked state when queued: `Undefined` or `ShaderRead`.
         from: TextureState,
@@ -113,7 +114,7 @@ pub(crate) fn record(
             PendingUpload::Texture {
                 staging,
                 image,
-                extent,
+                mips,
                 from,
                 ..
             } => {
@@ -125,25 +126,29 @@ pub(crate) fn record(
                     Ok(())
                 };
                 barrier(*from, TextureState::TransferDst)?;
-                let region = [vk::BufferImageCopy {
-                    buffer_offset: 0,
-                    buffer_row_length: 0,
-                    buffer_image_height: 0,
-                    image_subresource: vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    },
-                    image_offset: vk::Offset3D::default(),
-                    image_extent: vk::Extent3D {
-                        width: extent.0,
-                        height: extent.1,
-                        depth: 1,
-                    },
-                }];
+                let region: Vec<_> = mips
+                    .iter()
+                    .enumerate()
+                    .map(|(level, &(offset, width, height))| vk::BufferImageCopy {
+                        buffer_offset: offset,
+                        buffer_row_length: 0,
+                        buffer_image_height: 0,
+                        image_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: level as u32,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        image_offset: vk::Offset3D::default(),
+                        image_extent: vk::Extent3D {
+                            width,
+                            height,
+                            depth: 1,
+                        },
+                    })
+                    .collect();
                 // SAFETY: the image is in TRANSFER_DST_OPTIMAL (barrier above) and has
-                // TRANSFER_DST usage (validated when queued); staging holds w*h*bpt bytes.
+                // TRANSFER_DST usage (validated when queued); staging holds every level at its offset.
                 unsafe {
                     s.raw.cmd_copy_buffer_to_image(
                         cb,

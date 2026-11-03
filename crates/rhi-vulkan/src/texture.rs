@@ -59,15 +59,20 @@ impl VkTexture {
         }
     }
 
-    /// Plain 2D (one layer, not a cube): the only shape the bindless `texture2D` / `image2D`
-    /// arrays can hold. shortcut: cube and array views get no bindless slot until M5c adds
-    /// `textureCube[]` / `texture2DArray[]` bindings.
+    /// Plain 2D (one layer, not a cube): the shape of the bindless `image2D` array and of a 2D
+    /// sampled slot. shortcut: array (non-cube) views get no bindless slot; a cube is sampled
+    /// through the same binding 0 as `textureCube[]` (M5c).
     pub(crate) fn is_plain_2d(&self) -> bool {
         self.layer_count == 1 && !self.cube
     }
 
     pub(crate) fn has_sampled_slot(&self) -> bool {
-        self.usage.contains(TextureUsage::SAMPLED) && self.is_plain_2d()
+        self.usage.contains(TextureUsage::SAMPLED) && (self.is_plain_2d() || self.is_cube_view())
+    }
+
+    /// A whole cube (six layers, `CUBE` view type): sampled through `textureCube[]`.
+    fn is_cube_view(&self) -> bool {
+        self.cube && self.layer_count == 6
     }
 
     pub(crate) fn has_storage_slot(&self) -> bool {
@@ -696,7 +701,7 @@ pub(crate) fn texture_index(s: &DeviceShared, h: TextureHandle) -> Result<u32, R
     }
     if !t.has_sampled_slot() {
         return Err(invalid(
-            "texture_index: needs a plain 2D (not array or cube) texture or view with TextureUsage::SAMPLED",
+            "texture_index: needs a 2D or cube (not array) texture or view with TextureUsage::SAMPLED",
         ));
     }
     Ok(h.index())
@@ -706,6 +711,17 @@ pub(crate) fn upload_texture(
     s: &DeviceShared,
     h: TextureHandle,
     data: &[u8],
+) -> Result<(), RhiError> {
+    upload_texture_mips(s, h, &[data], false)
+}
+
+/// Queues the upload of `mips` (mip 0 first, each tightly packed). With `all` the texture's whole
+/// chain must be given; otherwise only mip 0 is written.
+pub(crate) fn upload_texture_mips(
+    s: &DeviceShared,
+    h: TextureHandle,
+    mips: &[&[u8]],
+    all: bool,
 ) -> Result<(), RhiError> {
     let mut pool = write(&s.pools.textures);
     let t = pool.get_mut(h).ok_or_else(|| stale("texture", h))?;
@@ -727,22 +743,38 @@ pub(crate) fn upload_texture(
             "upload_texture: depth textures cannot be uploaded to",
         ));
     }
-    check_upload_len(t.width, t.height, t.format, data.len())?;
+    if all && mips.len() as u32 != t.image_mips {
+        return Err(invalid(format!(
+            "upload_texture_mips: {} levels given, the texture has {}",
+            mips.len(),
+            t.image_mips
+        )));
+    }
+    let mut regions = Vec::with_capacity(mips.len());
+    let mut staged = Vec::new();
+    for (level, data) in mips.iter().enumerate() {
+        let (w, h2) = ((t.width >> level).max(1), (t.height >> level).max(1));
+        check_upload_len(w, h2, t.format, data.len())?;
+        regions.push((staged.len() as u64, w, h2));
+        staged.extend_from_slice(data);
+        // Offsets of a buffer-to-image copy must be a multiple of the texel size (4 for RGBA8).
+        staged.resize(staged.len().next_multiple_of(16), 0);
+    }
     if !matches!(t.state, TextureState::Undefined | TextureState::ShaderRead) {
         return Err(invalid(format!("upload_texture from state {:?}", t.state)));
     }
     let from = t.state;
-    let (staging, allocation) = create_staging(s, data, &format!("staging({})", t.label))?;
+    let (staging, allocation) = create_staging(s, &staged, &format!("staging({})", t.label))?;
     lock(&s.pending_uploads).push(PendingUpload::Texture {
         staging,
         allocation,
         image: t.image,
-        extent: (t.width, t.height),
-        bytes: data.len() as u64,
+        mips: regions,
+        bytes: staged.len() as u64,
         from,
     });
     t.state = TextureState::ShaderRead;
-    tracing::trace!(target: "rhi_vulkan::texture", handle = ?h, bytes = data.len(), from_state = ?from, "upload_texture queued");
+    tracing::trace!(target: "rhi_vulkan::texture", handle = ?h, bytes = staged.len(), levels = mips.len(), from_state = ?from, "upload_texture queued");
     Ok(())
 }
 

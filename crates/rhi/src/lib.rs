@@ -1117,6 +1117,10 @@ pub trait Device: Sized + Send {
     /// [`TextureUsage::TRANSFER_DST`]. Callable at any time, like [`Device::upload_buffer`].
     /// The texture ends in [`TextureState::ShaderRead`].
     fn upload_texture(&self, h: TextureHandle, data: &[u8]) -> Result<(), RhiError>;
+    /// Like [`Device::upload_texture`] for a whole mip chain: `mips[i]` holds level `i`, tightly
+    /// packed (`max(1, width >> i)` x `max(1, height >> i)` texels); exactly the texture's
+    /// `mip_levels` must be given.
+    fn upload_texture_mips(&self, h: TextureHandle, mips: &[&[u8]]) -> Result<(), RhiError>;
 
     /// Creates a sampler and writes it into the bindless sampler array.
     fn create_sampler(&self, desc: &SamplerDesc) -> Result<SamplerHandle, RhiError>;
@@ -1446,6 +1450,9 @@ mod tests {
             Ok(0)
         }
         fn upload_texture(&self, _: TextureHandle, _: &[u8]) -> Result<(), RhiError> {
+            Ok(())
+        }
+        fn upload_texture_mips(&self, _: TextureHandle, _: &[&[u8]]) -> Result<(), RhiError> {
             Ok(())
         }
         fn create_sampler(&self, _: &SamplerDesc) -> Result<SamplerHandle, RhiError> {

@@ -59,6 +59,12 @@ pub(crate) struct PhysicalDeviceFacts {
     pub shader_sampled_image_array_non_uniform_indexing: bool,
     pub descriptor_binding_sampled_image_update_after_bind: bool,
     pub descriptor_binding_partially_bound: bool,
+    /// M5b features: bindless storage images and GPU-driven indirect draws.
+    pub shader_storage_image_array_non_uniform_indexing: bool,
+    pub descriptor_binding_storage_image_update_after_bind: bool,
+    pub draw_indirect_count: bool,
+    pub multi_draw_indirect: bool,
+    pub draw_indirect_first_instance: bool,
     /// `L_img` of MODULE-007 §6.3.
     pub bindless_sampled_images: u32,
     /// `L_smp` of MODULE-007 §6.3.
@@ -137,6 +143,17 @@ pub(crate) fn evaluate(f: &PhysicalDeviceFacts) -> Result<u32, Rejection> {
             f.descriptor_binding_partially_bound,
             "descriptorBindingPartiallyBound",
         ),
+        (
+            f.shader_storage_image_array_non_uniform_indexing,
+            "shaderStorageImageArrayNonUniformIndexing",
+        ),
+        (
+            f.descriptor_binding_storage_image_update_after_bind,
+            "descriptorBindingStorageImageUpdateAfterBind",
+        ),
+        (f.draw_indirect_count, "drawIndirectCount"),
+        (f.multi_draw_indirect, "multiDrawIndirect"),
+        (f.draw_indirect_first_instance, "drawIndirectFirstInstance"),
     ] {
         if !ok {
             return Err(Rejection::MissingFeature(name));
@@ -472,6 +489,7 @@ fn gather_facts(
         .push_next(&mut f13);
     // SAFETY: as above.
     unsafe { raw.get_physical_device_features2(pd, &mut f2) };
+    let core = f2.features;
     // SAFETY: as above.
     let exts = unsafe { raw.enumerate_device_extension_properties(pd) }
         .map_err(|r| map_vk("vkEnumerateDeviceExtensionProperties", r))?;
@@ -545,6 +563,15 @@ fn gather_facts(
             .descriptor_binding_sampled_image_update_after_bind
             == vk::TRUE,
         descriptor_binding_partially_bound: f12.descriptor_binding_partially_bound == vk::TRUE,
+        shader_storage_image_array_non_uniform_indexing: f12
+            .shader_storage_image_array_non_uniform_indexing
+            == vk::TRUE,
+        descriptor_binding_storage_image_update_after_bind: f12
+            .descriptor_binding_storage_image_update_after_bind
+            == vk::TRUE,
+        draw_indirect_count: f12.draw_indirect_count == vk::TRUE,
+        multi_draw_indirect: core.multi_draw_indirect == vk::TRUE,
+        draw_indirect_first_instance: core.draw_indirect_first_instance == vk::TRUE,
         bindless_sampled_images: p12
             .max_per_stage_descriptor_update_after_bind_sampled_images
             .min(p12.max_descriptor_set_update_after_bind_sampled_images),
@@ -625,9 +652,7 @@ pub(crate) fn create_device_with(
         .shader_sampled_image_array_non_uniform_indexing(true)
         .descriptor_binding_sampled_image_update_after_bind(true)
         .descriptor_binding_partially_bound(true)
-        // M5b: bindless storage images and GPU-driven rendering. shortcut: enabled without a
-        // capability check (all desktop Vulkan 1.3 drivers have them), add facts and a
-        // Rejection when a driver without them has to be supported.
+        // M5b: bindless storage images and GPU-driven rendering (checked by `evaluate`).
         .shader_storage_image_array_non_uniform_indexing(true)
         .descriptor_binding_storage_image_update_after_bind(true)
         .draw_indirect_count(true);
@@ -994,6 +1019,10 @@ impl rhi::Device for VulkanDevice {
         texture::upload_texture(&self.shared, h, data)
     }
 
+    fn upload_texture_mips(&self, h: TextureHandle, mips: &[&[u8]]) -> Result<(), RhiError> {
+        texture::upload_texture_mips(&self.shared, h, mips, true)
+    }
+
     fn create_sampler(&self, desc: &SamplerDesc) -> Result<SamplerHandle, RhiError> {
         texture::create_sampler(&self.shared, desc)
     }
@@ -1158,6 +1187,11 @@ mod tests {
             shader_sampled_image_array_non_uniform_indexing: true,
             descriptor_binding_sampled_image_update_after_bind: true,
             descriptor_binding_partially_bound: true,
+            shader_storage_image_array_non_uniform_indexing: true,
+            descriptor_binding_storage_image_update_after_bind: true,
+            draw_indirect_count: true,
+            multi_draw_indirect: true,
+            draw_indirect_first_instance: true,
             bindless_sampled_images: 65536,
             bindless_samplers: 1024,
             bindless_storage_images: 4096,
@@ -1244,6 +1278,30 @@ mod tests {
             let mut f = facts("a", D);
             clear(&mut f);
             assert_eq!(evaluate(&f), Err(Rejection::MissingFeature(name)));
+        }
+    }
+
+    #[test]
+    fn reject_missing_each_m5b_feature() {
+        type Clear = fn(&mut PhysicalDeviceFacts);
+        let cases: [(&str, Clear); 5] = [
+            ("shaderStorageImageArrayNonUniformIndexing", |f| {
+                f.shader_storage_image_array_non_uniform_indexing = false
+            }),
+            ("descriptorBindingStorageImageUpdateAfterBind", |f| {
+                f.descriptor_binding_storage_image_update_after_bind = false
+            }),
+            ("drawIndirectCount", |f| f.draw_indirect_count = false),
+            ("multiDrawIndirect", |f| f.multi_draw_indirect = false),
+            ("drawIndirectFirstInstance", |f| {
+                f.draw_indirect_first_instance = false
+            }),
+        ];
+        for (name, clear) in cases {
+            let mut f = facts("a", D);
+            clear(&mut f);
+            assert_eq!(evaluate(&f), Err(Rejection::MissingFeature(name)));
+            assert!(Rejection::MissingFeature(name).to_string().contains(name));
         }
     }
 

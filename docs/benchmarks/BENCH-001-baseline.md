@@ -1,8 +1,8 @@
 # BENCH-001: Benchmark baseline
 
-- Status: Accepted (M5b, 2026-11-02)
+- Status: Accepted (M5c, 2026-11-03)
 - Implements: MASTER-004 §5, ADR-0013 §1; supports NFR-PERF-001..015
-- Results: `docs/benchmarks/results/2026-11-02-<workload>-<tag>.json` (`baseline`, `m5a`, `m5b`; plus `many-draws-cpu-path-m5b`)
+- Results: `docs/benchmarks/results/2026-11-02-<workload>-<tag>.json` (`baseline`, `m5a`, `m5b`, `m5c`; plus `many-draws-cpu-path-m5b`)
 
 MASTER-000 §4.3 and §22 p3 forbid performance targets until this spec exists. It defines how the engine is measured and records the M4 renderer's numbers (the baseline) and the optimizations against them (M5a threading, M5b GPU-driven rendering). **No target is set**: targets need more workloads (asset loading, streaming) and a second machine.
 
@@ -42,7 +42,7 @@ All workloads are deterministic: camera, animation and lights are functions of t
 | triangle, textured quad | `triangle`, `textured-quad` (M1/M2 smoke tests) | Not measured: no workload content worth a baseline |
 | Shadows | covered by the cascade and spot passes of the three workloads above (per-pass GPU times, section 7) | Measured as passes |
 | Asset-load set | needs the asset system (M6) | Undefined |
-| Streaming set | texture streaming (M5c) | Undefined |
+| Streaming set | many-draws with 3 streamed textures (M5c, section 13) | Measured |
 
 ## 5. Resolution and present mode
 
@@ -195,6 +195,39 @@ Visual equivalence (screenshots at frame 120, 1242x1350, pixel diffs in `docs/be
 
 Caveats: the `many-draws` field is sparse (140 of 50 001 instances are occluded), so the occlusion win is small here; the two-phase scheme is exercised on denser occluders by the renderer's GPU test (a wall hides 400 spheres: 371 of the 407 instances are occlusion-culled, 29 frustum-culled, 7 drawn, image identical to the CPU path). LOD error is geometric only, normals are not part of the metric (hence the silhouette-only differences at 0.5 px). The `many-draws-cpu-path` file is the comparison run required by M5b; it is meaningless for earlier tags (the variable is ignored there).
 
-## 12. Related
+## 13. M5c: point-light shadows, texture streaming, debug lines
+
+Same machine and protocol (2026-11-03, `docs/benchmarks/run.sh m5c`, median of 3 runs, release). **Workload change:** pbr-scene's warm point light now casts a cube shadow, and many-draws gained three streamed textures (2048, 2048, 1024) on 12 of its 16 materials; the M5c rows are therefore not the M5b workload (pbr-scene without the shadow, `ANVIL_POINT_SHADOWS=0`, renders pixel-identically to M5b). The first complete M5c run measured 2x slower GPU frames: `shadow.vert` copied the now 2.7 KB `FrameData` into registers for its dynamic matrix index (about 0.2 ms per shadow pass); reading the matrix through the pointer fixed it, and the committed files are from the fixed build.
+
+| Workload | Tag | CPU frame med / p99 (ms) | Interval med / p99 (ms) | GPU frame med / p99 (ms) | Shadow draws | VRAM alloc / reserved (MiB) |
+|---|---|---|---|---|---|---|
+| pbr-scene-forward | baseline | 0.103 / 0.208 | 0.862 / 1.008 | 0.838 / 0.899 | 99 | 260 / 548 |
+| pbr-scene-forward | m5a | 0.104 / 0.155 | 0.856 / 0.991 | 0.836 / 0.897 | 99 | 260 / 548 |
+| pbr-scene-forward | m5b | 0.109 / 0.246 | 0.864 / 1.022 | 0.844 / 0.913 | 99 | 280 / 612 |
+| pbr-scene-forward | m5c | 0.127 / 0.264 | 0.743 / 0.935 | 0.724 / 0.771 | 133 | 304 / 636 |
+| pbr-scene-deferred-stress | baseline | 0.381 / 0.441 | 0.914 / 1.047 | 0.896 / 0.947 | 99 | 340 / 628 |
+| pbr-scene-deferred-stress | m5a | 0.311 / 0.486 | 0.911 / 1.124 | 0.891 / 0.937 | 99 | 340 / 628 |
+| pbr-scene-deferred-stress | m5b | 0.327 / 0.503 | 0.931 / 1.155 | 0.912 / 0.973 | 99 | 360 / 692 |
+| pbr-scene-deferred-stress | m5c | 0.333 / 0.519 | 0.827 / 1.085 | 0.812 / 0.850 | 133 | 385 / 717 |
+| many-draws | baseline | 9.272 / 10.405 | 9.518 / 10.678 | 2.220 / 2.446 | 3450 | 260 / 548 |
+| many-draws | m5a | 7.184 / 8.382 | 7.259 / 8.479 | 2.208 / 2.425 | 3450 | 260 / 548 |
+| many-draws | m5b | 0.606 / 0.796 | 1.276 / 1.491 | 1.248 / 1.365 | 3454 | 312 / 612 |
+| many-draws | m5c | 0.681 / 0.959 | 1.136 / 1.410 | 1.110 / 1.223 | 3454 | 330 / 636 |
+| pbr-scene-forward-no-point-shadow | m5c | 0.105 / 0.167 | 0.712 / 0.887 | 0.697 / 0.746 | 99 | 304 / 636 |
+| many-draws-point-shadows | m5c | 0.737 / 1.012 | 1.206 / 1.509 | 1.183 / 1.328 | 3703 | 364 / 636 |
+| many-draws-cpu-path | m5c | 1.928 / 2.665 | 1.974 / 2.713 | 1.550 / 1.746 | 3450 | 316 / 636 |
+
+(The three extra rows are the point-shadow variants and the CPU path, run with the same protocol.)
+
+**Point-light shadow cost.**
+- pbr-scene, one casting light: frame GPU time +0.027 ms (0.724 vs 0.697 ms, with and without), of which the six face passes are 0.013 ms and `cull.shadow` grows by 0.0035 ms; 34 shadow draws.
+- many-draws, three casting lights (50 001 instances): frame GPU time +0.073 ms, the 18 face passes sum to 0.042 ms (0.014 ms per light), `cull.shadow` +0.0064 ms; 249 more shadow draws.
+- VRAM: four 512 cubes are 25 MiB (D32), allocated up front.
+
+**Texture streaming.** many-draws: the CPU `streaming` stage is 0.075 ms median per frame at 50 000 instances (the estimate over all instances; reallocations are rare, the stage's p99 is in the JSON); resident texture bytes 1048584 (of 50331656 fully resident, 6 textures) after 8 evictions at the 512 MiB default budget, i.e. the field's small objects only need coarse levels. pbr-scene's textures are all at most 128 texels, so streaming costs 0.001 ms there.
+
+**Notes.** Aliasing and async compute: not adopted; VRAM (304 MiB allocated for pbr-scene) and a GPU-bound many-draws (GPU 1.1 ms of a 1.14 ms interval) show neither memory pressure nor a case for another queue. Parallel command recording: `execute` is 0.07 ms (pbr-scene) and 0.1 ms (many-draws).
+
+## 14. Related
 
 ADR-0013 (§1 protocol, §2 profiling, §3 threads), MASTER-004 §5, LAYER-005 (M5a), LAYER-006 §8a, LAYER-003 §20, MODULE-007 §8a.

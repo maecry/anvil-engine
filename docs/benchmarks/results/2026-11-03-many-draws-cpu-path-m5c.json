@@ -1,0 +1,327 @@
+{
+  "schema": 1,
+  "workload": "many-draws",
+  "variant_env": {
+    "ANVIL_BENCH": "/tmp/tmp.8vdBhxkRmA/many-draws-cpu-path-1.json",
+    "ANVIL_GPU_CULLING": "0",
+    "ANVIL_VSYNC": "0"
+  },
+  "machine": {
+    "gpu": "AMD Radeon RX 9070 XT (RADV GFX1201)",
+    "driver": "radv Mesa 26.2.5-arch3.1",
+    "vendor_id": 4098,
+    "vulkan_api": "1.4.354",
+    "cpu": "12th Gen Intel(R) Core(TM) i7-12700KF",
+    "logical_cpus": 20,
+    "worker_threads": 20,
+    "os": "CachyOS",
+    "kernel": "7.3.1-1-cachyos",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "build": "release"
+  },
+  "protocol": {
+    "warmup_frames": 120,
+    "measured_frames": 1000,
+    "resolution": [
+      1920,
+      1080
+    ]
+  },
+  "cpu_frame_ms": {
+    "median": 1.9281,
+    "p99": 2.6654,
+    "mean": 1.9426,
+    "samples": 1000
+  },
+  "frame_interval_ms": {
+    "median": 1.9743,
+    "p99": 2.7128,
+    "mean": 1.9853,
+    "samples": 1000
+  },
+  "gpu_frame_ms": {
+    "median": 1.5502,
+    "p99": 1.7461,
+    "mean": 1.5698,
+    "samples": 998
+  },
+  "cpu_stages_ms": {
+    "pack": {
+      "median": 0.1288,
+      "p99": 0.2243,
+      "mean": 0.1355,
+      "samples": 1000
+    },
+    "cull": {
+      "median": 0.1806,
+      "p99": 0.2675,
+      "mean": 0.185,
+      "samples": 1000
+    },
+    "sort": {
+      "median": 0.1751,
+      "p99": 0.2413,
+      "mean": 0.1784,
+      "samples": 1000
+    },
+    "shadow_lists": {
+      "median": 0.0886,
+      "p99": 0.2007,
+      "mean": 0.093,
+      "samples": 1000
+    },
+    "clusters": {
+      "median": 0.0256,
+      "p99": 0.0503,
+      "mean": 0.0263,
+      "samples": 1000
+    },
+    "upload": {
+      "median": 0.0071,
+      "p99": 0.0161,
+      "mean": 0.0075,
+      "samples": 1000
+    },
+    "streaming": {
+      "median": 0.0726,
+      "p99": 0.1602,
+      "mean": 0.0763,
+      "samples": 1000
+    },
+    "graph_build": {
+      "median": 0.012,
+      "p99": 0.0222,
+      "mean": 0.0123,
+      "samples": 1000
+    },
+    "compile": {
+      "median": 0.0133,
+      "p99": 0.0209,
+      "mean": 0.0139,
+      "samples": 1000
+    },
+    "execute": {
+      "median": 0.7865,
+      "p99": 1.3749,
+      "mean": 0.7762,
+      "samples": 1000
+    }
+  },
+  "gpu_passes_ms": [
+    {
+      "name": "shadow.cascade0",
+      "median": 0.0125,
+      "p99": 0.0155
+    },
+    {
+      "name": "shadow.cascade1",
+      "median": 0.0186,
+      "p99": 0.0217
+    },
+    {
+      "name": "shadow.cascade2",
+      "median": 0.0241,
+      "p99": 0.0271
+    },
+    {
+      "name": "shadow.cascade3",
+      "median": 0.0851,
+      "p99": 0.09
+    },
+    {
+      "name": "shadow.spot0",
+      "median": 0.0042,
+      "p99": 0.0048
+    },
+    {
+      "name": "shadow.spot1",
+      "median": 0.004,
+      "p99": 0.0049
+    },
+    {
+      "name": "shadow.spot2",
+      "median": 0.004,
+      "p99": 0.0046
+    },
+    {
+      "name": "shadow.spot3",
+      "median": 0.0039,
+      "p99": 0.0048
+    },
+    {
+      "name": "prepass",
+      "median": 0.3368,
+      "p99": 0.4253
+    },
+    {
+      "name": "ssao",
+      "median": 0.0591,
+      "p99": 0.0774
+    },
+    {
+      "name": "ssao.blur",
+      "median": 0.0345,
+      "p99": 0.0366
+    },
+    {
+      "name": "forward",
+      "median": 0.79,
+      "p99": 0.8887
+    },
+    {
+      "name": "skybox",
+      "median": 0.0098,
+      "p99": 0.0115
+    },
+    {
+      "name": "taa",
+      "median": 0.0712,
+      "p99": 0.0765
+    },
+    {
+      "name": "bloom.down0",
+      "median": 0.0226,
+      "p99": 0.024
+    },
+    {
+      "name": "bloom.down1",
+      "median": 0.0074,
+      "p99": 0.0081
+    },
+    {
+      "name": "bloom.down2",
+      "median": 0.0047,
+      "p99": 0.005
+    },
+    {
+      "name": "bloom.down3",
+      "median": 0.0033,
+      "p99": 0.0036
+    },
+    {
+      "name": "bloom.down4",
+      "median": 0.0028,
+      "p99": 0.003
+    },
+    {
+      "name": "bloom.down5",
+      "median": 0.0029,
+      "p99": 0.0032
+    },
+    {
+      "name": "bloom.up4",
+      "median": 0.0031,
+      "p99": 0.0033
+    },
+    {
+      "name": "bloom.up3",
+      "median": 0.0031,
+      "p99": 0.0033
+    },
+    {
+      "name": "bloom.up2",
+      "median": 0.0039,
+      "p99": 0.0042
+    },
+    {
+      "name": "bloom.up1",
+      "median": 0.0062,
+      "p99": 0.0067
+    },
+    {
+      "name": "bloom.up0",
+      "median": 0.0148,
+      "p99": 0.0159
+    },
+    {
+      "name": "tonemap",
+      "median": 0.016,
+      "p99": 0.0171
+    },
+    {
+      "name": "export barriers",
+      "median": 0.0008,
+      "p99": 0.0008
+    }
+  ],
+  "draws": 10182,
+  "shadow_draws": 3450,
+  "triangles": 2862742,
+  "lights": 5,
+  "culled_instances": 39819,
+  "gpu_culling": false,
+  "instances": 50001,
+  "instances_uploaded": {
+    "median": 0.0,
+    "p99": 0.0,
+    "mean": 0.0,
+    "samples": 1000
+  },
+  "cull": {
+    "visible": 0,
+    "frustum_culled": 0,
+    "occlusion_culled": 0,
+    "triangles": 0,
+    "camera_draws": 0,
+    "phase2_draws": 0,
+    "shadow_draws": 0
+  },
+  "point_shadows": 0,
+  "textures": {
+    "count": 6,
+    "resident_bytes": 1048584,
+    "full_bytes": 50331656,
+    "budget_bytes": 536870912,
+    "pending_uploads": 0,
+    "evictions": 8
+  },
+  "vram_bytes": {
+    "allocated": 331573120,
+    "reserved": 667443200
+  },
+  "representative_run": 1,
+  "repetitions": [
+    {
+      "cpu_frame_ms": {
+        "median": 1.9281,
+        "p99": 2.6654
+      },
+      "frame_interval_ms": {
+        "median": 1.9743,
+        "p99": 2.7128
+      },
+      "gpu_frame_ms": {
+        "median": 1.5502,
+        "p99": 1.7461
+      }
+    },
+    {
+      "cpu_frame_ms": {
+        "median": 1.9623,
+        "p99": 2.6322
+      },
+      "frame_interval_ms": {
+        "median": 2.0097,
+        "p99": 2.6831
+      },
+      "gpu_frame_ms": {
+        "median": 1.6517,
+        "p99": 1.7984
+      }
+    },
+    {
+      "cpu_frame_ms": {
+        "median": 1.9238,
+        "p99": 2.6578
+      },
+      "frame_interval_ms": {
+        "median": 1.9707,
+        "p99": 2.7194
+      },
+      "gpu_frame_ms": {
+        "median": 1.6116,
+        "p99": 1.8011
+      }
+    }
+  ]
+}

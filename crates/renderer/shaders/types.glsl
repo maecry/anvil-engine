@@ -18,17 +18,19 @@ struct FrameData {
     mat4 prev_view_proj;        // previous frame, without jitter
     mat4 cascade_vp[4];         // directional cascades (orthographic, Y flip folded in)
     mat4 spot_vp[4];            // spot shadow maps (perspective, depth 0..1, Y flip folded in)
+    mat4 point_vp[24];          // point shadow cube faces (light * 6 + face), see shadow.rs
     vec4 camera_pos;
     vec4 cascade_splits;        // view depth at which each cascade ends
     vec4 cascade_texel;         // world size of one texel per cascade (normal offset scale)
     uint cascade_tex[4];        // bindless slots of the cascade depth textures
     uint spot_tex[4];           // bindless slots of the spot depth textures
+    uint point_tex[4];          // bindless slots of the point shadow cube maps (cubes[] in bindings.glsl)
     uint light_count;           // directional lights first, then local lights
     uint dir_count;
     uint sampler_index;
     uint shadow_sampler;        // bindless slot of the comparison sampler
     float exposure;
-    uint debug_mode;            // 0 none, 1 cluster light count, 2 cascade tint, 3 SSAO, 4 LOD, 5 occlusion phase 2
+    uint debug_mode;            // 0 none, 1 cluster light count, 2 cascade tint, 3 SSAO, 4 LOD, 5 occlusion phase 2, 6 resident mip
     uint pad0;
     uint pad1;
     uint sky_index;             // equirect environment textures (bindless slots)
@@ -68,7 +70,7 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Me
 
 // position_type.w: 0 directional, 1 point, 2 spot. direction = direction the light travels.
 // color_intensity.rgb is color * intensity. spot.xy = cos(inner), cos(outer); spot.z = shadow
-// slot (spot: 0..3, directional: >= 0 means cascaded shadows, < 0 none); spot.w = tan(outer).
+// slot (spot and point: 0..3, directional: >= 0 means cascaded shadows, < 0 none); spot.w = tan(outer).
 struct Light { vec4 position_type; vec4 direction_range; vec4 color_intensity; vec4 spot; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Lights { Light l[]; };
 
@@ -85,7 +87,7 @@ struct Material {
     uint occlusion_tex;
     uint emissive_tex;
     float alpha_cutoff;
-    uint pad1;
+    uint base_mip;              // resident base mip level of the base color texture (debug view 6)
     uint pad2;
 };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Materials { Material m[]; };

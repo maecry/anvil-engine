@@ -20,6 +20,8 @@ pub(crate) const COMMAND_BYTES: u64 = 20;
 
 /// Where each (view, pipeline variant) command region starts. A region can hold as many commands
 /// as there are opaque instances of its variant (each instance draws at most once per view).
+/// Only the views active this frame get regions (the camera views and the shadow views with a
+/// light), so unused point-light faces cost no memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CullLayout {
     /// Opaque instances per variant: the capacity of one region.
@@ -27,10 +29,14 @@ pub(crate) struct CullLayout {
     prefix: [u32; VARIANTS],
     /// Commands per view.
     pub total: u32,
+    /// Bit `v` set: view `v` has regions.
+    active: u64,
 }
 
 impl CullLayout {
-    pub fn new(caps: [u32; VARIANTS]) -> Self {
+    /// `shadow_mask` has bit `k` set for shadow view `2 + k` (the `view_mask` of the culling
+    /// parameters); both camera views are always active.
+    pub fn new(caps: [u32; VARIANTS], shadow_mask: u32) -> Self {
         let mut prefix = [0; VARIANTS];
         for v in 1..VARIANTS {
             prefix[v] = prefix[v - 1] + caps[v - 1];
@@ -39,17 +45,23 @@ impl CullLayout {
             caps,
             prefix,
             total: caps.iter().sum(),
+            active: 0b11 | (u64::from(shadow_mask) << 2),
         }
     }
 
-    /// First command of `(view, variant)`.
+    /// First command of `(view, variant)`; inactive views point at region 0, which nothing
+    /// writes for them (their counters stay 0, so drawing them is a no-op).
     pub fn region(&self, view: usize, variant: usize) -> u32 {
-        view as u32 * self.total + self.prefix[variant]
+        if self.active & (1 << view) == 0 {
+            return 0;
+        }
+        let rank = (self.active & ((1 << view) - 1)).count_ones();
+        rank * self.total + self.prefix[variant]
     }
 
     /// Size of the command buffer, rounded up so small changes do not reallocate it.
     pub fn buffer_bytes(&self) -> u64 {
-        (u64::from(self.total) * CULL_VIEWS as u64 * COMMAND_BYTES)
+        (u64::from(self.total) * u64::from(self.active.count_ones()) * COMMAND_BYTES)
             .max(COMMAND_BYTES)
             .next_multiple_of(64 << 10)
     }
@@ -226,7 +238,7 @@ fn groups(n: u32, size: u32) -> u32 {
     n.div_ceil(size).max(1)
 }
 
-/// Frustum-only culling and LOD selection for every shadow view (command regions 2..9).
+/// Frustum-only culling and LOD selection for every shadow view (command regions 2..33).
 pub(crate) fn shadow_cull_pass<D: Device>(
     b: &mut GraphBuilder<'_, D>,
     pipeline: rhi::PipelineHandle,
@@ -353,10 +365,13 @@ mod tests {
 
     #[test]
     fn layout_regions_do_not_overlap() {
-        let l = CullLayout::new([5, 0, 3, 2]);
+        // Camera views, cascade 1, one spot light and the last point face are active.
+        let mask = 0b10 | (1 << 4) | (1 << 31);
+        let l = CullLayout::new([5, 0, 3, 2], mask);
         assert_eq!(l.total, 10);
+        let active = [0, 1, 3, 6, CULL_VIEWS - 1];
         let mut spans = Vec::new();
-        for view in 0..CULL_VIEWS {
+        for view in active {
             for v in 0..VARIANTS {
                 let s = l.region(view, v);
                 spans.push((s, s + l.caps[v]));
@@ -366,9 +381,11 @@ mod tests {
         for w in spans.windows(2) {
             assert!(w[0].1 <= w[1].0, "{w:?}");
         }
-        assert_eq!(spans.last().unwrap().1, l.total * CULL_VIEWS as u32);
+        assert_eq!(spans.last().unwrap().1, l.total * active.len() as u32);
         assert_eq!(l.regions()[1][2], 10 + 5);
-        assert!(CullLayout::new([0; 4]).buffer_bytes() >= COMMAND_BYTES);
+        // An inactive view has no region of its own.
+        assert_eq!(l.region(2, 3), 0);
+        assert!(CullLayout::new([0; 4], 0).buffer_bytes() >= COMMAND_BYTES);
         assert_eq!(l.buffer_bytes() % (64 << 10), 0);
     }
 

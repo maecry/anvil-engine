@@ -84,9 +84,9 @@ impl GeometryInputs<'_> {
 
 /// Inputs of [`shadow_pass`].
 pub(crate) struct ShadowInputs<'a> {
-    pub name: &'static str,
+    pub name: std::borrow::Cow<'static, str>,
     pub texture: TexId,
-    /// 0..3 cascade, 4..7 spot (`pc.view_index` in `shadow.vert`).
+    /// 0..3 cascade, 4..7 spot, 8..31 point-light cube faces (`pc.view_index` in `shadow.vert`).
     pub view_index: u32,
     pub geometry: GeometryInputs<'a>,
 }
@@ -111,6 +111,17 @@ pub(crate) struct ShadedInputs<'a> {
     /// Full-resolution ambient occlusion multiplying the ambient term (forward pass only).
     pub ssao: Option<TexId>,
     pub geometry: GeometryInputs<'a>,
+}
+
+/// Inputs of [`debug_pass`].
+pub(crate) struct DebugInputs {
+    pub pipeline: PipelineHandle,
+    pub hdr: TexId,
+    pub depth: TexId,
+    /// BDA of the frame data and of the debug vertices (both in the upload ring).
+    pub frame_address: u64,
+    pub vertex_address: u64,
+    pub vertex_count: u32,
 }
 
 /// Inputs of [`gbuffer_pass`].
@@ -252,14 +263,16 @@ const DEPTH_LOAD: DepthTarget = DepthTarget {
 
 /// Depth-only pass into one shadow map (a cascade or a spot light).
 pub(crate) fn shadow_pass<'a, D: Device>(b: &mut GraphBuilder<'a, D>, i: ShadowInputs<'a>) {
-    let pass = Pass::new(i.name).label_color([0.4, 0.4, 0.4, 1.0]).depth(
-        i.texture,
-        DepthTarget {
-            load: LoadOp::Clear,
-            store: StoreOp::Store,
-            clear: 1.0,
-        },
-    );
+    let pass = Pass::new(i.name.clone())
+        .label_color([0.4, 0.4, 0.4, 1.0])
+        .depth(
+            i.texture,
+            DepthTarget {
+                load: LoadOp::Clear,
+                store: StoreOp::Store,
+                clear: 1.0,
+            },
+        );
     b.pass(i.geometry.declare(pass), move |ctx| {
         draw_geometry(ctx, &i.geometry, i.view_index, NO_SSAO)
     });
@@ -352,6 +365,29 @@ pub(crate) fn transparent_pass<'a, D: Device>(b: &mut GraphBuilder<'a, D>, i: Sh
     }
     b.pass(i.geometry.declare(pass), move |ctx| {
         draw_geometry(ctx, &i.geometry, 0, NO_SSAO)
+    });
+}
+
+/// Debug lines over the lit image: depth tested against the opaque depth, no depth write.
+pub(crate) fn debug_pass<D: Device>(b: &mut GraphBuilder<'_, D>, i: DebugInputs) {
+    let pass = Pass::new("debug.lines")
+        .label_color([0.9, 0.2, 0.9, 1.0])
+        .color(
+            i.hdr,
+            ColorTarget {
+                load: LoadOp::Load,
+                ..ColorTarget::dont_care()
+            },
+        )
+        .depth(i.depth, DEPTH_LOAD);
+    b.pass(pass, move |ctx| {
+        ctx.cmd.bind_pipeline(i.pipeline);
+        let mut pc = [0u8; 16];
+        pc[0..8].copy_from_slice(&i.frame_address.to_le_bytes());
+        pc[8..16].copy_from_slice(&i.vertex_address.to_le_bytes());
+        ctx.cmd.push_constants(0, &pc);
+        ctx.cmd.draw(i.vertex_count, 1, 0, 0);
+        Ok(())
     });
 }
 

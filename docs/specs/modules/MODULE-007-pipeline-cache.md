@@ -225,3 +225,6 @@ Open (M5, not blocking):
 
 Remaining `verify:`
 - verify: `PipelineLayoutCreateInfo`/`DescriptorSetLayoutBindingFlagsCreateInfo` builder names in ash 0.38 (`DescriptorBindingFlags::{PARTIALLY_BOUND, UPDATE_AFTER_BIND}`, `DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL`, `DescriptorPoolCreateFlags::UPDATE_AFTER_BIND`).
+
+## 16. M5c status
+Unchanged. The pipeline cache now also covers the cube-face shadow pipelines and the debug line pipeline (12 more pipelines are created on a cold start, served from the cache afterwards). The device-selection feature checks of M5b (LAYER-003 §20.4) are in `device.rs`, next to the bindless checks this module describes.

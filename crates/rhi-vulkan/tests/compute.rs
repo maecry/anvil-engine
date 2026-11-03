@@ -256,10 +256,8 @@ fn storage_images_per_mip_and_view_creation() {
             cube: true,
         })
         .unwrap();
-    assert!(
-        dev.texture_index(cube).is_err(),
-        "a cube has no 2D slot yet"
-    );
+    // A whole cube is sampled through `textureCube[]` in the same binding (M5c).
+    dev.texture_index(cube).unwrap();
     let faces: Vec<_> = (0..6)
         .map(|f| {
             dev.create_texture_view(

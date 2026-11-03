@@ -50,6 +50,8 @@ fn main() {
         ("brdf_lut.frag", "brdf_lut.frag", Fragment, None),
         ("skybox.vert", "skybox.vert", Vertex, None),
         ("skybox.frag", "skybox.frag", Fragment, None),
+        ("debug.vert", "debug.vert", Vertex, None),
+        ("debug.frag", "debug.frag", Fragment, None),
         ("tonemap.vert", "tonemap.vert", Vertex, None),
         ("tonemap.frag", "tonemap.frag", Fragment, None),
         ("cull_camera.comp", "cull_camera.comp", Compute, None),

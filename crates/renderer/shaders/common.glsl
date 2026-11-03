@@ -8,7 +8,7 @@ layout(push_constant, std430) uniform Push {
     Lights lights;
     Materials materials;
     Vertices vertices;
-    uint view_index;            // shadow passes: 0..3 cascade, 4..7 spot; TAA: 1 = reset history
+    uint view_index;            // shadow passes: 0..3 cascade, 4..7 spot, 8..31 point faces; TAA: 1 = reset history
     uint ssao_index;            // bindless slot of the full-resolution AO texture, ~0u = none
     uvec4 gbuf;                 // per-pass texture slots (deferred lighting, SSAO, TAA)
 } pc;

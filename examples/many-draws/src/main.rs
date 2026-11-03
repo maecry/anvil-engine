@@ -9,7 +9,9 @@
 //! `ANVIL_SCREENSHOT=path.png` (with `ANVIL_EXIT_AFTER_FRAMES`: writes the last frame),
 //! `ANVIL_BENCH=path.json` (benchmark protocol, see `pbr-scene`), `ANVIL_WINDOW=WxH`,
 //! `ANVIL_VSYNC=0`, `ANVIL_GPU_CULLING=0` (the CPU path), `ANVIL_LOD=0|<pixels>`,
-//! `ANVIL_DEBUG_VIEW=lod|occlusion`.
+//! `ANVIL_DEBUG_VIEW=lod|occlusion|mips`, `ANVIL_DEBUG_DRAW=bounds|cascades|lights`,
+//! `ANVIL_POINT_SHADOWS=n` (0..3 of the point lights cast cube shadows, default 0),
+//! `ANVIL_TEXTURE_BUDGET_MB` / `ANVIL_TEXTURE_UPLOAD_MB` (texture streaming budgets).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,8 +21,8 @@ use anyhow::Context;
 use foundation::math::{Mat4, Quat, Vec3};
 use platform::{App, AppError, Control, Event, KeyCode, Window, WindowConfig};
 use renderer::{
-    Camera, DebugView, Environment, Light, MaterialDesc, MeshData, MeshInstance, PostSettings,
-    RenderPath, RenderScene, Renderer, Vertex, bench::Bench, mesh,
+    Camera, DebugDraw, DebugView, Environment, Light, MaterialDesc, MeshData, MeshInstance,
+    PostSettings, RenderPath, RenderScene, Renderer, Vertex, bench::Bench, mesh,
 };
 use rhi::{
     Acquire, Backend, BufferDesc, BufferUsage, CommandEncoder, Device, DeviceDesc,
@@ -45,6 +47,56 @@ fn hash01(n: u32) -> f32 {
     x = x.wrapping_mul(0x297A_2D39);
     x ^= x >> 15;
     (x >> 8) as f32 / (1u32 << 24) as f32
+}
+
+/// Procedural RGBA8 texture of `size` x `size` texels: `kind` 0 marble-like bands, 1 bricks, 2 a
+/// fine grid, so every mip level looks different.
+fn procedural(size: u32, kind: u32) -> Vec<u8> {
+    let mut data = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let (u, v) = (x as f32 / size as f32, y as f32 / size as f32);
+            let c = match kind {
+                0 => {
+                    let t =
+                        (u * 9.0 + (v * 14.0).sin() * 0.6 + hash01(x / 8 + (y / 8) * 977) * 0.25)
+                            .sin()
+                            * 0.5
+                            + 0.5;
+                    [0.35 + 0.6 * t, 0.4 + 0.5 * t, 0.5 + 0.4 * t]
+                }
+                1 => {
+                    let (row, off) = (
+                        y / (size / 16),
+                        if (y / (size / 16)).is_multiple_of(2) {
+                            0
+                        } else {
+                            size / 16
+                        },
+                    );
+                    let (bx, by) = ((x + off) % (size / 8), y % (size / 16));
+                    let mortar = bx < size / 128 + 1 || by < size / 128 + 1;
+                    let tone = 0.55 + 0.35 * hash01(row * 131 + (x + off) / (size / 8));
+                    if mortar {
+                        [0.75, 0.75, 0.72]
+                    } else {
+                        [tone, tone * 0.45, tone * 0.3]
+                    }
+                }
+                _ => {
+                    let g = (x % 32 < 2 || y % 32 < 2) as u32 as f32;
+                    [0.2 + 0.7 * g, 0.5 + 0.4 * g, 0.9 - 0.5 * g]
+                }
+            };
+            data.extend_from_slice(&[
+                (c[0].clamp(0.0, 1.0) * 255.0) as u8,
+                (c[1].clamp(0.0, 1.0) * 255.0) as u8,
+                (c[2].clamp(0.0, 1.0) * 255.0) as u8,
+                255,
+            ]);
+        }
+    }
+    data
 }
 
 /// A torus around the Y axis: ring radius `major`, tube radius `minor`.
@@ -105,7 +157,7 @@ fn camera_at(frame: u64) -> Camera {
 }
 
 /// Sun plus a few local lights that travel with the camera.
-fn lights_at(cam: &Camera) -> Vec<Light> {
+fn lights_at(cam: &Camera, point_shadows: usize) -> Vec<Light> {
     let fwd = cam.rotation * Vec3::NEG_Z;
     let right = cam.rotation * Vec3::X;
     let mut v = vec![Light::Directional {
@@ -125,6 +177,7 @@ fn lights_at(cam: &Camera) -> Vec<Light> {
             color: Vec3::from(color),
             intensity: 60.0,
             range: 16.0,
+            cast_shadows: i < point_shadows,
         });
     }
     v.push(Light::Spot {
@@ -154,6 +207,8 @@ struct ManyDraws {
     path: RenderPath,
     post: PostSettings,
     debug: DebugView,
+    debug_draw: DebugDraw,
+    point_shadows: usize,
     bench: Option<Bench>,
     rendered: u64,
     exit_after: Option<u64>,
@@ -197,11 +252,18 @@ impl ManyDraws {
             roughness: 0.95,
             ..MaterialDesc::default()
         });
+        // Three large textures (streamed: ADR-0013 §8); every fourth material has none.
+        let textures = [
+            r.create_texture(&device, "marble", &procedural(2048, 0), 2048, 2048, true)?,
+            r.create_texture(&device, "bricks", &procedural(2048, 1), 2048, 2048, true)?,
+            r.create_texture(&device, "grid", &procedural(1024, 2), 1024, 1024, true)?,
+        ];
         let materials: Vec<_> = (0..MATERIALS as u32)
             .map(|i| {
                 let hue = i as f32 / MATERIALS as f32 * std::f32::consts::TAU;
                 r.create_material(&MaterialDesc {
                     label: "field",
+                    base_color_texture: textures.get(i as usize % 4).copied(),
                     base_color: [
                         0.55 + 0.45 * hue.cos(),
                         0.55 + 0.45 * (hue + 2.1).cos(),
@@ -280,11 +342,12 @@ impl ManyDraws {
         };
         g.renderer.set_render_path(self.path);
         g.renderer.set_debug_view(self.debug);
+        g.renderer.set_debug_draw(self.debug_draw);
         g.renderer.set_post(self.post);
         let scene = RenderScene {
             camera,
             meshes: g.instances.clone(),
-            lights: lights_at(&camera),
+            lights: lights_at(&camera, self.point_shadows),
             environment: Environment::default(),
         };
         let readback = match &screenshot {
@@ -468,6 +531,14 @@ fn main() -> anyhow::Result<()> {
                 taa: env_flag("ANVIL_TAA"),
                 bloom: env_flag("ANVIL_BLOOM"),
             },
+            debug_draw: std::env::var("ANVIL_DEBUG_DRAW")
+                .ok()
+                .and_then(|v| DebugDraw::from_name(&v))
+                .unwrap_or(DebugDraw::None),
+            point_shadows: std::env::var("ANVIL_POINT_SHADOWS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             debug: std::env::var("ANVIL_DEBUG_VIEW")
                 .ok()
                 .and_then(|v| DebugView::from_name(&v))

@@ -22,7 +22,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 winit = "0.30.13"
 raw-window-handle = "0.6.2"
 glam = { version = "0.34.2", features = ["bytemuck"] }
-bytemuck = { version = "1.25.2", features = ["derive"] }
+bytemuck = { version = "1.25.2", features = ["derive", "min_const_generics"] }
 rayon = "1.12.0"
 
 [profile.release]

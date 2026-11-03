@@ -20,5 +20,9 @@ void main() {
     vec3 diff, spec;
     shade(s, v_world_pos, gl_FragCoord.xy, diff, spec);
     vec3 color = debug_view(f, diff * s.alpha + spec, v_world_pos, gl_FragCoord.xy);
-    out_color = vec4(color * instance_tint(f.debug_mode, v_flags), s.alpha);
+    vec3 tint = instance_tint(f.debug_mode, v_flags, v_material);
+    // Mip residency view: a flat tint, shaded by the lit brightness.
+    if (f.debug_mode == 6u) color = tint * (0.1 + dot(color, vec3(0.3)));
+    else color *= tint;
+    out_color = vec4(color, s.alpha);
 }

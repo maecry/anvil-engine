@@ -128,3 +128,6 @@ As LAYER-006 §13. Unit tests: `plan::tests` (ordering and barrier states, culli
 ## 16. M5b status
 
 Compute passes, buffers (transient and imported) with `BufferState` barriers, `StorageWrite` textures and per-mip tracking through view textures are implemented (LAYER-006 §8b); open question 1 is resolved by them. Not done (ADR-0013 §5 conditional items): transient memory aliasing (the pool still gives every transient its own memory; BENCH-001 VRAM, 260 to 312 MiB allocated, did not justify it) and async compute (one graphics queue; the culling passes depend on the frame's earlier work, so there is little to overlap on this renderer). Unit tests in `plan.rs` and `pool.rs`; GPU coverage through the renderer (LAYER-005 M5b).
+
+## 17. M5c status
+Point-light cube faces are ordinary one-layer view textures; with four casting lights a frame has up to 24 more passes (the timestamp limit of 126 passes still holds: pbr-scene about 85). Memory aliasing of transients and async compute were evaluated against BENCH-001 §13 (VRAM 304 MiB allocated for pbr-scene, many-draws GPU-bound by the shading passes, no idle compute-capable queue time that async compute could use measurably) and are **not adopted**; the shortcut stays recorded.

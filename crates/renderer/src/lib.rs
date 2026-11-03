@@ -14,6 +14,7 @@ mod arena;
 pub mod bench;
 mod cluster;
 mod cull;
+mod debug;
 mod gpu;
 mod gpu_cull;
 mod ibl;
@@ -24,14 +25,18 @@ mod prep;
 mod renderer;
 mod scene;
 mod shadow;
+mod streaming;
 
+pub use debug::DebugLines;
 pub use gpu_cull::CullStats;
 pub use mesh::{MAX_LODS, MeshData, MeshLod, Vertex, generate_lods};
 pub use render_graph::GpuTimings;
 pub use renderer::{
-    AlphaMode, DebugView, Material, MaterialDesc, MaterialId, Mesh, MeshId, PostSettings,
-    RenderError, RenderPath, Renderer, RendererStats, StageTimes, Texture, TextureId,
+    AlphaMode, DebugDraw, DebugView, Material, MaterialDesc, MaterialId, Mesh, MeshId,
+    PostSettings, RenderError, RenderPath, Renderer, RendererStats, StageTimes, Texture, TextureId,
+    TextureStats,
 };
 pub use scene::{
-    Camera, Environment, Light, MAX_LIGHTS, MAX_SPOT_SHADOWS, MeshInstance, RenderScene,
+    Camera, Environment, Light, MAX_LIGHTS, MAX_POINT_SHADOWS, MAX_SPOT_SHADOWS, MeshInstance,
+    RenderScene,
 };

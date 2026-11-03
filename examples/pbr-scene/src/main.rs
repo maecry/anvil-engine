@@ -9,7 +9,9 @@
 //! Env: `ANVIL_EXIT_AFTER_FRAMES=n` renders n frames and exits (code 1 on validation errors).
 //! `ANVIL_SCREENSHOT=path.png` (with `ANVIL_EXIT_AFTER_FRAMES`) writes the last frame as a PNG.
 //! `ANVIL_RENDER_PATH=forward|deferred`, `ANVIL_STRESS_LIGHTS=1`,
-//! `ANVIL_DEBUG_VIEW=clusters|cascades|ssao|lod|occlusion`, `ANVIL_SSAO=0|1`, `ANVIL_TAA=0|1`,
+//! `ANVIL_DEBUG_VIEW=clusters|cascades|ssao|lod|occlusion|mips`, `ANVIL_DEBUG_DRAW=bounds|cascades|lights`,
+//! `ANVIL_CAMERA=x,y,z,yaw,pitch`, `ANVIL_POINT_SHADOWS=0` (the warm point light casts cube shadows by default),
+//! `ANVIL_TEXTURE_BUDGET_MB`, `ANVIL_TEXTURE_UPLOAD_MB`, `ANVIL_SSAO=0|1`, `ANVIL_TAA=0|1`,
 //! `ANVIL_BLOOM=0|1` (default 1), `ANVIL_TOGGLE_POST=n` (cycle all combinations every n frames) select the initial state headlessly; `ANVIL_CAMERA_ORBIT=1`
 //! slowly orbits the camera (a function of the frame number, to inspect TAA in motion).
 //! `ANVIL_BENCH=path.json` runs the benchmark protocol (ADR-0013 §1): the camera orbits, vsync
@@ -25,8 +27,8 @@ use anyhow::Context;
 use foundation::math::{Mat4, Quat, Vec3};
 use platform::{App, AppError, Control, Event, KeyCode, MouseButton, Window, WindowConfig};
 use renderer::{
-    AlphaMode, Camera, DebugView, Environment, Light, MaterialDesc, MeshInstance, PostSettings,
-    RenderPath, RenderScene, Renderer, bench::Bench, mesh,
+    AlphaMode, Camera, DebugDraw, DebugView, Environment, Light, MaterialDesc, MeshInstance,
+    PostSettings, RenderPath, RenderScene, Renderer, bench::Bench, mesh,
 };
 use rhi::{
     Acquire, Backend, BufferDesc, BufferUsage, CommandEncoder, Device, DeviceDesc,
@@ -94,6 +96,7 @@ fn stress_lights(frame: u64) -> Vec<Light> {
                 ),
                 intensity: 2.0,
                 range: 2.5,
+                cast_shadows: false,
             }
         })
         .collect()
@@ -148,6 +151,7 @@ struct PbrScene {
     stress: bool,
     path: RenderPath,
     debug: DebugView,
+    debug_draw: DebugDraw,
     post: PostSettings,
     orbit: bool,
     /// `ANVIL_TOGGLE_POST=n`: step through all 8 SSAO/TAA/bloom combinations every n frames.
@@ -292,6 +296,8 @@ impl PbrScene {
                 color: Vec3::new(1.0, 0.45, 0.15),
                 intensity: 25.0,
                 range: 8.0,
+                // Cube shadows of the spheres, the cube and the fence (`ANVIL_POINT_SHADOWS=0` turns them off).
+                cast_shadows: std::env::var("ANVIL_POINT_SHADOWS").as_deref() != Ok("0"),
             },
             // Cool spot light on the right-hand spheres.
             Light::Spot {
@@ -387,6 +393,7 @@ impl PbrScene {
         g.lights[0] = sun(sun_angle);
         g.renderer.set_render_path(self.path);
         g.renderer.set_debug_view(self.debug);
+        g.renderer.set_debug_draw(self.debug_draw);
         let mut lights = g.lights.clone();
         if self.stress {
             lights.extend(stress_lights(self.rendered));
@@ -619,6 +626,25 @@ impl App for PbrScene {
     }
 }
 
+/// Start pose: `ANVIL_CAMERA=x,y,z,yaw,pitch` (radians) or the default view.
+fn start_camera() -> FlyCamera {
+    let v: Vec<f32> = std::env::var("ANVIL_CAMERA")
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    match v[..] {
+        [x, y, z, yaw, pitch] => FlyCamera {
+            position: Vec3::new(x, y, z),
+            yaw,
+            pitch,
+        },
+        _ => FlyCamera {
+            position: Vec3::new(0.0, 2.2, 9.0),
+            yaw: 0.0,
+            pitch: -0.12,
+        },
+    }
+}
+
 /// `name=0` disables, anything else (or unset) enables.
 fn env_flag(name: &str) -> bool {
     std::env::var(name).as_deref() != Ok("0")
@@ -664,11 +690,7 @@ fn main() -> anyhow::Result<()> {
         window.with_env_size(),
         PbrScene {
             gfx: None,
-            camera: FlyCamera {
-                position: Vec3::new(0.0, 2.2, 9.0),
-                yaw: 0.0,
-                pitch: -0.12,
-            },
+            camera: start_camera(),
             keys: Vec::new(),
             looking: false,
             sun_angle: SUN_START,
@@ -691,6 +713,10 @@ fn main() -> anyhow::Result<()> {
                 .ok()
                 .and_then(|v| DebugView::from_name(&v))
                 .unwrap_or(DebugView::None),
+            debug_draw: std::env::var("ANVIL_DEBUG_DRAW")
+                .ok()
+                .and_then(|v| DebugDraw::from_name(&v))
+                .unwrap_or(DebugDraw::None),
             bench: None,
             last: Instant::now(),
             rendered: 0,
