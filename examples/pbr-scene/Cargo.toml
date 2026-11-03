@@ -14,6 +14,7 @@ platform = { path = "../../crates/platform" }
 rhi = { path = "../../crates/rhi" }
 rhi-vulkan = { path = "../../crates/rhi-vulkan" }
 renderer = { path = "../../crates/renderer" }
+debug = { path = "../../crates/debug" }
 tracing.workspace = true
 anyhow = "1"
 # Only for ANVIL_SCREENSHOT (ADR-0011 §11).

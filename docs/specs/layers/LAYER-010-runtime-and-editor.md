@@ -61,6 +61,18 @@ pub struct DiagnosticsView<'a> { pub gpu_scopes: &'a [GpuScopeSample], pub memor
 - Errors: per-crate thiserror enums; runtime converts to a single application-level result at the binary boundary (`anyhow` allowed in binaries only).
 - Diagnostics: this layer is the display side; it adds no instrumentation requirement on lower layers beyond README §2.4.
 
+## 6. Debug crate (M6b-1, ADR-0014 §8)
+
+`crates/debug` (layer 5) depends on foundation, platform, rhi, renderer and render-graph, never on ash or a backend; it is generic over `rhi::Device`. Everything is plain egui (`egui` 0.33 and `egui-winit`).
+
+- **`EguiInput`**: owns the `egui::Context` and the egui-winit state. Events arrive through the new `platform::App::on_raw_event` (every raw winit window event, before translation; `Window::winit()` exposes the window). `wants_pointer()` and `wants_keyboard()` tell an app to skip camera and key input.
+- **`EguiRenderer`**: one graphics pipeline (`shaders/egui.vert|frag`, compiled by `build.rs`). Each frame slot owns one host-visible buffer holding the vertices (pulled through the buffer device address, like the renderer's debug lines) followed by the `u32` indices; it grows by doubling. One scissored `draw_indexed` per mesh, premultiplied-alpha blend (`One`, `OneMinusSrcAlpha`), `LoadOp::Load` into a target that is in `ColorAttachment` state and stays there. egui's gamma-space colors are multiplied in the fragment shader; for an sRGB target the result is converted to linear first, so the hardware encoding returns egui's intended bytes (tested). Font and image textures are `Rgba8Unorm` bindless textures; a `TexturesDelta` set or patch makes a fresh texture from a CPU copy (the old one is destroyed deferred), free destroys. `register_texture` turns an existing sampled rhi texture (for example the editor viewport's offscreen target, in `ShaderRead`, gamma-encoded `*Unorm`) into an `egui::TextureId`.
+- **Panels** (`debug::panels`): functions over `&mut egui::Ui` and plain data: `frame_stats` (FPS, frame, renderer CPU and GPU ms, history graph), `gpu_timings`, `memory` (`DeviceDiagnostics`, texture streaming), `render_graph` (`GraphStats` and the pass order with GPU times), `renderer_settings` (render path, SSAO/TAA/bloom, debug view, debug draw, GPU culling, LOD pixels, through the renderer's setters).
+- **`Overlay`**: bundles the above behind F1. Per frame: `run(device, window, renderer)` (builds the UI from last frame's stats, uploads textures), render the scene with `scene_final_state(final)` as its end state, then `render(device, cmd, frame, image, final)` which draws over the swapchain image and moves it to `final` (so screenshots include the overlay). Hidden, `render` does nothing and `scene_final_state` is the plain final state.
+- **`ANVIL_OVERLAY=1`**: `Overlay::enabled_by_env()`. pbr-scene and many-draws create an `Overlay` only then; unset, no debug code runs. The apps copy the renderer's settings back after `run`, so panel edits persist.
+- **Shortcuts**: one linear/clamp sampler for all textures; paint callbacks are skipped; no clipboard or IME output beyond what egui-winit does without its default features; the graph panel lists passes from `GpuTimings` (an earlier frame) rather than a `GraphDescription` (not exposed by the renderer).
+- **Test**: `crates/debug/tests/gpu_egui.rs` (`ANVIL_GPU_TESTS=1`).
+
 ## 13. Testing strategy
 
 Scene serialization round-trip; extraction determinism; headless runtime smoke test with `NullBackend`; editor UI tests are manual at first; M6 completion criterion (create, save, reopen, run a sample project).

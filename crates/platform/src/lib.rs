@@ -196,6 +196,9 @@ pub enum MouseButton {
     Other,
 }
 
+/// The raw winit window event, see [`App::on_raw_event`].
+pub use winit::event::WindowEvent as RawWindowEvent;
+
 /// Platform events delivered to the application.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Event {
@@ -257,6 +260,9 @@ pub trait App: 'static {
     fn on_start(&mut self, window: &Window) -> Result<(), AppError>;
     /// Called for each translated event.
     fn on_event(&mut self, window: &Window, event: &Event) -> Control;
+    /// Called with every raw winit window event (redraws excluded) before it is translated, so
+    /// UI libraries such as egui can see the full event. Default: ignore.
+    fn on_raw_event(&mut self, _window: &Window, _event: &RawWindowEvent) {}
     /// Called once per redraw (continuous mode). Check [`Window::is_minimized`].
     /// Return [`Control::Exit`] to leave the loop cleanly (`on_exit` still runs).
     ///
@@ -287,6 +293,11 @@ impl Window {
     #[must_use]
     pub fn is_minimized(&self) -> bool {
         is_zero_size(self.inner_size())
+    }
+    /// The underlying winit window, for integrations that need it (egui-winit).
+    #[must_use]
+    pub fn winit(&self) -> &winit::window::Window {
+        &self.0
     }
     /// Ask for another `on_frame`.
     pub fn request_redraw(&self) {
@@ -450,12 +461,15 @@ impl<A: App> ApplicationHandler for Handler<A> {
                     Err(e) => self.fail(el, PlatformError::App(e)),
                 }
             }
-        } else if let Some(ev) = map_event(&event) {
-            if let Event::Resized { width, height } = ev {
-                tracing::debug!(width, height, "resized");
-            }
-            if self.app.on_event(&window, &ev) == Control::Exit {
-                el.exit();
+        } else {
+            self.app.on_raw_event(&window, &event);
+            if let Some(ev) = map_event(&event) {
+                if let Event::Resized { width, height } = ev {
+                    tracing::debug!(width, height, "resized");
+                }
+                if self.app.on_event(&window, &ev) == Control::Exit {
+                    el.exit();
+                }
             }
         }
     }

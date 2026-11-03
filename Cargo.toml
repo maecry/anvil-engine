@@ -24,6 +24,8 @@ raw-window-handle = "0.6.2"
 glam = { version = "0.34.2", features = ["bytemuck"] }
 bytemuck = { version = "1.25.2", features = ["derive", "min_const_generics"] }
 rayon = "1.12.0"
+egui = { version = "0.33.3", default-features = false, features = ["bytemuck", "default_fonts"] }
+egui-winit = { version = "0.33.3", default-features = false, features = ["wayland", "x11"] }
 
 [profile.release]
 lto = "thin"
