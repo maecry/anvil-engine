@@ -18,3 +18,4 @@ Template: [0000-template.md](0000-template.md). Rules: Master Spec §13.3.
 | [0012](0012-m4-render-graph.md) | M4 render graph (state model, compile, transients, passes, diagnostics) and advanced-rendering techniques | Accepted | 2026-11-02 |
 | [0013](0013-m5-performance-engineering.md) | M5 performance: benchmark baseline, profiling, threads, compute/indirect RHI, GPU-driven culling, LOD, streaming | Accepted | 2026-11-02 |
 | [0014](0014-m6-runtime-and-tooling.md) | M6 runtime and tooling: hecs scene, RON formats, UUID .meta assets, runtime, egui on RHI, in-process editor with scripted commands | Accepted | 2026-11-03 |
+| [0015](0015-m7-production-hardening.md) | M7 production hardening: golden images, leak/stress tests, device-loss fault injection, spirv-val, corruption tests, API stability, reproducible packaging | Accepted | 2026-11-03 |
