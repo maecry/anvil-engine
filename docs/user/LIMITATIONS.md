@@ -17,7 +17,9 @@ you add one, add it here too (`grep -rn "shortcut:" crates examples`).
   Recreating every GPU resource is not implemented.
 - **Lavapipe test flakiness.** Two GPU tests, `push_constants_reach_shader` and
   `pipelines_share_one_layout`, read back all zeros intermittently on lavapipe (software Vulkan);
-  they may be marked `#[ignore]` on lavapipe only. They run on hardware drivers.
+  suspected cause was `wait_idle` returning before the work was visible, so it now also waits on
+  the timeline. The fix is unconfirmed on lavapipe; if they still flake there they get ignored on
+  lavapipe only.
 - **No license has been chosen.** The repository has no `LICENSE` file, so there is no permission
   to redistribute or reuse it yet. See [release-checklist](../development/release-checklist.md).
 - **No release channels.** The only artifact is a tagged release candidate tarball
