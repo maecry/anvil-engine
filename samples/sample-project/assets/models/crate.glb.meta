@@ -1,0 +1,32 @@
+(
+    version: 1,
+    id: "1eed60b7-d5df-4ab7-93f3-ed5dad84c310",
+    importer: "gltf",
+    sub_assets: [
+        (
+            id: "7c2096a7-6435-57ca-985a-2e277edbf595",
+            kind: Texture,
+            name: "image/0",
+        ),
+        (
+            id: "2cf335b1-88b5-5594-b782-ad45155bc248",
+            kind: Material,
+            name: "material/0",
+        ),
+        (
+            id: "572dbaf7-7e35-521b-9a41-e678f1064725",
+            kind: Material,
+            name: "material/1",
+        ),
+        (
+            id: "97f1c304-930e-51cb-ab82-15494fec94a4",
+            kind: Mesh,
+            name: "mesh/0/0",
+        ),
+        (
+            id: "57137131-e422-55ba-bd01-7774ac1fff58",
+            kind: Mesh,
+            name: "mesh/1/0",
+        ),
+    ],
+)

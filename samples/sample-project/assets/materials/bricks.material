@@ -1,0 +1,16 @@
+(
+    version: 1,
+    base_color: (1.0, 1.0, 1.0, 1.0),
+    base_color_texture: Some("65f143bc-31dd-4f1c-a6f0-7d34d2054329"),
+    metallic: 0.0,
+    roughness: 0.5,
+    metallic_roughness_texture: None,
+    normal_texture: None,
+    normal_scale: 1.0,
+    occlusion_texture: None,
+    occlusion_strength: 1.0,
+    emissive: (0.0, 0.0, 0.0),
+    emissive_texture: None,
+    alpha_mode: Opaque,
+    double_sided: false,
+)

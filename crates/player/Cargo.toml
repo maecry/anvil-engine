@@ -1,0 +1,20 @@
+[package]
+name = "player"
+description = "anvil-player: runs a project's startup scene."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "anvil-player"
+path = "src/main.rs"
+
+[dependencies]
+foundation = { path = "../foundation", features = ["log-init"] }
+runtime = { path = "../runtime" }
+tracing.workspace = true
+anyhow.workspace = true

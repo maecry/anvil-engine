@@ -1,0 +1,18 @@
+[package]
+name = "scene"
+description = "ECS world, hierarchy, transforms and scene serialization (ADR-0014)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+foundation = { path = "../foundation" }
+assets = { path = "../assets" }
+thiserror.workspace = true
+tracing.workspace = true
+hecs.workspace = true
+serde.workspace = true
+ron.workspace = true

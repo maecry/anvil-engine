@@ -1,0 +1,104 @@
+(
+    version: 1,
+    entities: [
+        (
+            uuid: "3f81a7d8-24db-47d1-9ae7-7a1d80efe459",
+            name: Some("sun"),
+            parent: None,
+            transform: Some((
+                translation: (0.0, 0.0, 0.0),
+                rotation: (-0.47894263, 0.21552417, 0.0, 0.85097784),
+                scale: (1.0, 1.0, 1.0),
+            )),
+            mesh_renderer: None,
+            light: Some((
+                kind: Directional,
+                color: (1.0, 0.96, 0.9),
+                intensity: 3.0,
+                range: 10.0,
+                inner_cone: 0.3,
+                outer_cone: 0.5,
+                cast_shadows: true,
+            )),
+            camera: None,
+        ),
+        (
+            uuid: "d94e5e4b-65e4-4c0c-a657-86ca2e08a9b8",
+            name: Some("camera"),
+            parent: None,
+            transform: Some((
+                translation: (3.5999997, 2.4, 5.0000005),
+                rotation: (-0.16766846, 0.28312707, 0.05034253, 0.9429698),
+                scale: (1.0, 1.0, 1.0),
+            )),
+            mesh_renderer: None,
+            light: None,
+            camera: Some((
+                fov_y: 1.0471976,
+                near: 0.1,
+                exposure: 1.0,
+            )),
+        ),
+        (
+            uuid: "3185815e-e876-4ca5-9414-0c2641df4e9d",
+            name: Some("brick crate"),
+            parent: None,
+            transform: Some((
+                translation: (1.9, -0.1, 0.8),
+                rotation: (0.0, 0.24740396, 0.0, 0.9689124),
+                scale: (0.8, 0.8, 0.8),
+            )),
+            mesh_renderer: Some((
+                mesh: "97f1c304-930e-51cb-ab82-15494fec94a4",
+                material: "28d1236f-0fa1-4f03-be4f-158f2719cb63",
+            )),
+            light: None,
+            camera: None,
+        ),
+        (
+            uuid: "f67baa51-8641-4b53-96fe-f0bf12f9952d",
+            name: Some("crate"),
+            parent: Some("ff1602a1-0769-46bd-9768-7b5f9cfaf57f"),
+            transform: Some((
+                translation: (0.0, 0.0, 0.0),
+                rotation: (0.0, 0.0, 0.0, 1.0),
+                scale: (1.0, 1.0, 1.0),
+            )),
+            mesh_renderer: Some((
+                mesh: "97f1c304-930e-51cb-ab82-15494fec94a4",
+                material: "2cf335b1-88b5-5594-b782-ad45155bc248",
+            )),
+            light: None,
+            camera: None,
+        ),
+        (
+            uuid: "efdfadcc-55b8-4c2f-b695-f52cb3821c21",
+            name: Some("ground"),
+            parent: Some("ff1602a1-0769-46bd-9768-7b5f9cfaf57f"),
+            transform: Some((
+                translation: (0.0, -0.5, 0.0),
+                rotation: (0.0, 0.0, 0.0, 1.0),
+                scale: (1.0, 1.0, 1.0),
+            )),
+            mesh_renderer: Some((
+                mesh: "57137131-e422-55ba-bd01-7774ac1fff58",
+                material: "572dbaf7-7e35-521b-9a41-e678f1064725",
+            )),
+            light: None,
+            camera: None,
+        ),
+        (
+            uuid: "ff1602a1-0769-46bd-9768-7b5f9cfaf57f",
+            name: Some("crate model"),
+            parent: None,
+            transform: Some((
+                translation: (0.0, 0.0, 0.0),
+                rotation: (0.0, 0.0, 0.0, 1.0),
+                scale: (1.0, 1.0, 1.0),
+            )),
+            mesh_renderer: None,
+            light: None,
+            camera: None,
+        ),
+    ],
+)

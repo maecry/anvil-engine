@@ -1,0 +1,31 @@
+[package]
+name = "assets"
+description = "Asset database, importers, cache, async loading and hot reload (ADR-0014)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Generators for test and sample content (glb files, PNGs); not part of the runtime API.
+fixtures = []
+
+[dependencies]
+foundation = { path = "../foundation" }
+thiserror.workspace = true
+tracing.workspace = true
+bytemuck.workspace = true
+rayon.workspace = true
+serde.workspace = true
+ron.workspace = true
+uuid.workspace = true
+gltf.workspace = true
+image.workspace = true
+ktx2.workspace = true
+notify.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+assets = { path = ".", features = ["fixtures"] }

@@ -539,6 +539,8 @@ pub struct Renderer {
     white_linear: TextureId,
     flat_normal: TextureId,
     default_material: MaterialId,
+    fallback_mesh: MeshId,
+    missing_material: MaterialId,
     arena: Arena,
     /// GPU table of mesh records, indexed by mesh handle index.
     mesh_table: BufferHandle,
@@ -1203,6 +1205,8 @@ impl Renderer {
             white_linear: TextureId::NULL,
             flat_normal: TextureId::NULL,
             default_material: MaterialId::NULL,
+            fallback_mesh: MeshId::NULL,
+            missing_material: MaterialId::NULL,
             arena,
             mesh_table,
             mesh_table_address: device.buffer_address(mesh_table)?,
@@ -1241,6 +1245,14 @@ impl Renderer {
             label: "default",
             ..MaterialDesc::default()
         });
+        r.missing_material = r.create_material(&MaterialDesc {
+            label: "missing",
+            base_color: [1.0, 0.0, 1.0, 1.0],
+            metallic: 0.0,
+            roughness: 1.0,
+            ..MaterialDesc::default()
+        });
+        r.fallback_mesh = r.create_mesh(device, "default.cube", &crate::mesh::cube())?;
         tracing::debug!(?extent, ?swapchain_format, frames, "renderer created");
         Ok(r)
     }
@@ -1579,6 +1591,46 @@ impl Renderer {
 
     /// Registers a material. Stale texture ids fall back to the built-in defaults.
     pub fn create_material(&mut self, desc: &MaterialDesc) -> MaterialId {
+        let m = self.build_material(desc);
+        let id = self.materials.insert(m);
+        tracing::debug!(label = desc.label, ?id, "material created");
+        id
+    }
+
+    /// Replaces the contents of an existing material in place (same id). Returns `false` for a
+    /// stale id.
+    pub fn update_material(&mut self, id: MaterialId, desc: &MaterialDesc) -> bool {
+        let m = self.build_material(desc);
+        let Some(slot) = self.materials.get_mut(id) else {
+            return false;
+        };
+        *slot = m;
+        self.cache.invalidate();
+        tracing::debug!(label = desc.label, ?id, "material updated");
+        true
+    }
+
+    /// Built-in fallback mesh (a unit cube) for assets that are loading or failed.
+    pub fn fallback_mesh(&self) -> MeshId {
+        self.fallback_mesh
+    }
+
+    /// Built-in 1x1 white sRGB texture.
+    pub fn white_texture(&self) -> TextureId {
+        self.white_srgb
+    }
+
+    /// Built-in opaque magenta material for assets that are missing or failed.
+    pub fn missing_material(&self) -> MaterialId {
+        self.missing_material
+    }
+
+    /// Built-in default material (white, rough).
+    pub fn default_material(&self) -> MaterialId {
+        self.default_material
+    }
+
+    fn build_material(&self, desc: &MaterialDesc) -> Material {
         let tex = |t: Option<TextureId>, default: TextureId| {
             t.filter(|t| self.textures.get(*t).is_some())
                 .unwrap_or(default)
@@ -1609,14 +1661,12 @@ impl Renderer {
             base_mip: 0,
             pad: 0,
         };
-        let id = self.materials.insert(Material {
+        Material {
             gpu: m,
             textures,
             alpha_mode: desc.alpha_mode,
             double_sided: desc.double_sided,
-        });
-        tracing::debug!(label = desc.label, ?id, "material created");
-        id
+        }
     }
 
     /// Destroys a material record.

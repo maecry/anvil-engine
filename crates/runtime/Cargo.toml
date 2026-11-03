@@ -1,0 +1,28 @@
+[package]
+name = "runtime"
+description = "Composition root: window, device, renderer, world and assets (ADR-0014)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+foundation = { path = "../foundation" }
+platform = { path = "../platform" }
+rhi = { path = "../rhi" }
+rhi-vulkan = { path = "../rhi-vulkan" }
+renderer = { path = "../renderer" }
+assets = { path = "../assets" }
+scene = { path = "../scene" }
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+ron.workspace = true
+png = "0.18"
+
+[dev-dependencies]
+foundation = { path = "../foundation", features = ["log-init"] }
+tempfile.workspace = true
+assets = { path = "../assets", features = ["fixtures"] }
