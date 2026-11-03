@@ -17,3 +17,4 @@ Template: [0000-template.md](0000-template.md). Rules: Master Spec §13.3.
 | [0011](0011-m3-renderer-architecture.md) | M3 core renderer: math conventions, renderer/app boundary, fixed passes, IBL, RHI additions | Accepted | 2026-11-02 |
 | [0012](0012-m4-render-graph.md) | M4 render graph (state model, compile, transients, passes, diagnostics) and advanced-rendering techniques | Accepted | 2026-11-02 |
 | [0013](0013-m5-performance-engineering.md) | M5 performance: benchmark baseline, profiling, threads, compute/indirect RHI, GPU-driven culling, LOD, streaming | Accepted | 2026-11-02 |
+| [0014](0014-m6-runtime-and-tooling.md) | M6 runtime and tooling: hecs scene, RON formats, UUID .meta assets, runtime, egui on RHI, in-process editor with scripted commands | Accepted | 2026-11-03 |
