@@ -19,6 +19,7 @@ mod instance;
 mod pipeline_cache;
 mod registry;
 mod swapchain;
+pub mod testing;
 mod texture;
 mod timestamps;
 mod upload;

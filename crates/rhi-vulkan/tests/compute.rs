@@ -10,6 +10,7 @@ use rhi::{
     Device, Format, Memory, RhiError, ShaderStageDesc, TextureDesc, TextureState, TextureUsage,
     TextureViewDesc,
 };
+use rhi_vulkan::testing::assert_no_leaks;
 
 fn buf(dev: &rhi_vulkan::VulkanDevice, label: &str, size: u64, usage: BufferUsage) -> BufferHandle {
     dev.create_buffer(&BufferDesc {
@@ -103,6 +104,7 @@ fn compute_writes_buffer_direct_indirect_and_fill() {
     dev.destroy_pipeline(pipe);
     dev.destroy_shader_module(m);
     retire_all(&mut dev);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -285,6 +287,7 @@ fn storage_images_per_mip_and_view_creation() {
     dev.destroy_pipeline(pipe);
     dev.destroy_shader_module(m);
     retire_all(&mut dev);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -350,5 +353,6 @@ fn indexed_indirect_and_count_draws() {
     quad.destroy(&dev);
     pipe.destroy(&dev);
     retire_all(&mut dev);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }

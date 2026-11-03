@@ -432,7 +432,21 @@ impl DeviceShared {
         // SAFETY: queue mutex held (vkDeviceWaitIdle needs all queues externally synchronized).
         let r = unsafe { self.raw.device_wait_idle() };
         drop(q);
-        r.map_err(|r| map_vk("vkDeviceWaitIdle", r))
+        r.map_err(|r| map_vk("vkDeviceWaitIdle", r))?;
+        // Also wait on the timeline for the last submit: vkDeviceWaitIdle alone has been seen
+        // returning before the work's results were visible on lavapipe (ADR-0015 §10).
+        let last = self.sync.last_submitted.load(Ordering::Acquire);
+        if last == 0 {
+            return Ok(());
+        }
+        let sems = [self.sync.timeline];
+        let vals = [last];
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&sems)
+            .values(&vals);
+        // SAFETY: the timeline is alive and `last` was queued for signal by a successful submit.
+        unsafe { self.raw.wait_semaphores(&info, u64::MAX) }
+            .map_err(|r| map_vk("vkWaitSemaphores", r))
     }
 }
 
@@ -846,6 +860,23 @@ pub struct VulkanDevice {
 }
 
 impl VulkanDevice {
+    /// Runs empty frames until every deferred destroy has retired, so diagnostics taken after
+    /// teardown show real leaks only (shutdown logs, leak tests).
+    ///
+    /// # Errors
+    /// Any submit or wait failure, including `DeviceLost`.
+    pub fn retire_pending(&mut self) -> Result<(), RhiError> {
+        use rhi::{CommandEncoder as _, Device as _};
+        for _ in 0..=self.diagnostics().frames_in_flight {
+            let t = self.begin_frame()?;
+            let fin = self.begin_commands(&t)?.finish()?;
+            self.submit_unwindowed(fin)?;
+            self.wait_idle()?;
+        }
+        self.begin_frame()?;
+        Ok(())
+    }
+
     /// Idempotent teardown (LAYER-004 §9 steps 1-6); `Drop` calls it and logs errors.
     ///
     /// # Errors

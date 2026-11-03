@@ -6,6 +6,7 @@ mod common;
 use common::{FLAT_FRAG, FLAT_VERT, Pipe, assert_clean, desc, enabled};
 use rhi::{Backend, CommandEncoder, Device, DeviceDesc, Format, Instance};
 use rhi_vulkan::Vulkan;
+use rhi_vulkan::testing::assert_no_leaks;
 
 #[test]
 fn timestamps_round_trip() {
@@ -33,6 +34,7 @@ fn timestamps_round_trip() {
         dev.submit_unwindowed(fin).unwrap();
     }
     dev.wait_idle().unwrap();
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 

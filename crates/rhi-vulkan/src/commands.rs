@@ -447,6 +447,9 @@ pub(crate) struct CommandManager {
     tracker: SlotTracker,
     current: Option<usize>,
     acquired: bool,
+    /// `ANVIL_SIMULATE_DEVICE_LOST=<frame>`: the submit of that (1-based) frame fails with
+    /// `DeviceLost` (fault injection, ADR-0015 §4). No real loss occurs.
+    simulate_lost: Option<u64>,
     pub(crate) span: tracing::Span,
 }
 
@@ -458,6 +461,9 @@ impl CommandManager {
             tracker: SlotTracker::new(frames_in_flight),
             current: None,
             acquired: false,
+            simulate_lost: std::env::var("ANVIL_SIMULATE_DEVICE_LOST")
+                .ok()
+                .and_then(|v| v.parse().ok()),
             span: tracing::Span::none(),
         };
         for i in 0..frames_in_flight {
@@ -641,6 +647,10 @@ impl CommandManager {
         }
         if wait_acquire && !self.acquired {
             return Err(invalid("submit requires an acquired swapchain image"));
+        }
+        if self.simulate_lost == Some(self.tracker.frame_counter) {
+            tracing::error!(frame = self.tracker.frame_counter, "simulated device loss");
+            return Err(RhiError::DeviceLost);
         }
         let s = &self.shared;
         let value = self.tracker.next_value();

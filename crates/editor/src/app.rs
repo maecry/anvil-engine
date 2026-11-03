@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -158,6 +159,8 @@ struct EditorApp {
     rendered: u64,
     report: Arc<Mutex<EditorReport>>,
     failure: Arc<Mutex<Option<String>>>,
+    /// Set when a frame hit `DeviceLost` (the windowed loop erases error types).
+    lost: Arc<AtomicBool>,
 }
 
 /// Runs the editor until it quits, the window closes, a script command fails or
@@ -182,6 +185,7 @@ pub fn run(opts: EditorOptions) -> Result<EditorReport, EditorError> {
     };
     let report = Arc::new(Mutex::new(EditorReport::default()));
     let failure = Arc::new(Mutex::new(None));
+    let lost = Arc::new(AtomicBool::new(false));
     let mut app = EditorApp {
         opts,
         script,
@@ -192,6 +196,7 @@ pub fn run(opts: EditorOptions) -> Result<EditorReport, EditorError> {
         rendered: 0,
         report: report.clone(),
         failure: failure.clone(),
+        lost: lost.clone(),
     };
     if app.opts.headless {
         if app.script.is_none() {
@@ -206,7 +211,11 @@ pub fn run(opts: EditorOptions) -> Result<EditorReport, EditorError> {
         result?;
     } else {
         let config = app.opts.window.clone();
-        platform::run(config, app)?;
+        let ran = platform::run(config, app);
+        if lost.load(Ordering::Acquire) {
+            return Err(EditorError::DeviceLost);
+        }
+        ran?;
     }
     if let Some(msg) = failure.lock().ok().and_then(|f| f.clone()) {
         return Err(EditorError::Command(msg));
@@ -337,8 +346,19 @@ impl EditorApp {
         Ok(())
     }
 
-    /// One frame. Returns true when the run should end.
+    /// One frame; a lost device is logged with the diagnostics snapshot (ADR-0015 §4).
     fn frame(&mut self, window: Option<&Window>) -> Result<bool, EditorError> {
+        let r = self.frame_inner(window);
+        if matches!(r, Err(EditorError::DeviceLost)) {
+            self.lost.store(true, Ordering::Release);
+            let diag = self.gfx.as_ref().map(|g| g.device.diagnostics());
+            tracing::error!(frame = self.rendered, ?diag, "device lost");
+        }
+        r
+    }
+
+    /// One frame. Returns true when the run should end.
+    fn frame_inner(&mut self, window: Option<&Window>) -> Result<bool, EditorError> {
         let (Some(gfx), Some(ed)) = (self.gfx.as_mut(), self.editor.as_mut()) else {
             return Ok(true);
         };
@@ -527,10 +547,13 @@ impl EditorApp {
     }
 
     fn teardown(&mut self) {
-        let (Some(gfx), Some(ed)) = (self.gfx.take(), self.editor.take()) else {
+        let (Some(mut gfx), Some(ed)) = (self.gfx.take(), self.editor.take()) else {
             return;
         };
-        if let Err(e) = gfx.device.wait_idle() {
+        // A lost device cannot be waited on (the wait may hang or fail); drop the rest as is.
+        if !self.lost.load(Ordering::Acquire)
+            && let Err(e) = gfx.device.wait_idle()
+        {
             tracing::error!(error = %e, "wait_idle failed");
         }
         gfx.egui.destroy(&gfx.device);
@@ -544,7 +567,18 @@ impl EditorApp {
         if let Some(img) = gfx.offscreen {
             gfx.device.destroy_texture(img.texture);
         }
-        tracing::info!(diag = ?gfx.device.diagnostics(), "diagnostics at exit");
+        if !self.lost.load(Ordering::Acquire)
+            && let Err(e) = gfx.device.retire_pending()
+        {
+            tracing::error!(error = %e, "retiring deferred destroys failed");
+        }
+        let d = gfx.device.diagnostics();
+        tracing::info!(
+            live = ?d.live,
+            pending_destroys = d.pending_destroys,
+            allocated_bytes = d.memory.allocated_bytes,
+            "shutdown diagnostics"
+        );
         let Gfx {
             instance,
             surface,

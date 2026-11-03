@@ -24,3 +24,4 @@ shaderc = "0.10.1"
 [dev-dependencies]
 rhi-vulkan = { path = "../rhi-vulkan" }
 foundation = { path = "../foundation", features = ["log-init"] }
+png = "0.18"

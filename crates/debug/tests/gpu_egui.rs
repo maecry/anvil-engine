@@ -117,7 +117,7 @@ fn run(format: Format) -> Vec<u8> {
     dev.destroy_buffer(rb);
     dev.destroy_texture(target);
     gpu.destroy(&dev);
-    dev.wait_idle().unwrap();
+    rhi_vulkan::testing::assert_no_leaks(&mut dev);
     let c = inst.validation_counts();
     assert_eq!((c.errors, c.warnings), (0, 0), "validation messages: {c:?}");
     pixels

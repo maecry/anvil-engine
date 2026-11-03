@@ -1,6 +1,7 @@
 //! The frame loop: windowed through `platform`, or headless against an offscreen target.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -177,6 +178,8 @@ pub struct Runtime<A: Application> {
     last: Instant,
     rendered: u64,
     report: Arc<Mutex<RunReport>>,
+    /// Set when a frame hit `DeviceLost` (also across the windowed loop, which erases errors).
+    lost: Arc<AtomicBool>,
 }
 
 impl<A: Application> Runtime<A> {
@@ -187,6 +190,7 @@ impl<A: Application> Runtime<A> {
     /// Project, device, renderer or window failures.
     pub fn run(opts: RunOptions, app: A) -> Result<RunReport, RuntimeError> {
         let report = Arc::new(Mutex::new(RunReport::default()));
+        let lost = Arc::new(AtomicBool::new(false));
         let mut rt = Runtime {
             opts,
             app,
@@ -197,6 +201,7 @@ impl<A: Application> Runtime<A> {
             last: Instant::now(),
             rendered: 0,
             report: report.clone(),
+            lost: lost.clone(),
         };
         if rt.opts.headless {
             rt.opts.exit_after_frames.get_or_insert(60);
@@ -214,7 +219,11 @@ impl<A: Application> Runtime<A> {
             result?;
         } else {
             let config = rt.opts.window.clone();
-            platform::run(config, rt)?;
+            let ran = platform::run(config, rt);
+            if lost.load(Ordering::Acquire) {
+                return Err(RuntimeError::DeviceLost);
+            }
+            ran?;
         }
         let r = *report
             .lock()
@@ -315,8 +324,19 @@ impl<A: Application> Runtime<A> {
         Ok(())
     }
 
-    /// One frame in the fixed order. Returns true when the run should end.
+    /// One frame; a lost device is logged with the diagnostics snapshot (ADR-0015 §4).
     fn frame(&mut self, window: Option<&Window>) -> Result<bool, RuntimeError> {
+        let r = self.frame_inner(window);
+        if matches!(r, Err(RuntimeError::DeviceLost)) {
+            self.lost.store(true, Ordering::Release);
+            let diag = self.gfx.as_ref().map(|g| g.device.diagnostics());
+            tracing::error!(frame = self.rendered, ?diag, "device lost");
+        }
+        r
+    }
+
+    /// One frame in the fixed order. Returns true when the run should end.
+    fn frame_inner(&mut self, window: Option<&Window>) -> Result<bool, RuntimeError> {
         let (Some(gfx), Some(core)) = (self.gfx.as_mut(), self.core.as_mut()) else {
             return Ok(true);
         };
@@ -432,10 +452,13 @@ impl<A: Application> Runtime<A> {
     }
 
     fn teardown(&mut self) {
-        let (Some(gfx), Some(core)) = (self.gfx.take(), self.core.take()) else {
+        let (Some(mut gfx), Some(core)) = (self.gfx.take(), self.core.take()) else {
             return;
         };
-        if let Err(e) = gfx.device.wait_idle() {
+        // A lost device cannot be waited on (the wait may hang or fail); drop the rest as is.
+        if !self.lost.load(Ordering::Acquire)
+            && let Err(e) = gfx.device.wait_idle()
+        {
             tracing::error!(error = %e, "wait_idle failed");
         }
         let stats = core.assets.stats();
@@ -447,7 +470,18 @@ impl<A: Application> Runtime<A> {
         if let Some(img) = gfx.offscreen {
             gfx.device.destroy_texture(img.texture);
         }
-        tracing::info!(diag = ?gfx.device.diagnostics(), "diagnostics at exit");
+        if !self.lost.load(Ordering::Acquire)
+            && let Err(e) = gfx.device.retire_pending()
+        {
+            tracing::error!(error = %e, "retiring deferred destroys failed");
+        }
+        let d = gfx.device.diagnostics();
+        tracing::info!(
+            live = ?d.live,
+            pending_destroys = d.pending_destroys,
+            allocated_bytes = d.memory.allocated_bytes,
+            "shutdown diagnostics"
+        );
         let Gfx {
             instance,
             surface,

@@ -16,8 +16,8 @@ use rhi::{
     CommandEncoder, CompareOp, ComputePipelineDesc, CullMode, DepthBias, DepthState, Device,
     Filter, Format, FrameToken, FrontFace, GraphicsPipelineDesc, Memory, PipelineHandle,
     PrimitiveTopology, RhiError, SamplerDesc, SamplerHandle, ShaderModuleDesc, ShaderModuleHandle,
-    ShaderStageDesc, SwapchainImage, TextureDesc, TextureHandle, TextureState, TextureUsage,
-    TextureViewDesc,
+    ShaderStageDesc, SwapchainHandle, SwapchainImage, TextureDesc, TextureHandle, TextureState,
+    TextureUsage, TextureViewDesc,
 };
 
 use crate::arena::{Arena, ArenaSlot};
@@ -1945,7 +1945,8 @@ impl Renderer {
     /// changed), four shadow cascades and up to four spot shadows, the depth prepass, then
     /// either forward lighting or G-buffer + lighting, the skybox, blended geometry and tonemap
     /// into `target`. `frame` is the token `cmd` was begun with. `target` ends in `final_state`
-    /// (`Present`, or `TransferSrc` to read it back); it is imported as `Undefined`.
+    /// (`Present`, or `TransferSrc` to read it back). A swapchain image is imported as `Undefined`; an
+    /// offscreen target (null swapchain handle) keeps the layout the graph last left it in.
     ///
     /// # Errors
     /// [`RenderError`] from ring uploads (including ring overflow), or the graph.
@@ -2435,12 +2436,17 @@ impl Renderer {
             })
             .collect();
         let ids = self.ibl.import(&mut b);
-        let swapchain = b.import(
-            "swapchain",
-            target.texture,
-            target.extent,
-            Some(TextureState::Undefined),
-        );
+        // A swapchain image arrives in an unknown layout (the RHI does not track it), so import
+        // it as `Undefined`. An offscreen target is device-owned and keeps its layout between
+        // frames: let the graph remember it (a fresh texture starts `Undefined`).
+        let initial = if target.swapchain == SwapchainHandle::NULL {
+            self.graph
+                .track_if_new(target.texture, TextureState::Undefined);
+            None
+        } else {
+            Some(TextureState::Undefined)
+        };
+        let swapchain = b.import("swapchain", target.texture, target.extent, initial);
         let color_tex = |format| TransientDesc {
             width: w,
             height: h,

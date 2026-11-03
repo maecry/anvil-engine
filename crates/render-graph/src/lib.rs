@@ -252,6 +252,11 @@ impl RenderGraph {
         self.states.insert(texture, state);
     }
 
+    /// Like [`track`](Self::track) but keeps the state already remembered for `texture`.
+    pub fn track_if_new(&mut self, texture: TextureHandle, state: TextureState) {
+        self.states.entry(texture).or_insert(state);
+    }
+
     /// Stops remembering `texture`; call before destroying an imported texture.
     pub fn forget(&mut self, texture: TextureHandle) {
         self.states.remove(&texture);

@@ -9,7 +9,10 @@ pub enum EditorError {
     Io(String),
     /// Runtime failure.
     #[error(transparent)]
-    Runtime(#[from] runtime::RuntimeError),
+    Runtime(runtime::RuntimeError),
+    /// The GPU device was lost; the process should exit with code 3 (ADR-0015 §4).
+    #[error("GPU device lost")]
+    DeviceLost,
     /// Asset failure.
     #[error(transparent)]
     Asset(#[from] assets::AssetError),
@@ -18,10 +21,10 @@ pub enum EditorError {
     Scene(#[from] scene::SceneError),
     /// Device failure.
     #[error(transparent)]
-    Rhi(#[from] rhi::RhiError),
+    Rhi(rhi::RhiError),
     /// Renderer failure.
     #[error(transparent)]
-    Render(#[from] renderer::RenderError),
+    Render(renderer::RenderError),
     /// Window or event loop failure.
     #[error(transparent)]
     Platform(#[from] platform::PlatformError),
@@ -34,5 +37,32 @@ impl EditorError {
 
     pub(crate) fn io(path: &std::path::Path, e: &dyn std::fmt::Display) -> Self {
         Self::Io(format!("{}: {e}", path.display()))
+    }
+}
+
+impl From<runtime::RuntimeError> for EditorError {
+    fn from(e: runtime::RuntimeError) -> Self {
+        match e {
+            runtime::RuntimeError::DeviceLost => Self::DeviceLost,
+            e => Self::Runtime(e),
+        }
+    }
+}
+
+impl From<rhi::RhiError> for EditorError {
+    fn from(e: rhi::RhiError) -> Self {
+        match e {
+            rhi::RhiError::DeviceLost => Self::DeviceLost,
+            e => Self::Rhi(e),
+        }
+    }
+}
+
+impl From<renderer::RenderError> for EditorError {
+    fn from(e: renderer::RenderError) -> Self {
+        match e {
+            renderer::RenderError::Rhi(e) => e.into(),
+            e => Self::Render(e),
+        }
     }
 }

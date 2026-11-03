@@ -130,7 +130,7 @@ fn passes_barriers_and_pool_reuse_are_validation_clean() {
     dev.wait_idle().unwrap();
     graph.destroy(&dev);
     dev.destroy_texture(history);
-    dev.wait_idle().unwrap();
+    rhi_vulkan::testing::assert_no_leaks(&mut dev);
     drop(dev);
     let c = inst.validation_counts();
     assert_eq!((c.errors, c.warnings), (0, 0), "validation messages: {c:?}");

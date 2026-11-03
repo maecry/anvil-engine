@@ -8,6 +8,7 @@ use rhi::{
     AddressMode, BufferDesc, BufferUsage, CommandEncoder, Device, Filter, Format, IndexFormat,
     Memory, RhiError, SamplerDesc, TextureDesc, TextureState, TextureUsage,
 };
+use rhi_vulkan::testing::assert_no_leaks;
 
 fn pattern(len: usize, seed: u8) -> Vec<u8> {
     (0..len)
@@ -58,6 +59,7 @@ fn buffer_write_read_roundtrip_exact() {
     dev.destroy_buffer(rb);
     retire_all(&mut dev);
     assert_eq!(dev.diagnostics().live.buffers, 0);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -94,6 +96,7 @@ fn buffer_upload_gpu_roundtrip() {
     assert_eq!(out, b);
     dev.destroy_buffer(gpu);
     dev.destroy_buffer(rb);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -121,12 +124,15 @@ fn buffer_upload_offsets() {
     assert_eq!(out[256..456], b[..]);
     dev.destroy_buffer(gpu);
     dev.destroy_buffer(rb);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
 #[test]
 fn buffer_address_nonzero_stable() {
-    let Some((inst, dev)) = setup() else { return };
+    let Some((inst, mut dev)) = setup() else {
+        return;
+    };
     let a = buf(&dev, 64, BufferUsage::STORAGE, Memory::GpuOnly);
     let b = buf(&dev, 64, BufferUsage::STORAGE, Memory::GpuOnly);
     let (aa, ab) = (
@@ -138,6 +144,7 @@ fn buffer_address_nonzero_stable() {
     assert_ne!(aa, ab);
     dev.destroy_buffer(a);
     dev.destroy_buffer(b);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -180,6 +187,7 @@ fn buffer_stale_handle() {
         Err(RhiError::StaleHandle { kind: "buffer", .. })
     ));
     // The warning counts are about validation messages only; stale handles never reached Vulkan.
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -210,6 +218,7 @@ fn buffer_destroy_deferred() {
     let d = dev.diagnostics();
     assert!(d.gpu_completed_frame > tag);
     assert_eq!(d.pending_destroys, 0);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -278,6 +287,7 @@ fn buffer_invalid_args() {
         dev.destroy_buffer(h);
     }
     dev.destroy_texture(tgt);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -302,6 +312,7 @@ fn buffer_stress_create_destroy_100k() {
         d.memory.allocated_bytes, d.memory.reserved_bytes
     );
     assert_eq!(d.memory.allocated_bytes, 0);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -335,6 +346,7 @@ fn buffer_memory_diagnostics() {
     );
     retire_all(&mut dev);
     assert_eq!(dev.diagnostics().memory.allocated_bytes, base);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -361,6 +373,7 @@ fn abandoned_frame_keeps_uploads() {
     assert_eq!(out, data);
     dev.destroy_buffer(gpu);
     dev.destroy_buffer(rb);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -407,6 +420,7 @@ fn texture_upload_readback_exact() {
     assert_eq!(out, data);
     dev.destroy_buffer(rb);
     dev.destroy_texture(t);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -436,12 +450,15 @@ fn texture_upload_twice() {
     ));
     dev.destroy_buffer(rb);
     dev.destroy_texture(t);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
 #[test]
 fn texture_upload_invalid_args() {
-    let Some((inst, dev)) = setup() else { return };
+    let Some((inst, mut dev)) = setup() else {
+        return;
+    };
     let t = dev.create_texture(&readable(4, 4)).unwrap();
     let invalid = |r: Result<(), RhiError>| {
         assert!(matches!(r, Err(RhiError::InvalidDescriptor(_))), "{r:?}");
@@ -465,6 +482,7 @@ fn texture_upload_invalid_args() {
     for h in [t, nodst, nosamp] {
         dev.destroy_texture(h);
     }
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -528,6 +546,7 @@ fn texture_sample_in_draw() {
     dev.destroy_texture(tex);
     dev.destroy_texture(target);
     dev.destroy_sampler(smp);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -569,6 +588,7 @@ fn texture_checkerboard_quad_pixels() {
     dev.destroy_texture(tex);
     dev.destroy_texture(target);
     dev.destroy_sampler(smp);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -597,6 +617,7 @@ fn push_constants_reach_shader() {
     pipe.destroy(&dev);
     q.destroy(&dev);
     dev.destroy_texture(target);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -619,6 +640,7 @@ fn push_constants_misuse_surfaces_at_finish() {
     c.push_constants(0, &[0u8; 128]);
     c.push_constants(124, &[0u8; 4]);
     c.finish().unwrap();
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -666,6 +688,7 @@ fn pipelines_share_one_layout() {
     q.destroy(&dev);
     dev.destroy_texture(target);
     dev.destroy_texture(target2);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -705,6 +728,7 @@ fn depth_pipeline_draw() {
     q.destroy(&dev);
     dev.destroy_texture(target);
     dev.destroy_texture(depth);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -752,6 +776,7 @@ fn sampled_depth_and_compare_sampler() {
     dev.destroy_texture(target);
     dev.destroy_texture(depth);
     retire_all(&mut dev);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -857,6 +882,7 @@ fn depth_only_pipeline_renders_into_sampled_depth() {
     dev.destroy_texture(depth);
     q.destroy(&dev);
     retire_all(&mut dev);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -897,6 +923,7 @@ fn draw_format_mismatch_rejected() {
     assert!(matches!(c.finish(), Err(RhiError::InvalidDescriptor(_))));
     pipe.destroy(&dev);
     dev.destroy_texture(target);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -935,12 +962,15 @@ fn bindless_slot_not_reused_before_retire() {
     assert_eq!(s3.index(), s1.index());
     dev.destroy_sampler(s2);
     dev.destroy_sampler(s3);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
 #[test]
 fn bindless_stale_index_rejected() {
-    let Some((inst, dev)) = setup() else { return };
+    let Some((inst, mut dev)) = setup() else {
+        return;
+    };
     let t = dev.create_texture(&readable(4, 4)).unwrap();
     let s = sampler(&dev);
     dev.destroy_texture(t);
@@ -961,12 +991,15 @@ fn bindless_stale_index_rejected() {
     ));
     dev.destroy_texture(t); // stale: warn + no-op
     dev.destroy_sampler(s);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
 #[test]
 fn texture_unsupported_combo() {
-    let Some((inst, dev)) = setup() else { return };
+    let Some((inst, mut dev)) = setup() else {
+        return;
+    };
     for d in [
         tex_desc(0, 4, Format::Rgba8Unorm, TextureUsage::SAMPLED),
         tex_desc(4, 4, Format::Rgba8Unorm, TextureUsage::NONE),
@@ -981,6 +1014,7 @@ fn texture_unsupported_combo() {
         );
     }
     assert_eq!(dev.diagnostics().live.textures, 0);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -995,6 +1029,7 @@ fn sampler_create_destroy() {
     dev.destroy_sampler(s);
     assert_eq!(dev.diagnostics().live.samplers, 0);
     retire_all(&mut dev);
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -1063,6 +1098,7 @@ fn texture_destroy_while_in_flight() {
         (d.live.textures, d.live.samplers, d.live.buffers),
         (0, 0, 0)
     );
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
@@ -1092,6 +1128,7 @@ fn diagnostics_bindless_and_memory() {
         d2.bindless.image_high_water >= 1,
         "high-water never decreases"
     );
+    assert_no_leaks(&mut dev);
     assert_clean(&inst);
 }
 
