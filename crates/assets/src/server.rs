@@ -243,6 +243,24 @@ impl AssetServer {
         Ok(())
     }
 
+    /// Registers source files that appeared under `assets/` since the last scan (creating their
+    /// `.meta`), for tools that create or import files while running. Returns how many are new.
+    ///
+    /// # Errors
+    /// [`AssetError::Io`] when `assets/` cannot be read or a `.meta` cannot be written.
+    pub fn rescan(&mut self) -> Result<usize, AssetError> {
+        let mut files = Vec::new();
+        collect_files(&self.root.join("assets"), &mut files)?;
+        files.sort();
+        let before = self.by_path.len();
+        for f in files {
+            if !self.by_path.contains_key(&self.rel(&f)) {
+                self.discover_file(&f)?;
+            }
+        }
+        Ok(self.by_path.len() - before)
+    }
+
     /// Starts loading the asset at `path` (relative to the project).
     ///
     /// # Errors

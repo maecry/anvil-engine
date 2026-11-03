@@ -19,4 +19,4 @@ mod runtime;
 pub use core::RuntimeCore;
 pub use error::RuntimeError;
 pub use project::{PROJECT_FILE, PROJECT_VERSION, Project};
-pub use runtime::{Application, Context, Input, RunOptions, RunReport, Runtime, Time};
+pub use runtime::{Application, Context, Input, RunOptions, RunReport, Runtime, Time, write_png};

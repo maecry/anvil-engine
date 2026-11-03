@@ -91,6 +91,8 @@ Importer golden tests on small glTF/PNG fixtures; corruption fuzzing (M7); hot-r
 - [x] glTF cube with texture loads asynchronously and renders through the renderer (`samples/sample-project`, `anvil-player` headless screenshot).
 - [x] Corrupt file reports an error and the app continues (`assets/tests/assets.rs`, `runtime/tests/project.rs::broken_assets_fall_back_instead_of_failing`).
 - [x] No GPU type appears in assets public API (`cargo tree -p assets` has no rhi, rhi-vulkan, ash or renderer).
+- [x] `AssetServer::rescan` registers files created while running (the editor's create and import commands; `assets/tests/assets.rs::rescan_registers_only_new_files`).
+- [x] The editor creates a material, edits it with a live preview and saves it without the hot reload fighting the save (`editor/tests/project_lifecycle.rs`).
 - [x] Ids survive moves, cache hits on the second load and reimports on change, failed dependencies propagate, hot reload (unit and integration tests).
 
 ## 15. Open questions (answered by ADR-0014)

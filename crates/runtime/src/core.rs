@@ -241,6 +241,27 @@ impl RuntimeCore {
         }
     }
 
+    /// Live preview of an unsaved material: updates the GPU copy of `id` in place from `draft`
+    /// (editor material panel). Returns false when `id` has no GPU copy yet (not drawn so far).
+    /// Call every frame while the draft differs from the saved asset: texture slots that are
+    /// still loading resolve on a later call, and a hot reload of the old file is overwritten
+    /// before the frame renders.
+    pub fn preview_material(
+        &mut self,
+        device: &VulkanDevice,
+        id: AssetId,
+        draft: &MaterialAsset,
+    ) -> bool {
+        let Some(mat) = self.materials.get(&id).copied() else {
+            return false;
+        };
+        if mat == self.renderer.missing_material() {
+            return false;
+        }
+        let desc = self.material_desc(device, draft);
+        self.renderer.update_material(mat, &desc)
+    }
+
     /// Destroys the renderer's resources. Call after `device.wait_idle()`.
     pub fn destroy(self, device: &VulkanDevice) {
         self.renderer.destroy(device);

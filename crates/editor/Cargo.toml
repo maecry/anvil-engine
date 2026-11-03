@@ -1,0 +1,42 @@
+[package]
+name = "editor"
+description = "anvil-editor: scene editor with viewport, hierarchy, inspector, asset browser and material editor (ADR-0014 §9)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "editor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "anvil-editor"
+path = "src/main.rs"
+
+[dependencies]
+foundation = { path = "../foundation", features = ["log-init"] }
+platform = { path = "../platform" }
+rhi = { path = "../rhi" }
+rhi-vulkan = { path = "../rhi-vulkan" }
+renderer = { path = "../renderer" }
+assets = { path = "../assets" }
+scene = { path = "../scene" }
+runtime = { path = "../runtime" }
+debug = { path = "../debug" }
+hecs.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+ron.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+assets = { path = "../assets" }
+scene = { path = "../scene" }
+runtime = { path = "../runtime" }
+png = "0.18"

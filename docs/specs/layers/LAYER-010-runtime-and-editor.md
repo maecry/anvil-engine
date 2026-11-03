@@ -6,7 +6,7 @@
 | Milestone | M5 (profiler); M6 (scene, runtime, editor, debug) |
 | Crates | scene, runtime, debug, profiler, editor |
 | Traces to | MASTER-000 §5.1 (Layers 4-5), §5.2 rules 1, 4, 5, 6, §8.9-8.12, §14 M5-M6 |
-| Last updated | 2026-11-02 |
+| Last updated | 2026-11-03 |
 
 ## 1. Purpose
 
@@ -93,15 +93,49 @@ pub struct Project { version, name, startup_scene }               // project.anv
 - **Shortcuts**: one linear/clamp sampler for all textures; paint callbacks are skipped; no clipboard or IME output beyond what egui-winit does without its default features; the graph panel lists passes from `GpuTimings` (an earlier frame) rather than a `GraphDescription` (not exposed by the renderer).
 - **Test**: `crates/debug/tests/gpu_egui.rs` (`ANVIL_GPU_TESTS=1`).
 
+## 7b. Editor crate (M6b-2, ADR-0014 §9)
+
+`crates/editor` (layer 5): the library `editor` and the binary `anvil-editor [project-dir]`. It depends on runtime, scene, assets, renderer, debug, platform and (for device creation, like the runtime) rhi and rhi-vulkan; nothing depends on it (FR-TOOL-006: only public runtime/scene/assets/renderer/debug APIs, no renderer internals).
+
+- **Architecture.** `Editor` embeds a `runtime::RuntimeCore` (the player's world, asset bridge, systems and extract) with its own loop (`app.rs`). Per frame: acquire, `assets.update`, one script command, the egui pass (the panels read the editor and queue commands), `apply_pending`, transform systems + extract, then record: the `Renderer` renders the scene into an offscreen `Rgba8Unorm` **viewport texture** (sized to the viewport panel, recreated when it changes), a clear of the window image, egui over it (the viewport is a user texture from `EguiRenderer::register_texture`), optional readback. Windowed it presents; headless it renders to an offscreen `Rgba8Srgb` 1600x900 image and egui runs with a plain `egui::Context` (no window). `Editor::new` starts without a project; `OpenProject` builds a fresh `RuntimeCore` (old GPU copies go with the old one).
+- **Panels.** Viewport (editor fly camera that is not an entity: RMB look, WASD/Space/Q while RMB is held, Shift fast, wheel dollies; click picks the nearest `MeshRenderer` world AABB, mesh bounds from the asset's vertices, the unit cube for NIL or unloaded meshes; selection AABB and a 3-axis translate gizmo are renderer debug lines; dragging a handle moves the entity along that axis in the parent's space). Hierarchy (tree by `Parent`/`Children`, select, context menu: add child, make the selected entity a child of this one, unparent, delete; Delete key; create empty). Inspector (name, position/rotation(euler degrees)/scale, `MeshRenderer` mesh and material pickers listing assets of the right kind, `Light`, `Camera`, add/remove components). Asset browser (folder tree of `assets/`, kind and `LoadState` per file with the failure reason, create material, create scene, instantiate model, edit material, open scene; it requests every source asset so states are visible). Material editor (factors, alpha mode, five texture slots, live preview, Save, Revert). Debug column: the `debug::panels` (frame, renderer settings, GPU passes, render graph, memory). Menu bar: File (New/Open project dialogs take a directory path, Save Scene Ctrl+S, Quit), Scene (create empty), Play/Stop.
+- **Material preview and hot reload.** `RuntimeCore::preview_material` updates the GPU material in place from the editor's draft (`Renderer::update_material`). After every extract the editor re-applies the draft while it differs from the saved file or from the loaded asset, so neither the 200 ms hot reload of the file written by Save nor an old reload landing after newer edits ever reaches the screen.
+- **Play/Stop.** Play stores `SceneFile::from_world` as RON text in memory and switches the viewport to the scene's camera (no gizmo, no editing interaction); Stop rebuilds the world from the text (uuids survive, so the selection does). Saving while playing is refused.
+- **Project lifecycle.** `NewProject` writes `project.anvil`, `assets/{scenes,models,materials,textures}`, `.gitignore` (`.anvil/`) and `assets/scenes/main.scene` with a camera, a shadow-casting sun and a ground slab (the renderer's built-in cube, flattened; no third-party content). `OpenProject` loads the manifest, starts the asset server with hot reload and reads the startup scene directly from disk.
+- **`EditorCommand`** (`serde`, RON; `command.rs`) is the only way state changes: `NewProject{path}`, `OpenProject{path}`, `ImportFile{src,dest}`, `Select{entity}`, `CreateEntity{name,parent}`, `DeleteEntity`, `Rename`, `SetTransform{entity,translation,rotation_deg,scale}`, `SetParent` (keeps the world transform), `AddComponent`/`RemoveComponent{entity,component}`, `SetLight`, `SetCamera`, `AssignMesh`/`AssignMaterial{entity, Option<AssetRef>}`, `InstantiateModel{model,name,translation}`, `CreateMaterial{path}`, `OpenMaterial{path}`, `EditMaterial{path,material}`, `SaveMaterial{path}`, `CreateScene{path}`, `OpenScene{path}`, `SaveScene`, `Play`, `Stop`, `Screenshot{path}`, `WaitFrames(n)` (script only), `AssertEntity{name,has_mesh,parent,material,translation}`, `AssertEntityCount{at_least}`, `Quit`. Entities are addressed by `Name("..")` (first match in spawn order) or `Uuid(..)`; assets by `Path("assets/..")` or `Id(..)`. `Editor::apply(device, cmd) -> Result<Outcome, EditorError>` applies one command; `Outcome::Wait` means "an asset is still loading, apply again next frame" (`InstantiateModel`, `Screenshot`, which waits until imports were idle for 3 frames so the image shows the finished scene).
+- **Scripts.** `ANVIL_EDITOR_SCRIPT=file.ron` is a RON list of commands, one applied per frame (a waiting command blocks the script for at most 60 s). A failing command logs an error, stops the run and the process exits 1; so do validation errors. Headless, the editor quits when the script ends. Each applied command is logged (`script command applied`). Example:
+
+```ron
+[
+    NewProject(path: "/tmp/demo"),
+    ImportFile(src: "samples/sample-project/assets/models/crate.glb", dest: "models/crate.glb"),
+    InstantiateModel(model: Path("assets/models/crate.glb"), name: "crate-instance", translation: (0.0, 0.5, 0.0)),
+    CreateMaterial(path: "assets/materials/red.material"),
+    EditMaterial(path: "assets/materials/red.material", material: (base_color: (0.9, 0.1, 0.1, 1.0), roughness: 0.35)),
+    SaveMaterial(path: "assets/materials/red.material"),
+    AssignMaterial(entity: Name("crate"), material: Some(Path("assets/materials/red.material"))),
+    SetTransform(entity: Name("crate-instance"), translation: (1.5, 0.0, 0.0), rotation_deg: (0.0, 30.0, 0.0), scale: (1.0, 1.0, 1.0)),
+    SaveScene,
+    Screenshot(path: "/tmp/demo.png"),
+    Quit,
+]
+```
+
+- **Env.** `ANVIL_WINDOW=0` headless (1600x900) or `WxH`, `ANVIL_EDITOR_SCRIPT`, `ANVIL_EXIT_AFTER_FRAMES` (headless without a script defaults to 60), `ANVIL_VSYNC=0`, `ANVIL_SYNC_VALIDATION=1`. The `anvil-editor` exit code is 1 on a failed command or validation errors.
+- **Shortcuts.** No undo/redo (`EditorCommand` is the hook: record inverses where commands are applied). Picking recomputes mesh bounds from the vertices each call and tests only `MeshRenderer` entities. The inspector derives euler angles from the quaternion every frame (a drag near gimbal lock jumps). No drag-and-drop in the hierarchy or from the asset browser to the viewport (menu actions and buttons instead). Project paths are typed, there is no file dialog. The gizmo is depth-tested debug lines (an occluding mesh hides it) and translate-only. The material preview runs every frame while a draft is unsaved. Selection is resolved by uuid with a linear search. One viewport, no multi-select, no scene tabs, no saved layout. Crash isolation stays deferred to M7.
+- **Tests.** Unit tests (command script parse, picking and gizmo math, template); `crates/editor/tests/project_lifecycle.rs` (`ANVIL_GPU_TESTS=1`, the M6 exit test): a headless editor script creates a project, imports and instantiates a glTF, creates, edits, saves and assigns a material, moves it, plays, stops, saves and screenshots; a second editor process reopens the project and asserts the entity set; `anvil-player` runs it headless. All three processes run with sync validation: 0 errors, 0 warnings, and the screenshots show the red crate.
+
 ## 13. Testing strategy
 
-Scene serialization round-trip; hierarchy and transform tests; headless runtime tests on a real device (`ANVIL_GPU_TESTS=1`, validation counts must be 0, screenshot not black); editor UI tests are manual at first; M6 completion criterion (create, save, reopen, run a sample project).
+Scene serialization round-trip; hierarchy and transform tests; headless runtime tests on a real device (`ANVIL_GPU_TESTS=1`, validation counts must be 0, screenshot not black); the editor is tested through its command script (the exit test), picking math in unit tests; interactive input (drag, camera, menus) is checked manually; M6 completion criterion (create, save, reopen, run a sample project).
 
 ## 14. Acceptance criteria (Draft)
 
-- [ ] `cargo tree` shows nothing depends on editor, debug or profiler except applications.
+- [x] `cargo tree` shows nothing depends on editor, debug or profiler except applications (`cargo tree -i editor` is the editor alone; `-i debug` lists the editor and the two examples).
 - [x] A sample project runs with the editor disabled (`anvil-player samples/sample-project`, M6a).
-- [ ] The debug panels display GPU scopes without any dependency from lower layers on it (M6b; there is no separate profiler crate).
+- [x] The debug panels display GPU scopes without any dependency from lower layers on it (`debug::panels`, shown by the overlay and the editor; there is no separate profiler crate).
+- [x] A sample project can be created, saved, reopened and executed (`crates/editor/tests/project_lifecycle.rs`, M6 exit test).
+- [x] Every editor edit goes through `EditorCommand`; the editor uses only runtime, scene, assets, renderer and debug APIs (FR-TOOL-006).
 
 ## 15. Open questions (answered by ADR-0014)
 
@@ -112,7 +146,7 @@ Scene serialization round-trip; hierarchy and transform tests; headless runtime 
 5. Profiler hook: pull-style (existing RHI timestamps, `RendererStats`); no push hook needed.
 6. debug vs profiler: one `debug` crate; no `profiler` crate (§1).
 
-Remaining, deferred: saved game-defined components (a serde registry), several cameras, undo/redo, play-mode world copy (M6b editor).
+Remaining, deferred: saved game-defined components (a serde registry), several cameras, undo/redo. (The play-mode world copy is in the editor, section 7.)
 
 ## 16. Related modules
 

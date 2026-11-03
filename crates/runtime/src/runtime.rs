@@ -469,7 +469,10 @@ impl<A: Application> Runtime<A> {
 }
 
 /// Writes swapchain texels (BGRA or RGBA, 8 bit) as an RGBA PNG.
-fn write_png(
+///
+/// # Errors
+/// [`RuntimeError::Io`] when the file cannot be written.
+pub fn write_png(
     path: &std::path::Path,
     (w, h): (u32, u32),
     format: Format,

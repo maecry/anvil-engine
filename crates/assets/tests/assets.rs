@@ -89,6 +89,33 @@ fn meta_created_and_id_survives_move() {
 }
 
 #[test]
+fn rescan_registers_only_new_files() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "assets/a.png",
+        &checker_png(4, 2, [1; 3], [2; 3]),
+    );
+    let mut s = AssetServer::new(dir.path()).unwrap();
+    let a = s.id_for_path("assets/a.png").unwrap();
+    assert_eq!(s.rescan().unwrap(), 0);
+    write(
+        dir.path(),
+        "assets/sub/b.png",
+        &checker_png(4, 2, [3; 3], [4; 3]),
+    );
+    assert_eq!(s.rescan().unwrap(), 1);
+    assert!(dir.path().join("assets/sub/b.png.meta").exists());
+    assert!(s.id_for_path("assets/sub/b.png").is_some());
+    assert_eq!(
+        s.id_for_path("assets/a.png"),
+        Some(a),
+        "known ids are untouched"
+    );
+    assert_eq!(s.rescan().unwrap(), 0);
+}
+
+#[test]
 fn duplicate_meta_gets_new_id() {
     let dir = tempfile::tempdir().unwrap();
     let png = checker_png(4, 2, [1; 3], [2; 3]);

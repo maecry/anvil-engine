@@ -482,6 +482,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "editor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assets",
+ "debug",
+ "foundation",
+ "hecs",
+ "platform",
+ "png",
+ "renderer",
+ "rhi",
+ "rhi-vulkan",
+ "ron",
+ "runtime",
+ "scene",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "egui"
 version = "0.33.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
