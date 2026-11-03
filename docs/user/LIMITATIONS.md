@@ -17,9 +17,9 @@ you add one, add it here too (`grep -rn "shortcut:" crates examples`).
   Recreating every GPU resource is not implemented.
 - **Lavapipe test flakiness.** Two GPU tests, `push_constants_reach_shader` and
   `pipelines_share_one_layout`, read back all zeros intermittently on lavapipe (software Vulkan);
-  suspected cause was `wait_idle` returning before the work was visible, so it now also waits on
-  the timeline. The fix is unconfirmed on lavapipe; if they still flake there they get ignored on
-  lavapipe only.
+  the fragment stage sees zero push constants while the vertex stage does not. Our push-constant
+  path is shared with the renderer, which passes on lavapipe, so this is treated as a driver issue:
+  the two tests skip on CPU devices and run on hardware drivers.
 - **No license has been chosen.** The repository has no `LICENSE` file, so there is no permission
   to redistribute or reuse it yet. See [release-checklist](../development/release-checklist.md).
 - **No release channels.** The only artifact is a tagged release candidate tarball

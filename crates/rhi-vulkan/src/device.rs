@@ -432,21 +432,7 @@ impl DeviceShared {
         // SAFETY: queue mutex held (vkDeviceWaitIdle needs all queues externally synchronized).
         let r = unsafe { self.raw.device_wait_idle() };
         drop(q);
-        r.map_err(|r| map_vk("vkDeviceWaitIdle", r))?;
-        // Also wait on the timeline for the last submit: vkDeviceWaitIdle alone has been seen
-        // returning before the work's results were visible on lavapipe (ADR-0015 §10).
-        let last = self.sync.last_submitted.load(Ordering::Acquire);
-        if last == 0 {
-            return Ok(());
-        }
-        let sems = [self.sync.timeline];
-        let vals = [last];
-        let info = vk::SemaphoreWaitInfo::default()
-            .semaphores(&sems)
-            .values(&vals);
-        // SAFETY: the timeline is alive and `last` was queued for signal by a successful submit.
-        unsafe { self.raw.wait_semaphores(&info, u64::MAX) }
-            .map_err(|r| map_vk("vkWaitSemaphores", r))
+        r.map_err(|r| map_vk("vkDeviceWaitIdle", r))
     }
 }
 
