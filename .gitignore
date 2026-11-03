@@ -1,4 +1,5 @@
 /target
+/dist
 *.spv
 /.codegraph
 .claude/worktrees/

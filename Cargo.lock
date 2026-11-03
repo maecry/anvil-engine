@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "assets"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "assets",
  "bytemuck",
@@ -429,7 +429,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "debug"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "bytemuck",
  "egui",
@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "editor"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "assets",
@@ -686,7 +686,7 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "foundation"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "glam",
  "rayon",
@@ -1138,7 +1138,7 @@ dependencies = [
 
 [[package]]
 name = "many-draws"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "debug",
@@ -1630,7 +1630,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pbr-scene"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "debug",
@@ -1689,7 +1689,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "platform"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "foundation",
  "raw-window-handle",
@@ -1700,7 +1700,7 @@ dependencies = [
 
 [[package]]
 name = "player"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "foundation",
@@ -1923,7 +1923,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "render-graph"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "foundation",
  "rhi",
@@ -1934,7 +1934,7 @@ dependencies = [
 
 [[package]]
 name = "renderer"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "bytemuck",
  "foundation",
@@ -1951,7 +1951,7 @@ dependencies = [
 
 [[package]]
 name = "rhi"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "foundation",
  "raw-window-handle",
@@ -1960,7 +1960,7 @@ dependencies = [
 
 [[package]]
 name = "rhi-vulkan"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "ash",
  "ash-window",
@@ -1994,7 +1994,7 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "runtime"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "assets",
  "foundation",
@@ -2063,7 +2063,7 @@ dependencies = [
 
 [[package]]
 name = "scene"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "assets",
  "foundation",
@@ -2309,7 +2309,7 @@ dependencies = [
 
 [[package]]
 name = "textured-quad"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "foundation",
@@ -2541,7 +2541,7 @@ dependencies = [
 
 [[package]]
 name = "triangle"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "anyhow",
  "foundation",

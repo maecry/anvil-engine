@@ -682,6 +682,8 @@ fn load_or_import(
     let cache_file = project.join(".anvil/imported").join(format!("{id}.bin"));
     if let Ok(c) = std::fs::read(&cache_file)
         && let Ok(bundle) = cache::decode(&c, hash)
+        // A damaged count or id could drop the root asset, which would leave it `Loading` forever.
+        && bundle.first().is_some_and(|b| b.id == id)
     {
         return (Ok(bundle), true);
     }

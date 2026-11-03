@@ -4,8 +4,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Default cache file (relative to the working directory).
-const DEFAULT_PATH: &str = "target/anvil-pipeline-cache.bin";
+/// Default file name, under `$XDG_CACHE_HOME/anvil/` or `~/.cache/anvil/`.
+const FILE_NAME: &str = "pipeline-cache.bin";
 /// `VkPipelineCacheHeaderVersionOne` header size: size, version, vendor, device, UUID.
 const HEADER_BYTES: usize = 32;
 
@@ -17,11 +17,20 @@ pub(crate) struct CacheIdentity {
     pub uuid: [u8; 16],
 }
 
-/// The cache file: `desc` path, else env `ANVIL_PIPELINE_CACHE`, else [`DEFAULT_PATH`].
+/// The cache file: `desc` path, else env `ANVIL_PIPELINE_CACHE`, else
+/// `$XDG_CACHE_HOME/anvil/pipeline-cache.bin`, else `~/.cache/anvil/pipeline-cache.bin`, else
+/// (no home directory) the system temp directory.
 pub(crate) fn resolve_path(desc: Option<&Path>) -> PathBuf {
+    let env = |k| {
+        std::env::var_os(k)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
     desc.map(Path::to_path_buf)
-        .or_else(|| std::env::var_os("ANVIL_PIPELINE_CACHE").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_PATH))
+        .or_else(|| env("ANVIL_PIPELINE_CACHE"))
+        .or_else(|| env("XDG_CACHE_HOME").map(|d| d.join("anvil").join(FILE_NAME)))
+        .or_else(|| env("HOME").map(|d| d.join(".cache/anvil").join(FILE_NAME)))
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("anvil-{FILE_NAME}")))
 }
 
 /// Why a blob is not usable; logged as a warning, the cache then starts empty.
@@ -77,17 +86,16 @@ pub(crate) fn load(path: &Path, id: &CacheIdentity) -> Option<Vec<u8>> {
 }
 
 /// Writes `data` atomically (temp file + rename, so concurrent devices never see a torn file).
-/// Does not create directories. Failures only warn.
+/// Creates the parent directory when missing. Failures only warn.
 pub(crate) fn save(path: &Path, data: &[u8]) {
     static SEQ: AtomicU32 = AtomicU32::new(0);
     if data.len() <= HEADER_BYTES {
         return; // nothing compiled
     }
-    if path
-        .parent()
-        .is_some_and(|d| !d.as_os_str().is_empty() && !d.is_dir())
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
+        && let Err(e) = std::fs::create_dir_all(dir)
     {
-        tracing::debug!(path = %path.display(), "pipeline cache directory missing, not saved");
+        tracing::warn!(path = %dir.display(), error = %e, "pipeline cache directory not created, not saved");
         return;
     }
     let mut tmp = path.as_os_str().to_owned();
@@ -156,8 +164,7 @@ mod tests {
             uuid: [9; 16],
         };
         let dir = std::env::temp_dir().join(format!("anvil-pc-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("c.bin");
+        let path = dir.join("missing/c.bin"); // `save` creates the directory
         assert!(load(&path, &id).is_none());
         let data = blob(&id);
         save(&path, &data);
